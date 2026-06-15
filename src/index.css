@@ -1,0 +1,54 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700;900&family=Noto+Serif+SC:wght@700;900&display=swap');
+
+:root {
+  font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+  color: #49392f;
+  background: #f6efe3;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --cream: #fffaf0;
+  --paper: #fffdf8;
+  --ink: #49392f;
+  --muted: #8c7668;
+  --coral: #e76049;
+  --green: #347459;
+  --line: #eadbc7;
+  --yellow: #f6d779;
+  --pink: #f6d7e2;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(246, 215, 121, .35), transparent 24rem),
+    radial-gradient(circle at 90% 25%, rgba(246, 215, 226, .45), transparent 22rem),
+    #f6efe3;
+}
+button, input, select, textarea { font: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .58; }
+a { color: inherit; text-decoration: none; }
+img { display: block; max-width: 100%; }
+h1, h2, h3, p { margin-top: 0; }
+h1, h2 { font-family: 'Noto Serif SC', serif; }
+input, select, textarea {
+  width: 100%;
+  border: 1px solid #ddcbb7;
+  border-radius: 12px;
+  padding: 11px 13px;
+  color: var(--ink);
+  background: #fff;
+  outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(52, 116, 89, .12); }
+textarea { min-height: 100px; resize: vertical; }
+label { display: grid; gap: 6px; color: #705c50; font-size: 13px; font-weight: 600; }
+
+@media (prefers-reduced-motion: no-preference) {
+  button, a, .recipe-card { transition: transform .2s ease, box-shadow .2s ease, background .2s ease; }
+}
