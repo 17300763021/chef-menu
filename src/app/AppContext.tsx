@@ -59,14 +59,15 @@ export function AppProvider({
       setTodayMenu(existing)
       return
     }
-    const created = await repository.saveMenu({
+    setTodayMenu({
+      id: `draft:${today}:${chefId}`,
       menuDate: today,
       chefId,
       recipeIds: [],
       quote: dailyQuote(),
       note: '',
+      status: 'planned',
     })
-    setTodayMenu(created)
   }, [repository, today])
 
   const loadRecommendations = useCallback((allRecipes: Recipe[], chefId: string) => {
@@ -83,17 +84,31 @@ export function AppProvider({
 
   const refresh = useCallback(async () => {
     setLoading(true)
-    const [nextChefs, nextRecipes, nextHistory] = await Promise.all([
-      repository.getChefs(),
-      repository.getRecipes(),
-      repository.getHistory(),
-    ])
-    setChefs(nextChefs)
-    setRecipes(nextRecipes)
-    setHistory(nextHistory)
-    await loadMenu(selectedChefId)
-    loadRecommendations(nextRecipes, selectedChefId)
-    setLoading(false)
+    try {
+      const [nextChefs, nextRecipes, nextHistory] = await Promise.all([
+        repository.getChefs(),
+        repository.getRecipes(),
+        repository.getHistory(),
+      ])
+      const legacySlug = selectedChefId === 'chen'
+        ? 'chen-chef'
+        : selectedChefId === 'jin'
+          ? 'jin-chef'
+          : ''
+      const activeChef = nextChefs.find((chef) => chef.id === selectedChefId)
+        ?? nextChefs.find((chef) => chef.slug === legacySlug)
+        ?? nextChefs[0]
+      const activeChefId = activeChef?.id ?? selectedChefId
+
+      setChefs(nextChefs)
+      setRecipes(nextRecipes)
+      setHistory(nextHistory)
+      if (activeChefId !== selectedChefId) setSelectedChefId(activeChefId)
+      await loadMenu(activeChefId)
+      loadRecommendations(nextRecipes, activeChefId)
+    } finally {
+      setLoading(false)
+    }
   }, [loadMenu, loadRecommendations, repository, selectedChefId])
 
   useEffect(() => {

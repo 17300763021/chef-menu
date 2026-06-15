@@ -1,9 +1,10 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import App from '../App'
 import { AppProvider } from './AppContext'
-import { LocalRepository } from '../data/repository'
+import { LocalRepository, type MenuRepository } from '../data/repository'
+import { demoChefs, demoRecipes } from '../data/demoData'
 
 describe('chef menu application', () => {
   it('switches chefs and shows two daily recommendations', async () => {
@@ -22,5 +23,34 @@ describe('chef menu application', () => {
     await userEvent.click(screen.getByRole('button', { name: /加入今日菜单/ }))
     await userEvent.click(screen.getByRole('link', { name: /今日菜单/ }))
     await waitFor(() => expect(screen.getByText('辣椒炒肉')).toBeInTheDocument())
+  })
+
+  it('loads cloud chefs with UUID ids without creating an empty menu', async () => {
+    const cloudChefs = demoChefs.map((chef, index) => ({
+      ...chef,
+      id: `00000000-0000-0000-0000-00000000000${index + 1}`,
+    }))
+    const cloudRecipes = demoRecipes.map((recipe) => ({
+      ...recipe,
+      chefId: recipe.chefId === 'chen' ? cloudChefs[0].id : cloudChefs[1].id,
+    }))
+    const saveMenu = vi.fn()
+    const repository: MenuRepository = {
+      getChefs: async () => cloudChefs,
+      getRecipes: async () => cloudRecipes,
+      getHistory: async () => [],
+      getMenu: async () => null,
+      saveMenu,
+      saveRecipe: async () => cloudRecipes[0],
+      completeMenu: async () => {
+        throw new Error('not used')
+      },
+    }
+
+    localStorage.setItem('chef-menu:selected-chef', 'chen')
+    render(<AppProvider repository={repository}><App /></AppProvider>)
+
+    expect(await screen.findByText('今天推荐这两道')).toBeInTheDocument()
+    expect(saveMenu).not.toHaveBeenCalled()
   })
 })
