@@ -109,7 +109,9 @@ export class SupabaseRepository implements MenuRepository {
       tutorial_note: draft.tutorialNote,
       is_published: draft.published ?? true,
     }).select().single()
-    if (error) throw error
+    if (error) {
+      throw new Error(`菜谱保存失败：${error.message}。请检查 recipes 表的管理员 RLS Policy。`)
+    }
     this.remoteReady = true
     return mapRecipe(data)
   }

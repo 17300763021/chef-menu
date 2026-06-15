@@ -42,6 +42,8 @@ export async function uploadImage(
     contentType: 'image/webp',
     upsert: false,
   })
-  if (error) throw error
+  if (error) {
+    throw new Error(`封面上传失败：${error.message}。请检查 Storage 的 RLS Policy。`)
+  }
   return client.storage.from(bucket).getPublicUrl(path).data.publicUrl
 }
