@@ -24,6 +24,8 @@ export interface MenuRepository {
   getChefs(): Promise<Chef[]>
   getRecipes(): Promise<Recipe[]>
   saveRecipe(draft: RecipeDraft): Promise<Recipe>
+  updateRecipe(id: string, draft: RecipeDraft): Promise<Recipe>
+  deleteRecipe(id: string): Promise<void>
   getMenu(date: string, chefId: string): Promise<DailyMenu | null>
   saveMenu(input: SaveMenuInput): Promise<DailyMenu>
   completeMenu(menuId: string, input: CompleteMenuInput): Promise<CookingRecord>
@@ -65,6 +67,17 @@ export class LocalRepository implements MenuRepository {
     }
     save(RECIPES_KEY, [...recipes, recipe])
     return recipe
+  }
+
+  async updateRecipe(id: string, draft: RecipeDraft) {
+    const recipes = await this.getRecipes()
+    const recipe: Recipe = { ...draft, id, published: draft.published ?? true }
+    save(RECIPES_KEY, recipes.map((item) => item.id === id ? recipe : item))
+    return recipe
+  }
+
+  async deleteRecipe(id: string) {
+    save(RECIPES_KEY, (await this.getRecipes()).filter((recipe) => recipe.id !== id))
   }
 
   async getMenu(date: string, chefId: string) {

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import App from '../App'
@@ -15,14 +15,13 @@ describe('chef menu application', () => {
     expect(screen.getByText(/金大厨今日掌勺/)).toBeInTheDocument()
   })
 
-  it('searches recipes and adds one to today menu', async () => {
+  it('searches recipes and blocks visitor ordering', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
     await userEvent.click((await screen.findAllByRole('link', { name: '自己点菜' }))[0])
     await userEvent.type(screen.getByRole('searchbox'), '五花肉')
     expect(await screen.findByText('辣椒炒肉')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: /加入今日菜单/ }))
-    await userEvent.click(screen.getByRole('link', { name: /今日菜单/ }))
-    await waitFor(() => expect(screen.getByText('辣椒炒肉')).toBeInTheDocument())
+    expect(await screen.findByRole('dialog')).toHaveTextContent('看菜可以，点菜不行')
   })
 
   it('loads cloud chefs with UUID ids without creating an empty menu', async () => {
@@ -42,6 +41,8 @@ describe('chef menu application', () => {
       getMenu: async () => null,
       saveMenu,
       saveRecipe: async () => cloudRecipes[0],
+      updateRecipe: async () => cloudRecipes[0],
+      deleteRecipe: async () => undefined,
       completeMenu: async () => {
         throw new Error('not used')
       },

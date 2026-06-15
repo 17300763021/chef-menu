@@ -15,6 +15,9 @@ import {
   type MenuRepository,
 } from '../data/repository'
 import { appRepository } from '../data/supabaseRepository'
+import { getAdminUser, signOut } from '../features/auth'
+import { supabase } from '../lib/supabase'
+import { PermissionDialog } from '../components/PermissionDialog'
 
 interface AppState {
   chefs: Chef[]
@@ -25,6 +28,10 @@ interface AppState {
   recommendationIds: string[]
   history: HistoryEntry[]
   loading: boolean
+  adminEmail: string
+  isAdmin: boolean
+  refreshAdminUser: () => Promise<void>
+  adminSignOut: () => Promise<void>
   setSelectedChefId: (chefId: string) => void
   addToMenu: (recipeId: string) => Promise<void>
   removeFromMenu: (recipeId: string) => Promise<void>
@@ -51,6 +58,8 @@ export function AppProvider({
   const [recommendationIds, setRecommendationIds] = useState<string[]>([])
   const [history, setHistory] = useState<HistoryEntry[]>([])
   const [loading, setLoading] = useState(true)
+  const [adminEmail, setAdminEmail] = useState('')
+  const [permissionOpen, setPermissionOpen] = useState(false)
   const today = shanghaiDateKey()
 
   const loadMenu = useCallback(async (chefId: string) => {
@@ -120,6 +129,20 @@ export function AppProvider({
     localStorage.setItem('chef-menu:selected-chef', selectedChefId)
   }, [selectedChefId])
 
+  const refreshAdminUser = useCallback(async () => {
+    const user = await getAdminUser()
+    setAdminEmail(user?.email ?? '')
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refreshAdminUser(), 0)
+    const subscription = supabase?.auth.onAuthStateChange(() => void refreshAdminUser())
+    return () => {
+      window.clearTimeout(timer)
+      subscription?.data.subscription.unsubscribe()
+    }
+  }, [refreshAdminUser])
+
   const updateItems = async (recipeIds: string[]) => {
     const menu = await repository.saveMenu({
       menuDate: today,
@@ -132,6 +155,10 @@ export function AppProvider({
   }
 
   const addToMenu = async (recipeId: string) => {
+    if (!adminEmail) {
+      setPermissionOpen(true)
+      return
+    }
     const ids = todayMenu?.recipeIds ?? []
     if (!ids.includes(recipeId)) await updateItems([...ids, recipeId])
   }
@@ -165,6 +192,13 @@ export function AppProvider({
     recommendationIds,
     history,
     loading,
+    adminEmail,
+    isAdmin: Boolean(adminEmail),
+    refreshAdminUser,
+    adminSignOut: async () => {
+      await signOut()
+      setAdminEmail('')
+    },
     setSelectedChefId,
     addToMenu,
     removeFromMenu,
@@ -173,7 +207,12 @@ export function AppProvider({
     refresh,
   }
 
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>
+  return (
+    <AppContext.Provider value={value}>
+      {children}
+      {permissionOpen && <PermissionDialog onClose={() => setPermissionOpen(false)} />}
+    </AppContext.Provider>
+  )
 }
 
 export function useApp() {

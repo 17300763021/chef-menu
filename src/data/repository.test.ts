@@ -11,6 +11,20 @@ describe('LocalRepository', () => {
     expect((await repository.getRecipes()).length).toBe(demoRecipes.length)
   })
 
+  it('updates and deletes recipes', async () => {
+    const repository = new LocalRepository()
+    const original = (await repository.getRecipes())[0]
+    const updated = await repository.updateRecipe(original.id, {
+      ...original,
+      name: '测试改名菜',
+    })
+    expect(updated.name).toBe('测试改名菜')
+    expect((await repository.getRecipes()).find((recipe) => recipe.id === original.id)?.name).toBe('测试改名菜')
+
+    await repository.deleteRecipe(original.id)
+    expect((await repository.getRecipes()).some((recipe) => recipe.id === original.id)).toBe(false)
+  })
+
   it('persists a daily menu and its items', async () => {
     const repository = new LocalRepository()
     const menu = await repository.saveMenu({

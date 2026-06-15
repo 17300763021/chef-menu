@@ -57,6 +57,27 @@ function mapRecipe(row: Record<string, unknown>): Recipe {
   }
 }
 
+function recipeRow(draft: RecipeDraft) {
+  return {
+    chef_id: draft.chefId,
+    name: draft.name,
+    aliases: draft.aliases,
+    category: draft.category,
+    cover_url: draft.coverUrl,
+    ingredients: draft.ingredients,
+    steps: draft.steps,
+    keywords: draft.keywords,
+    spicy_level: draft.spicyLevel,
+    difficulty: draft.difficulty,
+    minutes: draft.minutes,
+    tutorial_platform: draft.tutorialPlatform,
+    tutorial_author: draft.tutorialAuthor,
+    tutorial_url: draft.tutorialUrl,
+    tutorial_note: draft.tutorialNote,
+    is_published: draft.published ?? true,
+  }
+}
+
 export class SupabaseRepository implements MenuRepository {
   private remoteReady = false
 
@@ -91,29 +112,26 @@ export class SupabaseRepository implements MenuRepository {
 
   async saveRecipe(draft: RecipeDraft) {
     if (!supabase) return localRepository.saveRecipe(draft)
-    const { data, error } = await supabase.from('recipes').insert({
-      chef_id: draft.chefId,
-      name: draft.name,
-      aliases: draft.aliases,
-      category: draft.category,
-      cover_url: draft.coverUrl,
-      ingredients: draft.ingredients,
-      steps: draft.steps,
-      keywords: draft.keywords,
-      spicy_level: draft.spicyLevel,
-      difficulty: draft.difficulty,
-      minutes: draft.minutes,
-      tutorial_platform: draft.tutorialPlatform,
-      tutorial_author: draft.tutorialAuthor,
-      tutorial_url: draft.tutorialUrl,
-      tutorial_note: draft.tutorialNote,
-      is_published: draft.published ?? true,
-    }).select().single()
+    const { data, error } = await supabase.from('recipes').insert(recipeRow(draft)).select().single()
     if (error) {
       throw new Error(`菜谱保存失败：${error.message}。请检查 recipes 表的管理员 RLS Policy。`)
     }
     this.remoteReady = true
     return mapRecipe(data)
+  }
+
+  async updateRecipe(id: string, draft: RecipeDraft) {
+    if (!supabase) return localRepository.updateRecipe(id, draft)
+    const { data, error } = await supabase
+      .from('recipes').update(recipeRow(draft)).eq('id', id).select().single()
+    if (error) throw new Error(`菜品修改失败：${error.message}`)
+    return mapRecipe(data)
+  }
+
+  async deleteRecipe(id: string) {
+    if (!supabase) return localRepository.deleteRecipe(id)
+    const { error } = await supabase.from('recipes').delete().eq('id', id)
+    if (error) throw new Error(`撤菜失败：${error.message}`)
   }
 
   async getMenu(date: string, chefId: string) {

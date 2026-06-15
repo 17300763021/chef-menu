@@ -19,9 +19,11 @@ function App() {
             <NavLink to="/recipes">自己点菜</NavLink>
             <NavLink to="/today">今日菜单</NavLink>
             <NavLink to="/history">做菜日历</NavLink>
-            <NavLink to="/admin">管理</NavLink>
           </nav>
-          <div className="desktop-chef-switcher"><ChefSwitcher /></div>
+          <div className="header-actions">
+            <div className="desktop-chef-switcher"><ChefSwitcher /></div>
+            <NavLink to="/admin" className="kitchen-door">后厨重地</NavLink>
+          </div>
         </header>
         <main>
           <Routes>
