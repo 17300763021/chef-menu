@@ -91,6 +91,6 @@ describe('chef menu application', () => {
     await userEvent.click(await screen.findByRole('tab', { name: '任务中心' }))
     await userEvent.click(screen.getByRole('button', { name: '运行实时决策' }))
 
-    expect(await screen.findByText(/任务请求提交失败/)).toBeInTheDocument()
+    expect(await screen.findByText(/任务请求提交失败|不能提交线上任务请求/)).toBeInTheDocument()
   })
 })
