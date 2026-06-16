@@ -6,6 +6,7 @@ import { RecipeDetailPage } from './pages/RecipeDetailPage'
 import { RecipesPage } from './pages/RecipesPage'
 import { TodayMenuPage } from './pages/TodayMenuPage'
 import { AdminPage } from './pages/AdminPage'
+import StockDashboard from './features/stocks/StockDashboard'
 import './App.css'
 
 function App() {
@@ -22,6 +23,7 @@ function App() {
           </nav>
           <div className="header-actions">
             <div className="desktop-chef-switcher"><ChefSwitcher /></div>
+            <NavLink to="/stocks" className="stock-door">股票助手</NavLink>
             <NavLink to="/admin" className="kitchen-door">后厨重地</NavLink>
           </div>
         </header>
@@ -33,6 +35,7 @@ function App() {
             <Route path="/today" element={<TodayMenuPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/admin" element={<AdminPage />} />
+            <Route path="/stocks" element={<StockDashboard />} />
           </Routes>
         </main>
         <footer><b>陈大厨菜单</b><span>写完代码，也要认真吃饭。</span></footer>

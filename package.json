@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "sync:stocks": "py scripts/sync_stock_data.py",
+    "sync:stocks:holdings": "py scripts/sync_stock_data.py --sync-holdings",
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview"

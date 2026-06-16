@@ -54,4 +54,33 @@ describe('chef menu application', () => {
     expect(await screen.findByText('今天推荐这两道')).toBeInTheDocument()
     expect(saveMenu).not.toHaveBeenCalled()
   })
+
+  it('opens the stock strategy assistant from the header action button', async () => {
+    render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
+
+    await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
+
+    expect(await screen.findByRole('heading', { name: '股票策略助手' })).toBeInTheDocument()
+    expect(screen.getByText('盘中实时决策')).toBeInTheDocument()
+  })
+
+  it('adds a holding with a custom suggestion in the stock assistant', async () => {
+    render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
+
+    await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
+    await userEvent.click(await screen.findByRole('tab', { name: '当前持仓' }))
+    await userEvent.click(screen.getByRole('button', { name: '新增持仓' }))
+
+    await userEvent.type(screen.getByLabelText('股票代码'), '000001')
+    await userEvent.type(screen.getByLabelText('股票名称'), '平安银行')
+    await userEvent.clear(screen.getByLabelText('成本价'))
+    await userEvent.type(screen.getByLabelText('成本价'), '10.50')
+    await userEvent.clear(screen.getByLabelText('持仓股数'))
+    await userEvent.type(screen.getByLabelText('持仓股数'), '100')
+    await userEvent.type(screen.getByLabelText('当前建议'), '等待回踩，不追高')
+    await userEvent.click(screen.getByRole('button', { name: '保存持仓' }))
+
+    expect(await screen.findByText('平安银行')).toBeInTheDocument()
+    expect(screen.getByText('等待回踩，不追高')).toBeInTheDocument()
+  })
 })
