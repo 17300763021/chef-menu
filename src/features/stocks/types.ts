@@ -76,6 +76,8 @@ export interface AddHoldingInput {
 }
 
 export type TradeAction = '加仓' | '减仓' | '清仓'
+export type SignalEventType = '买入' | '卖出' | '减仓' | '止损' | '止盈' | '做T买' | '做T卖' | '观察'
+export type SignalEventStatus = '新信号' | '已买入' | '已卖出' | '已忽略' | '已记录T'
 
 export interface SaveTradeInput {
   action: TradeAction
@@ -92,6 +94,46 @@ export interface SaveTradeResult {
 }
 
 export type StockJobType = 'night_scan' | 'live_decision' | 'sync_latest'
+
+export interface SignalEvent {
+  id: string
+  signalTime: string
+  signalDate: string
+  code: string
+  name: string
+  sourceType: string
+  signalType: SignalEventType
+  status: SignalEventStatus
+  triggerPrice: number
+  currentPrice: number
+  changeRate: number
+  buyPriceText: string
+  sellPriceText: string
+  stopLoss: number
+  targetPrice1: number | null
+  finalAction: string
+  reason: string
+  risk: string
+  createdAt: string
+}
+
+export interface ConfirmSignalBuyInput {
+  signal: SignalEvent
+  shares: number
+  price: number
+  buyDate: string
+  memo: string
+}
+
+export interface RecordTTradeInput {
+  signal: SignalEvent
+  holding: HoldingStock
+  action: '做T买' | '做T卖'
+  price: number
+  shares: number
+  tradeDate: string
+  memo: string
+}
 
 export interface TradeRecord {
   code: string

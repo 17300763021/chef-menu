@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -43,6 +44,32 @@ def pending_requests(client: SupabaseRest) -> list[dict[str, Any]]:
         "stock_job_requests?status=eq.pending&order=requested_at.asc&limit=5",
     )
     return rows or []
+
+
+def open_positions(client: SupabaseRest) -> list[dict[str, Any]]:
+    rows = client.request(
+        "GET",
+        "stock_positions?status=eq.open&select=code,name,cost_price,shares",
+    )
+    return rows or []
+
+
+def write_holdings_csv(client: SupabaseRest) -> Path | None:
+    rows = open_positions(client)
+    if not rows:
+        return None
+    path = ENGINE_DIR / "holdings_from_supabase.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["代码", "名称", "成本", "股数"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "代码": str(row.get("code", "")).zfill(6),
+                "名称": row.get("name", ""),
+                "成本": row.get("cost_price", 0),
+                "股数": row.get("shares", 0),
+            })
+    return path
 
 
 def sync_generated(stock_dir: Path, include_holdings: bool = False) -> None:
@@ -89,6 +116,7 @@ def run_live_decision() -> None:
     env["A_STOCK_SPOT_SOURCE"] = env.get("A_STOCK_SPOT_SOURCE", "tencent")
     strong_watchlist = ENGINE_DIR / "watchlists" / "latest_strong_watchlist.csv"
     watchlist = "watchlists/latest_strong_watchlist.csv" if has_csv_rows(strong_watchlist) else "watchlists/latest_watchlist.csv"
+    holdings_path = write_holdings_csv(get_client())
     command = [
         sys.executable,
         "-B",
@@ -99,6 +127,8 @@ def run_live_decision() -> None:
         "--minute-period",
         "5",
     ]
+    if holdings_path:
+        command.extend(["--holdings", holdings_path.name])
     print("+", " ".join(command), flush=True)
     subprocess.run(command, cwd=ENGINE_DIR, env=env, check=True)
 

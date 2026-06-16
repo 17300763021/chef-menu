@@ -6,14 +6,15 @@ import type {
   OverviewStats,
   RealtimeDecision,
   RoughStock,
+  SignalEvent,
   TaskRecord,
   TradeAction,
   TradeRecord,
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord
-type TabId = 'live' | 'holdings' | 'rough' | 'fine' | 'trades' | 'tasks'
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent
+type TabId = 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
 
 interface Column<T> {
   header: string
@@ -71,7 +72,7 @@ function DataTable<T extends StockRow>({
 }
 
 export default function StockDashboard() {
-  const [activeTab, setActiveTab] = useState<TabId>('live')
+  const [activeTab, setActiveTab] = useState<TabId>('signals')
   const [loading, setLoading] = useState(true)
   const [selectedStock, setSelectedStock] = useState<StockRow | null>(null)
   const [tradeModal, setTradeModal] = useState<{ action: TradeAction; stock: HoldingStock } | null>(null)
@@ -87,9 +88,11 @@ export default function StockDashboard() {
   const [holdings, setHoldings] = useState<HoldingStock[]>([])
   const [trades, setTrades] = useState<TradeRecord[]>([])
   const [tasks, setTasks] = useState<TaskRecord[]>([])
+  const [signals, setSignals] = useState<SignalEvent[]>([])
+  const [historicalFineStocks, setHistoricalFineStocks] = useState<FineStock[]>([])
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -97,6 +100,8 @@ export default function StockDashboard() {
       stockRepository.getHoldings(),
       stockRepository.getTradeRecords(),
       stockRepository.getTasks(),
+      stockRepository.getSignalEvents(),
+      stockRepository.getHistoricalFineStocks(),
     ])
     setOverview(stats)
     setRoughStocks(rough)
@@ -105,13 +110,15 @@ export default function StockDashboard() {
     setHoldings(currentHoldings)
     setTrades(tradeRecords)
     setTasks(taskRecords)
+    setSignals(signalEvents)
+    setHistoricalFineStocks(historicalPicks)
   }
 
   useEffect(() => {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -119,6 +126,8 @@ export default function StockDashboard() {
         stockRepository.getHoldings(),
         stockRepository.getTradeRecords(),
         stockRepository.getTasks(),
+        stockRepository.getSignalEvents(),
+        stockRepository.getHistoricalFineStocks(),
       ])
       if (!mounted) return
       setOverview(stats)
@@ -128,6 +137,8 @@ export default function StockDashboard() {
       setHoldings(currentHoldings)
       setTrades(tradeRecords)
       setTasks(taskRecords)
+      setSignals(signalEvents)
+      setHistoricalFineStocks(historicalPicks)
       setLoading(false)
     }
     void load()
@@ -145,10 +156,12 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
+    { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
     { id: 'holdings' as const, label: '当前持仓' },
     { id: 'rough' as const, label: '今日海选' },
     { id: 'fine' as const, label: '今日精选' },
+    { id: 'history' as const, label: '历史精选' },
     { id: 'trades' as const, label: '清仓复盘' },
     { id: 'tasks' as const, label: '任务中心' },
   ], [])
@@ -234,6 +247,150 @@ export default function StockDashboard() {
     { header: '导入条数', cell: (row) => row.importedCount, align: 'right' },
   ]
 
+  const signalColumns: Column<SignalEvent>[] = [
+    { header: '触发时间', cell: (row) => row.signalTime },
+    { header: '类型', cell: (row) => <StatusTag status={row.signalType} /> },
+    { header: '状态', cell: (row) => row.status },
+    { header: '来源', cell: (row) => row.sourceType },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '触发价', cell: (row) => formatPrice(row.triggerPrice), align: 'right' },
+    { header: '涨跌幅', cell: (row) => <ColorNumber value={row.changeRate} suffix="%" />, align: 'right' },
+    { header: '买入计划', cell: (row) => row.buyPriceText },
+    { header: '卖出计划', cell: (row) => row.sellPriceText },
+    { header: '动作', cell: (row) => signalActions(row) },
+  ]
+
+  const historyColumns: Column<FineStock>[] = [
+    { header: '入选日期', cell: (row) => row.date },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '策略等级', cell: (row) => row.strategyLevel },
+    { header: '排名分', cell: (row) => row.score, align: 'right' },
+    { header: '昨收', cell: (row) => formatPrice(row.prevClose), align: 'right' },
+    { header: '信号', cell: (row) => row.signal },
+    { header: '入选理由', cell: (row) => row.reason },
+    { header: '风险', cell: (row) => row.risk },
+  ]
+
+  function numberPrompt(message: string, fallback: number) {
+    const value = window.prompt(message, String(fallback))
+    if (value === null) return null
+    const parsed = Number(value)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+  }
+
+  function todayInputValue() {
+    return new Date().toISOString().slice(0, 10)
+  }
+
+  async function handleSignalBuy(signal: SignalEvent) {
+    const shares = numberPrompt('确认线下买入股数', 100)
+    if (!shares) return
+    const price = numberPrompt('确认线下买入价格', signal.triggerPrice || signal.currentPrice)
+    if (!price) return
+    setErrorMessage('')
+    try {
+      const holding = await stockRepository.confirmSignalBuy({
+        signal,
+        shares,
+        price,
+        buyDate: todayInputValue(),
+        memo: signal.reason || signal.finalAction,
+      })
+      setHoldings((items) => [holding, ...items])
+      setSignals((items) => items.map((item) => item.id === signal.id ? { ...item, status: '已买入' } : item))
+      setSavedMessage(`${signal.name} 已记录为持仓。`)
+    } catch (reason) {
+      setErrorMessage(reason instanceof Error ? reason.message : '信号买入记录失败')
+    }
+  }
+
+  async function handleSignalSell(signal: SignalEvent) {
+    const holding = holdings.find((item) => item.code === signal.code)
+    if (!holding) {
+      setErrorMessage('没有找到对应持仓，请先刷新或手动检查当前持仓。')
+      return
+    }
+    const price = numberPrompt('确认线下卖出价格', signal.triggerPrice || holding.currentPrice)
+    if (!price) return
+    setErrorMessage('')
+    try {
+      const result = await stockRepository.saveTrade({
+        action: '清仓',
+        holding,
+        price,
+        shares: holding.shares,
+        tradeDate: todayInputValue(),
+        memo: signal.finalAction || signal.sellPriceText,
+      })
+      await stockRepository.markSignalEvent(signal.id, '已卖出')
+      setHoldings((items) => items.filter((item) => item.code !== signal.code))
+      if (result.tradeRecord) setTrades((items) => [result.tradeRecord as TradeRecord, ...items])
+      setSignals((items) => items.map((item) => item.id === signal.id ? { ...item, status: '已卖出' } : item))
+      setSavedMessage(`${signal.name} 已记录清仓复盘。`)
+    } catch (reason) {
+      setErrorMessage(reason instanceof Error ? reason.message : '信号卖出记录失败')
+    }
+  }
+
+  async function handleSignalT(signal: SignalEvent) {
+    const holding = holdings.find((item) => item.code === signal.code)
+    if (!holding) {
+      setErrorMessage('做 T 需要已有持仓。')
+      return
+    }
+    const action = signal.signalType === '做T卖' ? '做T卖' : '做T买'
+    const shares = numberPrompt(`确认${action}股数`, 100)
+    if (!shares) return
+    const price = numberPrompt(`确认${action}价格`, signal.triggerPrice || holding.currentPrice)
+    if (!price) return
+    setErrorMessage('')
+    try {
+      const result = await stockRepository.recordTTrade({
+        signal,
+        holding,
+        action,
+        price,
+        shares,
+        tradeDate: todayInputValue(),
+        memo: signal.finalAction || action,
+      })
+      setHoldings((items) => {
+        if (!result.holding) return items.filter((item) => item.code !== holding.code)
+        return items.map((item) => item.code === holding.code ? result.holding as HoldingStock : item)
+      })
+      if (result.tradeRecord) setTrades((items) => [result.tradeRecord as TradeRecord, ...items])
+      setSignals((items) => items.map((item) => item.id === signal.id ? { ...item, status: '已记录T' } : item))
+      setSavedMessage(`${signal.name} 已记录${action}。`)
+    } catch (reason) {
+      setErrorMessage(reason instanceof Error ? reason.message : '做 T 记录失败')
+    }
+  }
+
+  async function handleIgnoreSignal(signal: SignalEvent) {
+    setErrorMessage('')
+    try {
+      await stockRepository.markSignalEvent(signal.id, '已忽略')
+      setSignals((items) => items.map((item) => item.id === signal.id ? { ...item, status: '已忽略' } : item))
+      setSavedMessage('信号已忽略。')
+    } catch (reason) {
+      setErrorMessage(reason instanceof Error ? reason.message : '信号忽略失败')
+    }
+  }
+
+  function signalActions(signal: SignalEvent) {
+    if (signal.status !== '新信号') return <span>-</span>
+    return (
+      <div className="stock-row-actions">
+        {signal.signalType === '买入' && <button type="button" onClick={(event) => { event.stopPropagation(); void handleSignalBuy(signal) }}>买入</button>}
+        {(['卖出', '减仓', '止损', '止盈'] as string[]).includes(signal.signalType) && <button type="button" onClick={(event) => { event.stopPropagation(); void handleSignalSell(signal) }}>清仓</button>}
+        {(['做T买', '做T卖'] as string[]).includes(signal.signalType) && <button type="button" onClick={(event) => { event.stopPropagation(); void handleSignalT(signal) }}>记录T</button>}
+        <button type="button" onClick={(event) => { event.stopPropagation(); void handleIgnoreSignal(signal) }}>忽略</button>
+      </div>
+    )
+  }
+
   async function submitTrade(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!tradeModal) return
@@ -287,10 +444,6 @@ export default function StockDashboard() {
     } catch (reason) {
       setErrorMessage(reason instanceof Error ? reason.message : '保存失败')
     }
-  }
-
-  function todayInputValue() {
-    return new Date().toISOString().slice(0, 10)
   }
 
   function explainLocalScript(action: 'night' | 'live' | 'sync') {
@@ -347,6 +500,7 @@ export default function StockDashboard() {
           ['当前持仓', holdings.length],
           ['可买入', overview?.buyableCount],
           ['风控提醒', overview?.alertCount],
+          ['新信号', signals.filter((item) => item.status === '新信号').length],
         ].map(([label, value]) => (
           <article key={label}>
             <span>{label}</span>
@@ -381,6 +535,17 @@ export default function StockDashboard() {
 
         <div className="stock-panel">
           {activeTab === 'live' && <DataTable columns={realtimeColumns} data={realtime} onRowClick={setSelectedStock} />}
+          {activeTab === 'signals' && (
+            <div className="stock-section-stack">
+              <div className="stock-panel-heading">
+                <div>
+                  <h2>信号中心</h2>
+                  <p>自动盯盘产生的买入、卖出、止损、止盈和做 T 提醒；按钮只记录你的线下操作。</p>
+                </div>
+              </div>
+              <DataTable columns={signalColumns} data={signals} onRowClick={setSelectedStock} />
+            </div>
+          )}
           {activeTab === 'holdings' && (
             <div className="stock-section-stack">
               <div className="stock-panel-heading">
@@ -395,6 +560,7 @@ export default function StockDashboard() {
           )}
           {activeTab === 'rough' && <DataTable columns={roughColumns} data={roughStocks} onRowClick={setSelectedStock} />}
           {activeTab === 'fine' && <DataTable columns={fineColumns} data={fineStocks} onRowClick={setSelectedStock} />}
+          {activeTab === 'history' && <DataTable columns={historyColumns} data={historicalFineStocks} onRowClick={setSelectedStock} />}
           {activeTab === 'trades' && <DataTable columns={tradeColumns} data={trades} onRowClick={setSelectedStock} />}
           {activeTab === 'tasks' && (
             <div className="stock-task-panel">
@@ -458,6 +624,9 @@ export default function StockDashboard() {
           <dl>
             {'date' in selectedStock && <><dt>日期</dt><dd>{selectedStock.date}</dd></>}
             {'finalAction' in selectedStock && <><dt>最终动作</dt><dd>{selectedStock.finalAction}</dd></>}
+            {'signalType' in selectedStock && <><dt>信号类型</dt><dd>{selectedStock.signalType}</dd></>}
+            {'buyPriceText' in selectedStock && <><dt>买入计划</dt><dd>{selectedStock.buyPriceText}</dd></>}
+            {'sellPriceText' in selectedStock && <><dt>卖出计划</dt><dd>{selectedStock.sellPriceText}</dd></>}
             {'reason' in selectedStock && <><dt>入选理由</dt><dd>{selectedStock.reason}</dd></>}
             {'sellMemo' in selectedStock && <><dt>卖出说明</dt><dd>{selectedStock.sellMemo}</dd></>}
             {'type' in selectedStock && <><dt>任务类型</dt><dd>{selectedStock.type}</dd></>}
