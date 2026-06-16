@@ -78,6 +78,7 @@ export default function StockDashboard() {
   const [showAddHoldingModal, setShowAddHoldingModal] = useState(false)
   const [savedMessage, setSavedMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
+  const [autoRefresh, setAutoRefresh] = useState(false)
 
   const [overview, setOverview] = useState<OverviewStats | null>(null)
   const [roughStocks, setRoughStocks] = useState<RoughStock[]>([])
@@ -86,6 +87,25 @@ export default function StockDashboard() {
   const [holdings, setHoldings] = useState<HoldingStock[]>([])
   const [trades, setTrades] = useState<TradeRecord[]>([])
   const [tasks, setTasks] = useState<TaskRecord[]>([])
+
+  async function loadStockData() {
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords] = await Promise.all([
+      stockRepository.getOverview(),
+      stockRepository.getRoughStocks(),
+      stockRepository.getFineStocks(),
+      stockRepository.getRealtimeDecisions(),
+      stockRepository.getHoldings(),
+      stockRepository.getTradeRecords(),
+      stockRepository.getTasks(),
+    ])
+    setOverview(stats)
+    setRoughStocks(rough)
+    setFineStocks(fine)
+    setRealtime(live)
+    setHoldings(currentHoldings)
+    setTrades(tradeRecords)
+    setTasks(taskRecords)
+  }
 
   useEffect(() => {
     let mounted = true
@@ -115,6 +135,14 @@ export default function StockDashboard() {
       mounted = false
     }
   }, [])
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined
+    const timer = window.setInterval(() => {
+      void loadStockData()
+    }, 60000)
+    return () => window.clearInterval(timer)
+  }, [autoRefresh])
 
   const tabs = useMemo(() => [
     { id: 'live' as const, label: '盘中实时决策' },
@@ -265,6 +293,27 @@ export default function StockDashboard() {
     return new Date().toISOString().slice(0, 10)
   }
 
+  function explainLocalScript(action: 'night' | 'live' | 'sync') {
+    setErrorMessage('')
+    const commands = {
+      night: '线上网页不能直接运行你电脑里的 Python。请在本机运行夜间筛选脚本，生成当天 CSV 后再同步。',
+      live: '线上网页不能直接运行你电脑里的 Python。请在本机运行实时决策脚本，生成当天 CSV 后再同步。',
+      sync: '线上网页不能持有 service_role key。请在本机 PowerShell 运行 npm run sync:stocks 同步当天 CSV。',
+    }
+    setSavedMessage(commands[action])
+  }
+
+  async function toggleAutoRefresh() {
+    const next = !autoRefresh
+    setAutoRefresh(next)
+    if (next) {
+      await loadStockData()
+      setSavedMessage('已开启每分钟刷新：网页会每 60 秒重新读取数据库数据。')
+    } else {
+      setSavedMessage('已关闭每分钟刷新。')
+    }
+  }
+
   if (loading) {
     return <section className="stock-dashboard stock-loading">正在同步策略工作台数据...</section>
   }
@@ -339,10 +388,10 @@ export default function StockDashboard() {
           {activeTab === 'tasks' && (
             <div className="stock-task-panel">
               <div className="stock-task-actions">
-                <button type="button">运行夜间筛选</button>
-                <button type="button">运行实时决策</button>
-                <button type="button">同步到数据库</button>
-                <button type="button">每分钟刷新</button>
+                <button type="button" onClick={() => explainLocalScript('night')}>运行夜间筛选</button>
+                <button type="button" onClick={() => explainLocalScript('live')}>运行实时决策</button>
+                <button type="button" onClick={() => explainLocalScript('sync')}>同步到数据库</button>
+                <button type="button" onClick={() => void toggleAutoRefresh()}>{autoRefresh ? '停止每分钟刷新' : '每分钟刷新'}</button>
               </div>
               <DataTable columns={taskColumns} data={tasks} />
             </div>

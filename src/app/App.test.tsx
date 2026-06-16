@@ -83,4 +83,14 @@ describe('chef menu application', () => {
     expect(await screen.findByText('平安银行')).toBeInTheDocument()
     expect(screen.getByText('等待回踩，不追高')).toBeInTheDocument()
   })
+
+  it('explains why stock task buttons cannot run local scripts online', async () => {
+    render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
+
+    await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
+    await userEvent.click(await screen.findByRole('tab', { name: '任务中心' }))
+    await userEvent.click(screen.getByRole('button', { name: '运行实时决策' }))
+
+    expect(await screen.findByText(/线上网页不能直接运行你电脑里的 Python/)).toBeInTheDocument()
+  })
 })
