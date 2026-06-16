@@ -145,6 +145,17 @@ def strong_row(row: dict[str, str]) -> dict[str, Any]:
     return mapped
 
 
+def fallback_strong_rows(watch_rows: list[dict[str, str]], limit: int = 10) -> list[dict[str, Any]]:
+    ranked = sorted(watch_rows, key=lambda row: parse_float(row.get("排名分")) or 0, reverse=True)
+    rows = []
+    for row in ranked[:limit]:
+        mapped = scan_row(row)
+        mapped["strategy_level"] = row.get("策略等级") or row.get("池分类") or "海选精选候选"
+        mapped["review_status"] = row.get("策略复核") or "重点池为空，按海选排名展示"
+        rows.append(mapped)
+    return rows
+
+
 def live_row(row: dict[str, str]) -> dict[str, Any]:
     time_text = row.get("时间", "")
     return {
@@ -204,8 +215,12 @@ def main() -> int:
     client = SupabaseRest(url, key)
     stock_dir = args.stock_dir
 
-    watch_rows = [scan_row(row) for row in read_csv(stock_dir / "watchlists" / "latest_watchlist.csv")]
-    strong_rows = [strong_row(row) for row in read_csv(stock_dir / "watchlists" / "latest_strong_watchlist.csv")]
+    raw_watch_rows = read_csv(stock_dir / "watchlists" / "latest_watchlist.csv")
+    raw_strong_rows = read_csv(stock_dir / "watchlists" / "latest_strong_watchlist.csv")
+    watch_rows = [scan_row(row) for row in raw_watch_rows]
+    strong_rows = [strong_row(row) for row in raw_strong_rows]
+    if not strong_rows and raw_watch_rows:
+        strong_rows = fallback_strong_rows(raw_watch_rows)
     live_rows = [live_row(row) for row in read_csv(stock_dir / "live_reports" / "latest_live_decision.csv")]
 
     counts: dict[str, int] = {}

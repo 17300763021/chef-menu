@@ -52,6 +52,13 @@ def sync_generated(stock_dir: Path, include_holdings: bool = False) -> None:
     run_command(args, ROOT)
 
 
+def has_csv_rows(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8-sig") as handle:
+        return len([line for line in handle if line.strip()]) > 1
+
+
 def run_night_scan() -> None:
     env = os.environ.copy()
     env["A_STOCK_SPOT_SOURCE"] = env.get("A_STOCK_SPOT_SOURCE", "tencent")
@@ -80,12 +87,14 @@ def run_night_scan() -> None:
 def run_live_decision() -> None:
     env = os.environ.copy()
     env["A_STOCK_SPOT_SOURCE"] = env.get("A_STOCK_SPOT_SOURCE", "tencent")
+    strong_watchlist = ENGINE_DIR / "watchlists" / "latest_strong_watchlist.csv"
+    watchlist = "watchlists/latest_strong_watchlist.csv" if has_csv_rows(strong_watchlist) else "watchlists/latest_watchlist.csv"
     command = [
         sys.executable,
         "-B",
         "a_stock_live_decision_v8.py",
         "--watchlist",
-        "watchlists/latest_strong_watchlist.csv",
+        watchlist,
         "--show-checks",
         "--minute-period",
         "5",
