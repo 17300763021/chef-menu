@@ -95,7 +95,7 @@ def run_night_scan() -> None:
         "-B",
         "a_stock_night_scanner_v7.py",
         "--limit",
-        os.environ.get("STOCK_SCAN_LIMIT", "1000"),
+        os.environ.get("STOCK_SCAN_LIMIT", "300"),
         "--top",
         os.environ.get("STOCK_SCAN_TOP", "50"),
         "--strong-top",

@@ -52,3 +52,10 @@
 - [x] Run production build.
 - [x] Run lint.
 - [x] Verify the account overview renders locally in browser.
+
+### Task 5: Data Run Usability
+
+**Files:**
+- Modify: `scripts/run_stock_tasks.py`
+
+- [x] Lower the default GitHub Actions scan limit from 1000 to 300 so manual full data refreshes complete faster for webpage review.
