@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
+import { buildAccountSummary, recommendSignalBuy } from './account'
 import { stockRepository } from './repository'
+import type { PositionAllocation } from './account'
 import type {
   FineStock,
   HoldingStock,
@@ -13,8 +15,8 @@ import type {
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent
-type TabId = 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation
+type TabId = 'account' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
 
 interface Column<T> {
   header: string
@@ -26,6 +28,10 @@ function formatPrice(value: number | null) {
   return value === null ? '-' : value.toFixed(2)
 }
 
+function formatMoney(value: number) {
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+}
+
 function ColorNumber({ value, suffix = '' }: { value: number; suffix?: string }) {
   const className = value > 0 ? 'stock-up' : value < 0 ? 'stock-down' : 'stock-flat'
   const prefix = value > 0 ? '+' : ''
@@ -35,6 +41,38 @@ function ColorNumber({ value, suffix = '' }: { value: number; suffix?: string })
 function StatusTag({ status }: { status: string }) {
   const tone = status.includes('止损') ? 'risk' : status.includes('止盈') ? 'profit' : status.includes('可买') ? 'buy' : status.includes('成功') ? 'ok' : 'neutral'
   return <span className={`stock-status stock-status-${tone}`}>{status}</span>
+}
+
+function isHoldingStock(row: StockRow): row is HoldingStock {
+  return 'marketValue' in row && 'currentSuggestion' in row
+}
+
+function PriceLevelChart({ levels }: { levels: Array<{ label: string; value: number; tone?: string }> }) {
+  const validLevels = levels.filter((item) => Number.isFinite(item.value) && item.value > 0)
+  if (validLevels.length === 0) return null
+  const min = Math.min(...validLevels.map((item) => item.value))
+  const max = Math.max(...validLevels.map((item) => item.value))
+  const span = Math.max(max - min, max * 0.02)
+  return (
+    <div className="stock-level-chart">
+      <h3>关键价位</h3>
+      <div className="stock-level-track">
+        {validLevels.map((item) => (
+          <span
+            key={item.label}
+            className={item.tone}
+            style={{ left: `${Math.min(96, Math.max(4, ((item.value - min) / span) * 92 + 4))}%` }}
+            title={`${item.label} ${formatPrice(item.value)}`}
+          />
+        ))}
+      </div>
+      <div className="stock-level-list">
+        {validLevels.map((item) => (
+          <p key={item.label}><b>{item.label}</b><span>{formatPrice(item.value)}</span></p>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function DataTable<T extends StockRow>({
@@ -72,7 +110,7 @@ function DataTable<T extends StockRow>({
 }
 
 export default function StockDashboard() {
-  const [activeTab, setActiveTab] = useState<TabId>('signals')
+  const [activeTab, setActiveTab] = useState<TabId>('account')
   const [loading, setLoading] = useState(true)
   const [selectedStock, setSelectedStock] = useState<StockRow | null>(null)
   const [tradeModal, setTradeModal] = useState<{ action: TradeAction; stock: HoldingStock } | null>(null)
@@ -90,6 +128,7 @@ export default function StockDashboard() {
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [signals, setSignals] = useState<SignalEvent[]>([])
   const [historicalFineStocks, setHistoricalFineStocks] = useState<FineStock[]>([])
+  const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
 
   async function loadStockData() {
     const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks] = await Promise.all([
@@ -156,6 +195,7 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
+    { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
     { id: 'holdings' as const, label: '当前持仓' },
@@ -208,7 +248,9 @@ export default function StockDashboard() {
     { header: '成本价', cell: (row) => formatPrice(row.costPrice), align: 'right' },
     { header: '当前价', cell: (row) => formatPrice(row.currentPrice), align: 'right' },
     { header: '股数', cell: (row) => row.shares, align: 'right' },
+    { header: '成本金额', cell: (row) => formatMoney(row.costPrice * row.shares), align: 'right' },
     { header: '市值', cell: (row) => row.marketValue.toFixed(0), align: 'right' },
+    { header: '账户占比', cell: (row) => `${accountSummary.positions.find((item) => item.code === row.code)?.allocationRate ?? 0}%`, align: 'right' },
     { header: '浮盈亏', cell: (row) => <ColorNumber value={row.floatingPnl} />, align: 'right' },
     { header: '盈亏率', cell: (row) => <ColorNumber value={row.pnlRate} suffix="%" />, align: 'right' },
     { header: '当前建议', cell: (row) => row.currentSuggestion },
@@ -273,6 +315,17 @@ export default function StockDashboard() {
     { header: '风险', cell: (row) => row.risk },
   ]
 
+  const allocationColumns: Column<PositionAllocation>[] = [
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '成本金额', cell: (row) => formatMoney(row.costAmount), align: 'right' },
+    { header: '当前市值', cell: (row) => formatMoney(row.marketValue), align: 'right' },
+    { header: '账户占比', cell: (row) => `${row.allocationRate}%`, align: 'right' },
+    { header: '浮盈亏', cell: (row) => <ColorNumber value={row.floatingPnl} />, align: 'right' },
+    { header: '收益贡献', cell: (row) => <ColorNumber value={row.pnlContributionRate} suffix="%" />, align: 'right' },
+    { header: '仓位状态', cell: (row) => row.overSinglePositionLimit ? <StatusTag status="超单票上限" /> : '正常' },
+  ]
+
   function numberPrompt(message: string, fallback: number) {
     const value = window.prompt(message, String(fallback))
     if (value === null) return null
@@ -285,7 +338,12 @@ export default function StockDashboard() {
   }
 
   async function handleSignalBuy(signal: SignalEvent) {
-    const shares = numberPrompt('确认线下买入股数', 100)
+    const recommendation = recommendSignalBuy(signal, accountSummary)
+    if (recommendation.maxShares <= 0) {
+      setErrorMessage(recommendation.reason)
+      return
+    }
+    const shares = numberPrompt(`确认线下买入股数。策略建议：${recommendation.maxShares} 股，约 ${formatMoney(recommendation.estimatedAmount)} 元；${recommendation.reason}`, recommendation.maxShares || 100)
     if (!shares) return
     const price = numberPrompt('确认线下买入价格', signal.triggerPrice || signal.currentPrice)
     if (!price) return
@@ -495,6 +553,9 @@ export default function StockDashboard() {
 
       <div className="stock-stats">
         {[
+          ['总资产', formatMoney(accountSummary.totalAssets)],
+          ['可用现金', formatMoney(accountSummary.cash)],
+          ['总盈亏', `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
           ['今日海选', overview?.roughCount],
           ['今日精选', overview?.fineCount],
           ['当前持仓', holdings.length],
@@ -508,6 +569,34 @@ export default function StockDashboard() {
           </article>
         ))}
       </div>
+
+      <div className="stock-account-overview">
+        <section>
+          <span>初始本金</span>
+          <strong>¥{formatMoney(accountSummary.initialCapital)}</strong>
+        </section>
+        <section>
+          <span>当前持仓市值</span>
+          <strong>¥{formatMoney(accountSummary.holdingMarketValue)}</strong>
+        </section>
+        <section>
+          <span>当前浮盈亏</span>
+          <strong><ColorNumber value={accountSummary.floatingPnl} /></strong>
+        </section>
+        <section>
+          <span>已清仓盈亏</span>
+          <strong><ColorNumber value={accountSummary.realizedPnl} /></strong>
+        </section>
+        <section>
+          <span>总收益率</span>
+          <strong><ColorNumber value={accountSummary.totalReturnRate} suffix="%" /></strong>
+        </section>
+        <section>
+          <span>风控规则</span>
+          <b>最多 6 只；单票 15%；留现金 25%</b>
+        </section>
+      </div>
+      {accountSummary.positionCountWarning && <div className="stock-account-warning">{accountSummary.positionCountWarning}</div>}
 
       <div className="stock-workbench">
         <div className="stock-toolbar">
@@ -534,6 +623,41 @@ export default function StockDashboard() {
         </div>
 
         <div className="stock-panel">
+          {activeTab === 'account' && (
+            <div className="stock-section-stack">
+              <div className="stock-panel-heading">
+                <div>
+                  <h2>账户总览</h2>
+                  <p>默认 100 万本金，按 4-6 只股票、单票最高 15%、至少保留 25% 现金做仓位控制。</p>
+                </div>
+              </div>
+              <div className="stock-chart-grid">
+                <section className="stock-mini-chart">
+                  <h3>持仓占比</h3>
+                  {accountSummary.positions.length === 0 && <div className="stock-empty">暂无持仓</div>}
+                  {accountSummary.positions.map((item) => (
+                    <div className="stock-bar-row" key={item.code}>
+                      <span>{item.name}</span>
+                      <div><i style={{ width: `${Math.min(item.allocationRate, 100)}%` }} /></div>
+                      <b>{item.allocationRate}%</b>
+                    </div>
+                  ))}
+                </section>
+                <section className="stock-mini-chart">
+                  <h3>盈亏贡献</h3>
+                  {accountSummary.positions.length === 0 && <div className="stock-empty">暂无持仓</div>}
+                  {accountSummary.positions.map((item) => (
+                    <div className="stock-bar-row stock-pnl-row" key={item.code}>
+                      <span>{item.name}</span>
+                      <div><i className={item.floatingPnl >= 0 ? 'gain' : 'loss'} style={{ width: `${Math.min(Math.abs(item.pnlContributionRate) * 12, 100)}%` }} /></div>
+                      <b><ColorNumber value={item.floatingPnl} /></b>
+                    </div>
+                  ))}
+                </section>
+              </div>
+              <DataTable columns={allocationColumns} data={accountSummary.positions} />
+            </div>
+          )}
           {activeTab === 'live' && <DataTable columns={realtimeColumns} data={realtime} onRowClick={setSelectedStock} />}
           {activeTab === 'signals' && (
             <div className="stock-section-stack">
@@ -621,8 +745,26 @@ export default function StockDashboard() {
           <button type="button" className="stock-drawer-close" onClick={() => setSelectedStock(null)}>×</button>
           <h2>{'name' in selectedStock ? selectedStock.name : '任务详情'}</h2>
           {'code' in selectedStock && <p className="stock-code">{selectedStock.code}</p>}
+          {isHoldingStock(selectedStock) && (
+            <PriceLevelChart levels={[
+              { label: '成本', value: selectedStock.costPrice },
+              { label: '当前', value: selectedStock.currentPrice, tone: selectedStock.currentPrice >= selectedStock.costPrice ? 'gain' : 'loss' },
+            ]} />
+          )}
+          {'signalType' in selectedStock && (
+            <PriceLevelChart levels={[
+              { label: '触发', value: selectedStock.triggerPrice },
+              { label: '当前', value: selectedStock.currentPrice },
+              { label: '止损', value: selectedStock.stopLoss, tone: 'loss' },
+              { label: '目标', value: selectedStock.targetPrice1 ?? 0, tone: 'gain' },
+            ]} />
+          )}
           <dl>
             {'date' in selectedStock && <><dt>日期</dt><dd>{selectedStock.date}</dd></>}
+            {isHoldingStock(selectedStock) && <><dt>成本金额</dt><dd>¥{formatMoney(selectedStock.costPrice * selectedStock.shares)}</dd></>}
+            {'marketValue' in selectedStock && <><dt>当前市值</dt><dd>¥{formatMoney(selectedStock.marketValue)}</dd></>}
+            {'marketValue' in selectedStock && <><dt>账户占比</dt><dd>{accountSummary.positions.find((item) => item.code === selectedStock.code)?.allocationRate ?? 0}%</dd></>}
+            {'floatingPnl' in selectedStock && <><dt>浮盈亏</dt><dd><ColorNumber value={selectedStock.floatingPnl} /></dd></>}
             {'finalAction' in selectedStock && <><dt>最终动作</dt><dd>{selectedStock.finalAction}</dd></>}
             {'signalType' in selectedStock && <><dt>信号类型</dt><dd>{selectedStock.signalType}</dd></>}
             {'buyPriceText' in selectedStock && <><dt>买入计划</dt><dd>{selectedStock.buyPriceText}</dd></>}
