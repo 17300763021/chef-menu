@@ -3,13 +3,16 @@ import { supabase } from '../../lib/supabase'
 import { stocksApi } from './mockApi'
 import type {
   AddHoldingInput,
+  ConfirmSignalBuyInput,
   FineStock,
   HoldingStock,
   OverviewStats,
+  RecordTTradeInput,
   RealtimeDecision,
   RoughStock,
   SaveTradeInput,
   SaveTradeResult,
+  SignalEvent,
   StockJobType,
   TaskRecord,
   TradeRecord,
@@ -190,6 +193,30 @@ function mapTask(row: Row): TaskRecord {
   }
 }
 
+function mapSignalEvent(row: Row): SignalEvent {
+  return {
+    id: text(row, 'id'),
+    signalTime: text(row, 'signal_time'),
+    signalDate: text(row, 'signal_date'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    sourceType: text(row, 'source_type'),
+    signalType: text(row, 'signal_type', '观察') as SignalEvent['signalType'],
+    status: text(row, 'status', '新信号') as SignalEvent['status'],
+    triggerPrice: numberValue(row, 'trigger_price'),
+    currentPrice: numberValue(row, 'current_price'),
+    changeRate: numberValue(row, 'change_rate'),
+    buyPriceText: text(row, 'buy_price_text'),
+    sellPriceText: text(row, 'sell_price_text'),
+    stopLoss: numberValue(row, 'stop_loss'),
+    targetPrice1: optionalNumber(row, 'target_price_1'),
+    finalAction: text(row, 'final_action'),
+    reason: text(row, 'reason'),
+    risk: text(row, 'risk'),
+    createdAt: text(row, 'created_at'),
+  }
+}
+
 export interface StockRepository {
   getOverview(): Promise<OverviewStats>
   getRoughStocks(): Promise<RoughStock[]>
@@ -198,8 +225,13 @@ export interface StockRepository {
   getHoldings(): Promise<HoldingStock[]>
   getTradeRecords(): Promise<TradeRecord[]>
   getTasks(): Promise<TaskRecord[]>
+  getSignalEvents(): Promise<SignalEvent[]>
+  getHistoricalFineStocks(): Promise<FineStock[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
   saveTrade(input: SaveTradeInput): Promise<SaveTradeResult>
+  confirmSignalBuy(input: ConfirmSignalBuyInput): Promise<HoldingStock>
+  markSignalEvent(id: string, status: SignalEvent['status']): Promise<void>
+  recordTTrade(input: RecordTTradeInput): Promise<SaveTradeResult>
   requestJob(jobType: StockJobType): Promise<void>
 }
 
@@ -272,6 +304,16 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       const rows = await selectRows('stock_job_runs', 'started_at')
       if (!client) return stocksApi.getTasks()
       return (rows ?? []).map(mapTask)
+    },
+    async getSignalEvents() {
+      const rows = await selectRows('stock_signal_events', 'signal_time')
+      if (!client) return []
+      return (rows ?? []).map(mapSignalEvent)
+    },
+    async getHistoricalFineStocks() {
+      const rows = await selectRows('stock_strong_picks', 'scan_date')
+      if (!client) return stocksApi.getFineStocks()
+      return (rows ?? []).map(mapFineStock)
     },
     async addHolding(input) {
       const holding = calculateHolding(input)
@@ -395,6 +437,45 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
         .map((item) => item.code === holding.code ? nextHolding : item)
         .filter((item): item is HoldingStock => Boolean(item))
       return { holding: nextHolding, tradeRecord }
+    },
+    async confirmSignalBuy(input) {
+      const holding = await this.addHolding({
+        code: input.signal.code,
+        name: input.signal.name,
+        costPrice: input.price,
+        shares: input.shares,
+        currentPrice: input.price,
+        buyDate: input.buyDate,
+        currentSuggestion: input.signal.finalAction || input.signal.reason,
+        buyMemo: input.memo,
+      })
+      await this.markSignalEvent(input.signal.id, '已买入')
+      return holding
+    },
+    async markSignalEvent(id, status) {
+      if (!client) return
+      try {
+        const result = await withTimeout(client
+          .from('stock_signal_events')
+          .update({ status, handled_at: new Date().toISOString() })
+          .eq('id', id))
+        const error = (result as { error?: unknown }).error
+        if (error) throw error
+      } catch {
+        throw new Error('信号状态更新失败：请确认 stock_signal_events 表已创建，并已登录管理员账号。')
+      }
+    },
+    async recordTTrade(input) {
+      const result = await this.saveTrade({
+        action: input.action === '做T买' ? '加仓' : '减仓',
+        holding: input.holding,
+        price: input.price,
+        shares: input.shares,
+        tradeDate: input.tradeDate,
+        memo: input.memo || input.action,
+      })
+      await this.markSignalEvent(input.signal.id, '已记录T')
+      return result
     },
     async requestJob(jobType) {
       if (!client) {

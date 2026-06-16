@@ -73,6 +73,16 @@ def date_from_timestamp(value: str) -> str:
     return text.split(" ")[0]
 
 
+def timestamp_from_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now().isoformat()
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return datetime.now().isoformat()
+
+
 class SupabaseRest:
     def __init__(self, url: str, key: str) -> None:
         if not url or not key:
@@ -178,6 +188,67 @@ def live_row(row: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def signal_type_from_live(row: dict[str, str]) -> str:
+    operation = row.get("操作类型", "")
+    is_holding = row.get("是否持仓") == "是"
+    final_action = row.get("最终动作", "")
+    text = " ".join([operation, final_action, row.get("现在动作", ""), row.get("卖出理由", "")])
+    if "止损" in text:
+        return "止损"
+    if "止盈" in text:
+        return "止盈"
+    if "减仓" in text:
+        return "减仓"
+    if is_holding and ("可加仓" in operation or "可以买小仓" in text or "加仓" in text):
+        return "做T买"
+    if operation == "可买入" or row.get("买入判断") == "可以买小仓":
+        return "买入"
+    return "观察"
+
+
+def should_store_signal_event(row: dict[str, str]) -> bool:
+    operation = row.get("操作类型", "")
+    final_action = row.get("最终动作", "")
+    if operation in {"可买入", "可加仓", "止损/风控", "减仓", "止盈"}:
+        return True
+    return any(keyword in final_action for keyword in ["止损", "减仓", "止盈", "加仓"])
+
+
+def signal_event_row(row: dict[str, str]) -> dict[str, Any]:
+    time_text = row.get("时间", "")
+    code = row.get("代码", "").zfill(6)
+    signal_type = signal_type_from_live(row)
+    trigger_price = parse_float(row.get("当前价")) or 0
+    signal_key = "|".join([
+        date_from_timestamp(time_text),
+        time_text.split(" ")[1] if " " in time_text else time_text,
+        code,
+        signal_type,
+        row.get("最终动作", ""),
+    ])
+    return {
+        "signal_time": timestamp_from_text(time_text),
+        "signal_date": date_from_timestamp(time_text),
+        "code": code,
+        "name": row.get("名称", ""),
+        "signal_key": signal_key,
+        "source_type": "持仓" if row.get("是否持仓") == "是" else "精选/观察",
+        "signal_type": signal_type,
+        "status": "新信号",
+        "trigger_price": trigger_price,
+        "current_price": trigger_price,
+        "change_rate": parse_float(row.get("涨跌幅")) or 0,
+        "buy_price_text": row.get("建议买入价", ""),
+        "sell_price_text": row.get("建议卖出价", ""),
+        "stop_loss": parse_float(row.get("止损位")) or 0,
+        "target_price_1": parse_float(row.get("第一止盈价")),
+        "final_action": row.get("最终动作", ""),
+        "reason": row.get("买入计划") or row.get("现在动作", ""),
+        "risk": row.get("不买原因") or row.get("卖出理由") or row.get("风险提示", ""),
+        "raw_payload": row,
+    }
+
+
 def holding_row(row: dict[str, str]) -> dict[str, Any]:
     cost = parse_float(row.get("成本")) or 0
     shares = parse_int(row.get("股数")) or 0
@@ -221,7 +292,9 @@ def main() -> int:
     strong_rows = [strong_row(row) for row in raw_strong_rows]
     if not strong_rows and raw_watch_rows:
         strong_rows = fallback_strong_rows(raw_watch_rows)
-    live_rows = [live_row(row) for row in read_csv(stock_dir / "live_reports" / "latest_live_decision.csv")]
+    raw_live_rows = read_csv(stock_dir / "live_reports" / "latest_live_decision.csv")
+    live_rows = [live_row(row) for row in raw_live_rows]
+    signal_rows = [signal_event_row(row) for row in raw_live_rows if should_store_signal_event(row)]
 
     counts: dict[str, int] = {}
     if watch_rows:
@@ -236,6 +309,8 @@ def main() -> int:
         decision_date = live_rows[0]["decision_date"]
         client.delete_equals("stock_live_decisions", "decision_date", decision_date)
         counts["stock_live_decisions"] = client.insert("stock_live_decisions", live_rows)
+    if signal_rows:
+        counts["stock_signal_events"] = client.upsert("stock_signal_events", signal_rows, "signal_key")
     if args.sync_holdings:
         holding_rows = [holding_row(row) for row in read_csv(stock_dir / "holdings.csv")]
         counts["stock_positions"] = client.upsert("stock_positions", holding_rows, "code,status")
