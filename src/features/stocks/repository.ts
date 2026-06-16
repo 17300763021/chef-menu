@@ -84,7 +84,7 @@ function tradeRecordFromInput(input: SaveTradeInput): TradeRecord {
   }
 }
 
-async function withTimeout<T>(request: PromiseLike<T>, milliseconds = 800): Promise<T> {
+async function withTimeout<T>(request: PromiseLike<T>, milliseconds = 5000): Promise<T> {
   let timer = 0
   try {
     return await Promise.race([
@@ -233,40 +233,45 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
         this.getRealtimeDecisions(),
         this.getHoldings(),
       ])
-      if (!rough.length && !fine.length && !live.length) return stocksApi.getOverview()
       return {
         roughCount: rough.length,
         fineCount: fine.length,
         holdingCount: holdings.length,
-        buyableCount: live.filter((item) => item.status === '可买入').length,
+        buyableCount: live.filter((item) => item.canBuy).length,
         alertCount: live.filter((item) => item.status === '止损/风控' || item.status === '止盈').length,
         lastUpdateTime: live[0]?.updateTime || new Date().toLocaleString(),
       }
     },
     async getRoughStocks() {
       const rows = await selectRows('stock_scan_results', 'scan_date')
-      return rows?.map(mapRoughStock) ?? stocksApi.getRoughStocks()
+      if (!client) return stocksApi.getRoughStocks()
+      return (rows ?? []).map(mapRoughStock)
     },
     async getFineStocks() {
       const rows = await selectRows('stock_strong_picks', 'scan_date')
-      return rows?.map(mapFineStock) ?? stocksApi.getFineStocks()
+      if (!client) return stocksApi.getFineStocks()
+      return (rows ?? []).map(mapFineStock)
     },
     async getRealtimeDecisions() {
       const rows = await selectRows('stock_live_decisions', 'updated_at')
-      return rows?.map(mapRealtimeDecision) ?? stocksApi.getRealtimeDecisions()
+      if (!client) return stocksApi.getRealtimeDecisions()
+      return (rows ?? []).map(mapRealtimeDecision)
     },
     async getHoldings() {
       const rows = await selectRows('stock_positions', 'created_at')
       if (rows) return rows.map(mapHolding)
+      if (client) return []
       return localHoldingList()
     },
     async getTradeRecords() {
       const rows = await selectRows('stock_trade_history', 'sell_date')
-      return rows?.map(mapTrade) ?? stocksApi.getTradeRecords()
+      if (!client) return stocksApi.getTradeRecords()
+      return (rows ?? []).map(mapTrade)
     },
     async getTasks() {
       const rows = await selectRows('stock_job_runs', 'started_at')
-      return rows?.map(mapTask) ?? stocksApi.getTasks()
+      if (!client) return stocksApi.getTasks()
+      return (rows ?? []).map(mapTask)
     },
     async addHolding(input) {
       const holding = calculateHolding(input)

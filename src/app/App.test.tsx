@@ -60,7 +60,7 @@ describe('chef menu application', () => {
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
 
-    expect(await screen.findByRole('heading', { name: '股票策略助手' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '股票策略助手' }, { timeout: 7000 })).toBeInTheDocument()
     expect(screen.getByText('盘中实时决策')).toBeInTheDocument()
   })
 

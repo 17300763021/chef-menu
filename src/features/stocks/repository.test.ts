@@ -2,6 +2,26 @@ import { describe, expect, it } from 'vitest'
 import { createStockRepository } from './repository'
 
 describe('stock repository', () => {
+  it('does not show mock stock prices when a cloud repository is configured but empty', async () => {
+    const emptyClient = {
+      from: () => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(emptyClient)
+
+    await expect(repository.getRealtimeDecisions()).resolves.toEqual([])
+    await expect(repository.getRoughStocks()).resolves.toEqual([])
+    await expect(repository.getFineStocks()).resolves.toEqual([])
+    await expect(repository.getOverview()).resolves.toMatchObject({
+      roughCount: 0,
+      fineCount: 0,
+      buyableCount: 0,
+    })
+  })
+
   it('falls back to local holdings and stores manually added holdings', async () => {
     const repository = createStockRepository(null)
 
