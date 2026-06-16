@@ -10,6 +10,7 @@ import type {
   RoughStock,
   SaveTradeInput,
   SaveTradeResult,
+  StockJobType,
   TaskRecord,
   TradeRecord,
 } from './types'
@@ -199,6 +200,7 @@ export interface StockRepository {
   getTasks(): Promise<TaskRecord[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
   saveTrade(input: SaveTradeInput): Promise<SaveTradeResult>
+  requestJob(jobType: StockJobType): Promise<void>
 }
 
 export function createStockRepository(client: StockSupabaseClient = supabase): StockRepository {
@@ -388,6 +390,21 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
         .map((item) => item.code === holding.code ? nextHolding : item)
         .filter((item): item is HoldingStock => Boolean(item))
       return { holding: nextHolding, tradeRecord }
+    },
+    async requestJob(jobType) {
+      if (!client) {
+        throw new Error('当前没有配置 Supabase，不能提交线上任务请求。')
+      }
+      try {
+        const { error } = await withTimeout(client.from('stock_job_requests').insert({
+          job_type: jobType,
+          status: 'pending',
+          requested_at: new Date().toISOString(),
+        }))
+        if (error) throw error
+      } catch {
+        throw new Error('任务请求提交失败：请确认已登录管理员账号，并已创建 stock_job_requests 表。')
+      }
     },
   }
 }

@@ -1,0 +1,49 @@
+name: Stock Tasks
+
+on:
+  schedule:
+    - cron: "*/5 * * * 1-5"
+    - cron: "10 2 * * 1-5"
+    - cron: "40 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Task mode"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full
+          - night_scan
+          - live_decision
+          - sync_latest
+          - pending
+
+jobs:
+  stock-tasks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r scripts/stock_engine/requirements.txt
+      - name: Run stock task
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          MODE="${INPUT_MODE:-pending}"
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "10 2 * * 1-5" ]; then
+            MODE="live_decision"
+          fi
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "40 7 * * 1-5" ]; then
+            MODE="full"
+          fi
+          python scripts/run_stock_tasks.py --mode "$MODE"

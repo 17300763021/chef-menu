@@ -91,6 +91,8 @@ export interface SaveTradeResult {
   tradeRecord?: TradeRecord
 }
 
+export type StockJobType = 'night_scan' | 'live_decision' | 'sync_latest'
+
 export interface TradeRecord {
   code: string
   name: string

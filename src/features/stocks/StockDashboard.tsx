@@ -295,12 +295,23 @@ export default function StockDashboard() {
 
   function explainLocalScript(action: 'night' | 'live' | 'sync') {
     setErrorMessage('')
-    const commands = {
-      night: '线上网页不能直接运行你电脑里的 Python。请在本机运行夜间筛选脚本，生成当天 CSV 后再同步。',
-      live: '线上网页不能直接运行你电脑里的 Python。请在本机运行实时决策脚本，生成当天 CSV 后再同步。',
-      sync: '线上网页不能持有 service_role key。请在本机 PowerShell 运行 npm run sync:stocks 同步当天 CSV。',
+    const jobTypes = {
+      night: 'night_scan' as const,
+      live: 'live_decision' as const,
+      sync: 'sync_latest' as const,
     }
-    setSavedMessage(commands[action])
+    const labels = {
+      night: '夜间筛选',
+      live: '实时决策',
+      sync: '同步数据库',
+    }
+    stockRepository.requestJob(jobTypes[action])
+      .then(() => {
+        setSavedMessage(`已提交${labels[action]}任务。GitHub Actions 会在几分钟内执行，稍后刷新即可查看结果。`)
+      })
+      .catch((reason) => {
+        setErrorMessage(reason instanceof Error ? reason.message : '任务提交失败')
+      })
   }
 
   async function toggleAutoRefresh() {
