@@ -1,5 +1,13 @@
 # React + TypeScript + Vite
 
+## Codex Collaboration Notes
+
+- User is a college student with limited token budget.
+- Default to concise Chinese updates and final answers.
+- Prefer direct implementation after enough context is available.
+- Save tokens, but do not skip verification that protects performance or prevents bugs.
+- After verified website/code changes, commit and push instead of asking the user to push.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

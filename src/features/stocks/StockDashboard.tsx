@@ -6,6 +6,8 @@ import type {
   FineStock,
   HoldingStock,
   OverviewStats,
+  PaperTradeOrder,
+  PortfolioSnapshot,
   RealtimeDecision,
   RoughStock,
   SignalEvent,
@@ -15,8 +17,8 @@ import type {
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation
-type TabId = 'account' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot
+type TabId = 'account' | 'auto' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
 
 interface Column<T> {
   header: string
@@ -128,10 +130,13 @@ export default function StockDashboard() {
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [signals, setSignals] = useState<SignalEvent[]>([])
   const [historicalFineStocks, setHistoricalFineStocks] = useState<FineStock[]>([])
+  const [paperOrders, setPaperOrders] = useState<PaperTradeOrder[]>([])
+  const [portfolioSnapshots, setPortfolioSnapshots] = useState<PortfolioSnapshot[]>([])
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
+  const latestSnapshot = portfolioSnapshots[0]
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -141,6 +146,8 @@ export default function StockDashboard() {
       stockRepository.getTasks(),
       stockRepository.getSignalEvents(),
       stockRepository.getHistoricalFineStocks(),
+      stockRepository.getPaperTradeOrders(),
+      stockRepository.getPortfolioSnapshots(),
     ])
     setOverview(stats)
     setRoughStocks(rough)
@@ -151,13 +158,15 @@ export default function StockDashboard() {
     setTasks(taskRecords)
     setSignals(signalEvents)
     setHistoricalFineStocks(historicalPicks)
+    setPaperOrders(autoOrders)
+    setPortfolioSnapshots(snapshots)
   }
 
   useEffect(() => {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -167,6 +176,8 @@ export default function StockDashboard() {
         stockRepository.getTasks(),
         stockRepository.getSignalEvents(),
         stockRepository.getHistoricalFineStocks(),
+        stockRepository.getPaperTradeOrders(),
+        stockRepository.getPortfolioSnapshots(),
       ])
       if (!mounted) return
       setOverview(stats)
@@ -178,6 +189,8 @@ export default function StockDashboard() {
       setTasks(taskRecords)
       setSignals(signalEvents)
       setHistoricalFineStocks(historicalPicks)
+      setPaperOrders(autoOrders)
+      setPortfolioSnapshots(snapshots)
       setLoading(false)
     }
     void load()
@@ -195,6 +208,7 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
+    { id: 'auto' as const, label: 'Auto Paper' },
     { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
@@ -324,6 +338,29 @@ export default function StockDashboard() {
     { header: '浮盈亏', cell: (row) => <ColorNumber value={row.floatingPnl} />, align: 'right' },
     { header: '收益贡献', cell: (row) => <ColorNumber value={row.pnlContributionRate} suffix="%" />, align: 'right' },
     { header: '仓位状态', cell: (row) => row.overSinglePositionLimit ? <StatusTag status="超单票上限" /> : '正常' },
+  ]
+
+  const paperOrderColumns: Column<PaperTradeOrder>[] = [
+    { header: 'Time', cell: (row) => row.orderTime },
+    { header: 'Side', cell: (row) => <StatusTag status={row.side} /> },
+    { header: 'Code', cell: (row) => row.code },
+    { header: 'Name', cell: (row) => row.name },
+    { header: 'Price', cell: (row) => formatPrice(row.price), align: 'right' },
+    { header: 'Shares', cell: (row) => row.shares, align: 'right' },
+    { header: 'Amount', cell: (row) => formatMoney(row.amount), align: 'right' },
+    { header: 'Realized P/L', cell: (row) => <ColorNumber value={row.realizedPnl} />, align: 'right' },
+    { header: 'Reason', cell: (row) => row.reason },
+  ]
+
+  const snapshotColumns: Column<PortfolioSnapshot>[] = [
+    { header: 'Time', cell: (row) => row.snapshotTime },
+    { header: 'Total Assets', cell: (row) => formatMoney(row.totalAssets), align: 'right' },
+    { header: 'Cash', cell: (row) => formatMoney(row.cash), align: 'right' },
+    { header: 'Holding Value', cell: (row) => formatMoney(row.holdingMarketValue), align: 'right' },
+    { header: 'Total P/L', cell: (row) => <ColorNumber value={row.totalPnl} />, align: 'right' },
+    { header: 'Return', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Positions', cell: (row) => row.positionCount, align: 'right' },
+    { header: 'Orders', cell: (row) => row.tradeCount, align: 'right' },
   ]
 
   function numberPrompt(message: string, fallback: number) {
@@ -504,14 +541,16 @@ export default function StockDashboard() {
     }
   }
 
-  function explainLocalScript(action: 'night' | 'live' | 'sync') {
+  function explainLocalScript(action: 'night' | 'live' | 'paper' | 'sync') {
     setErrorMessage('')
     const jobTypes = {
       night: 'night_scan' as const,
       live: 'live_decision' as const,
+      paper: 'paper_trade' as const,
       sync: 'sync_latest' as const,
     }
     const labels = {
+      paper: 'Auto Paper',
       night: '夜间筛选',
       live: '实时决策',
       sync: '同步数据库',
@@ -656,6 +695,44 @@ export default function StockDashboard() {
                 </section>
               </div>
               <DataTable columns={allocationColumns} data={accountSummary.positions} />
+            </div>
+          )}
+          {activeTab === 'auto' && (
+            <div className="stock-section-stack">
+              <div className="stock-panel-heading">
+                <div>
+                  <h2>Auto Paper Trading</h2>
+                  <p>Virtual 1,000,000 yuan account. It records simulated orders only and never connects to a broker.</p>
+                </div>
+              </div>
+              {latestSnapshot && (
+                <div className="stock-account-overview">
+                  <section>
+                    <span>Total Assets</span>
+                    <strong>{formatMoney(latestSnapshot.totalAssets)}</strong>
+                  </section>
+                  <section>
+                    <span>Cash</span>
+                    <strong>{formatMoney(latestSnapshot.cash)}</strong>
+                  </section>
+                  <section>
+                    <span>Total P/L</span>
+                    <strong><ColorNumber value={latestSnapshot.totalPnl} /></strong>
+                  </section>
+                  <section>
+                    <span>Return</span>
+                    <strong><ColorNumber value={latestSnapshot.totalReturnRate} suffix="%" /></strong>
+                  </section>
+                </div>
+              )}
+              <section>
+                <h3>Portfolio Snapshots</h3>
+                <DataTable columns={snapshotColumns} data={portfolioSnapshots} onRowClick={setSelectedStock} />
+              </section>
+              <section>
+                <h3>Auto Orders</h3>
+                <DataTable columns={paperOrderColumns} data={paperOrders} onRowClick={setSelectedStock} />
+              </section>
             </div>
           )}
           {activeTab === 'live' && <DataTable columns={realtimeColumns} data={realtime} onRowClick={setSelectedStock} />}

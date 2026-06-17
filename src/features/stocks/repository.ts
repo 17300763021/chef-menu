@@ -7,6 +7,8 @@ import type {
   FineStock,
   HoldingStock,
   OverviewStats,
+  PaperTradeOrder,
+  PortfolioSnapshot,
   RecordTTradeInput,
   RealtimeDecision,
   RoughStock,
@@ -193,6 +195,43 @@ function mapTask(row: Row): TaskRecord {
   }
 }
 
+function mapPaperTradeOrder(row: Row): PaperTradeOrder {
+  return {
+    id: text(row, 'id'),
+    orderTime: text(row, 'order_time'),
+    orderDate: text(row, 'order_date'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    side: text(row, 'side', 'buy') as PaperTradeOrder['side'],
+    reason: text(row, 'reason'),
+    price: numberValue(row, 'price'),
+    shares: numberValue(row, 'shares'),
+    amount: numberValue(row, 'amount'),
+    cashBefore: numberValue(row, 'cash_before'),
+    cashAfter: numberValue(row, 'cash_after'),
+    realizedPnl: numberValue(row, 'realized_pnl'),
+    status: text(row, 'status'),
+  }
+}
+
+function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
+  return {
+    id: text(row, 'id'),
+    snapshotTime: text(row, 'snapshot_time'),
+    snapshotDate: text(row, 'snapshot_date'),
+    cash: numberValue(row, 'cash'),
+    holdingMarketValue: numberValue(row, 'holding_market_value'),
+    totalAssets: numberValue(row, 'total_assets'),
+    realizedPnl: numberValue(row, 'realized_pnl'),
+    floatingPnl: numberValue(row, 'floating_pnl'),
+    totalPnl: numberValue(row, 'total_pnl'),
+    totalReturnRate: numberValue(row, 'total_return_rate'),
+    positionCount: numberValue(row, 'position_count'),
+    tradeCount: numberValue(row, 'trade_count'),
+    note: text(row, 'note'),
+  }
+}
+
 function mapSignalEvent(row: Row): SignalEvent {
   return {
     id: text(row, 'id'),
@@ -225,6 +264,8 @@ export interface StockRepository {
   getHoldings(): Promise<HoldingStock[]>
   getTradeRecords(): Promise<TradeRecord[]>
   getTasks(): Promise<TaskRecord[]>
+  getPaperTradeOrders(): Promise<PaperTradeOrder[]>
+  getPortfolioSnapshots(): Promise<PortfolioSnapshot[]>
   getSignalEvents(): Promise<SignalEvent[]>
   getHistoricalFineStocks(): Promise<FineStock[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
@@ -304,6 +345,14 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       const rows = await selectRows('stock_job_runs', 'started_at')
       if (!client) return stocksApi.getTasks()
       return (rows ?? []).map(mapTask)
+    },
+    async getPaperTradeOrders() {
+      const rows = await selectRows('stock_auto_trade_orders', 'order_time')
+      return (rows ?? []).map(mapPaperTradeOrder)
+    },
+    async getPortfolioSnapshots() {
+      const rows = await selectRows('stock_portfolio_snapshots', 'snapshot_time')
+      return (rows ?? []).map(mapPortfolioSnapshot)
     },
     async getSignalEvents() {
       const rows = await selectRows('stock_signal_events', 'signal_time')

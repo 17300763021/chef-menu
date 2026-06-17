@@ -17,6 +17,7 @@ on:
           - full
           - night_scan
           - live_decision
+          - paper_trade
           - sync_latest
           - pending
 

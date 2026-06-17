@@ -93,7 +93,7 @@ export interface SaveTradeResult {
   tradeRecord?: TradeRecord
 }
 
-export type StockJobType = 'night_scan' | 'live_decision' | 'sync_latest'
+export type StockJobType = 'night_scan' | 'live_decision' | 'paper_trade' | 'sync_latest'
 
 export interface SignalEvent {
   id: string
@@ -148,6 +148,39 @@ export interface TradeRecord {
   buyMemo: string
   sellMemo: string
   isCleared: boolean
+}
+
+export interface PaperTradeOrder {
+  id: string
+  orderTime: string
+  orderDate: string
+  code: string
+  name: string
+  side: 'buy' | 'sell'
+  reason: string
+  price: number
+  shares: number
+  amount: number
+  cashBefore: number
+  cashAfter: number
+  realizedPnl: number
+  status: string
+}
+
+export interface PortfolioSnapshot {
+  id: string
+  snapshotTime: string
+  snapshotDate: string
+  cash: number
+  holdingMarketValue: number
+  totalAssets: number
+  realizedPnl: number
+  floatingPnl: number
+  totalPnl: number
+  totalReturnRate: number
+  positionCount: number
+  tradeCount: number
+  note: string
 }
 
 export interface TaskRecord {

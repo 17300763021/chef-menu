@@ -166,6 +166,10 @@ def sync_generated(stock_dir: Path, include_holdings: bool = False) -> None:
     run_command(args, ROOT)
 
 
+def run_paper_trade() -> None:
+    run_command([sys.executable, str(ROOT / "scripts" / "paper_trade_engine.py")], ROOT)
+
+
 def has_csv_rows(path: Path) -> bool:
     if not path.exists():
         return False
@@ -231,6 +235,10 @@ def execute_job(job_type: str) -> int:
     if job_type == "live_decision":
         run_live_decision()
         sync_generated(ENGINE_DIR)
+        run_paper_trade()
+        return 2
+    if job_type == "paper_trade":
+        run_paper_trade()
         return 1
     if job_type == "sync_latest":
         sync_generated(ENGINE_DIR)
@@ -239,7 +247,8 @@ def execute_job(job_type: str) -> int:
         run_night_scan()
         run_live_decision()
         sync_generated(ENGINE_DIR)
-        return 2
+        run_paper_trade()
+        return 3
     if job_type == "auto":
         hour = datetime.now(timezone.utc).hour
         if hour >= 7:
@@ -286,7 +295,7 @@ def process_pending() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["auto", "full", "night_scan", "live_decision", "sync_latest", "pending"], default="pending")
+    parser.add_argument("--mode", choices=["auto", "full", "night_scan", "live_decision", "paper_trade", "sync_latest", "pending"], default="pending")
     args = parser.parse_args()
     if args.mode == "pending":
         process_pending()
