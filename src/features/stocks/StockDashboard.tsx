@@ -254,7 +254,7 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
-    { id: 'backtest' as const, label: 'Backtest' },
+    { id: 'backtest' as const, label: '回测中心' },
     { id: 'auto' as const, label: '自动模拟盘' },
     { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
@@ -413,51 +413,51 @@ export default function StockDashboard() {
 
   const backtestRunColumns: Column<BacktestRun>[] = [
     { header: 'Run time', cell: (row) => row.runTime },
-    { header: 'Strategy', cell: (row) => row.strategyName },
-    { header: 'Benchmark', cell: (row) => row.benchmarkName },
-    { header: 'Range', cell: (row) => `${row.startDate} ~ ${row.endDate}` },
-    { header: 'Return', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Benchmark return', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Excess', cell: (row) => <ColorNumber value={row.excessReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Max DD', cell: (row) => `${row.maxDrawdownRate.toFixed(2)}%`, align: 'right' },
-    { header: 'Win rate', cell: (row) => `${row.winRate.toFixed(2)}%`, align: 'right' },
-    { header: 'P/L ratio', cell: (row) => row.profitLossRatio.toFixed(2), align: 'right' },
-    { header: 'Trades', cell: (row) => row.tradeCount, align: 'right' },
-    { header: 'Avg days', cell: (row) => row.avgHoldingDays.toFixed(1), align: 'right' },
-    { header: 'Missed', cell: (row) => row.missedRunnerCount, align: 'right' },
+    { header: '策略', cell: (row) => row.strategyName },
+    { header: '对比基准', cell: (row) => row.benchmarkName },
+    { header: '回测区间', cell: (row) => `${row.startDate} ~ ${row.endDate}` },
+    { header: '策略收益', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
+    { header: '基准收益', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
+    { header: '超额收益', cell: (row) => <ColorNumber value={row.excessReturnRate} suffix="%" />, align: 'right' },
+    { header: '最大回撤', cell: (row) => `${row.maxDrawdownRate.toFixed(2)}%`, align: 'right' },
+    { header: '胜率', cell: (row) => `${row.winRate.toFixed(2)}%`, align: 'right' },
+    { header: '盈亏比', cell: (row) => row.profitLossRatio.toFixed(2), align: 'right' },
+    { header: '交易次数', cell: (row) => row.tradeCount, align: 'right' },
+    { header: '平均持仓天数', cell: (row) => row.avgHoldingDays.toFixed(1), align: 'right' },
+    { header: '错过大涨数', cell: (row) => row.missedRunnerCount, align: 'right' },
   ]
 
   const backtestTradeColumns: Column<BacktestTrade>[] = [
-    { header: 'Code', cell: (row) => row.code },
-    { header: 'Name', cell: (row) => row.name },
-    { header: 'Entry', cell: (row) => row.entryDate },
-    { header: 'Exit', cell: (row) => row.exitDate },
-    { header: 'Entry price', cell: (row) => formatPrice(row.entryPrice), align: 'right' },
-    { header: 'Exit price', cell: (row) => formatPrice(row.exitPrice), align: 'right' },
-    { header: 'P/L', cell: (row) => <ColorNumber value={row.pnlAmount} />, align: 'right' },
-    { header: 'Return', cell: (row) => <ColorNumber value={row.pnlRate} suffix="%" />, align: 'right' },
-    { header: 'Days', cell: (row) => row.holdingDays, align: 'right' },
-    { header: 'Reason', cell: (row) => row.exitReason },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '买入日', cell: (row) => row.entryDate },
+    { header: '卖出日', cell: (row) => row.exitDate },
+    { header: '买入价', cell: (row) => formatPrice(row.entryPrice), align: 'right' },
+    { header: '卖出价', cell: (row) => formatPrice(row.exitPrice), align: 'right' },
+    { header: '盈亏', cell: (row) => <ColorNumber value={row.pnlAmount} />, align: 'right' },
+    { header: '收益率', cell: (row) => <ColorNumber value={row.pnlRate} suffix="%" />, align: 'right' },
+    { header: '持仓天数', cell: (row) => row.holdingDays, align: 'right' },
+    { header: '退出原因', cell: (row) => row.exitReason },
   ]
 
   const missedRunnerColumns: Column<MissedRunner>[] = [
-    { header: 'Pick date', cell: (row) => row.pickDate },
-    { header: 'Code', cell: (row) => row.code },
-    { header: 'Name', cell: (row) => row.name },
-    { header: 'Pick price', cell: (row) => formatPrice(row.pickPrice), align: 'right' },
-    { header: 'Max price', cell: (row) => formatPrice(row.maxPrice), align: 'right' },
-    { header: 'Max return', cell: (row) => <ColorNumber value={row.maxReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Days to high', cell: (row) => row.daysToHigh, align: 'right' },
-    { header: 'Reason', cell: (row) => row.reason },
+    { header: '入选日', cell: (row) => row.pickDate },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '入选价', cell: (row) => formatPrice(row.pickPrice), align: 'right' },
+    { header: '最高价', cell: (row) => formatPrice(row.maxPrice), align: 'right' },
+    { header: '最大涨幅', cell: (row) => <ColorNumber value={row.maxReturnRate} suffix="%" />, align: 'right' },
+    { header: '几天后见高点', cell: (row) => row.daysToHigh, align: 'right' },
+    { header: '原因', cell: (row) => row.reason },
   ]
 
   const backtestCurveColumns: Column<BacktestEquityPoint>[] = [
-    { header: 'Date', cell: (row) => row.curveDate },
-    { header: 'Equity', cell: (row) => formatMoney(row.equityValue), align: 'right' },
-    { header: 'Daily return', cell: (row) => <ColorNumber value={row.dailyReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Drawdown', cell: (row) => `${row.drawdownRate.toFixed(2)}%`, align: 'right' },
-    { header: 'Benchmark', cell: (row) => formatMoney(row.benchmarkValue), align: 'right' },
-    { header: 'Benchmark return', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
+    { header: '日期', cell: (row) => row.curveDate },
+    { header: '策略权益', cell: (row) => formatMoney(row.equityValue), align: 'right' },
+    { header: '单日收益', cell: (row) => <ColorNumber value={row.dailyReturnRate} suffix="%" />, align: 'right' },
+    { header: '回撤', cell: (row) => `${row.drawdownRate.toFixed(2)}%`, align: 'right' },
+    { header: '基准权益', cell: (row) => formatMoney(row.benchmarkValue), align: 'right' },
+    { header: '基准收益', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
   ]
 
   function numberPrompt(message: string, fallback: number) {
@@ -662,7 +662,7 @@ export default function StockDashboard() {
       sync: 'sync_latest' as const,
     }
     const labels = {
-      backtest: 'Backtest',
+      backtest: '回测中心',
       paper: '自动模拟盘',
       night: '夜间筛选',
       live: '实时决策',
@@ -879,57 +879,57 @@ export default function StockDashboard() {
             <div className="stock-section-stack">
               <div className="stock-panel-heading">
                 <div>
-                  <h2>Backtest Center</h2>
-                  <p>Lightweight Backtrader validation for recent strong picks and missed runners.</p>
+                  <h2>回测中心</h2>
+                  <p>用历史行情验证当前策略，看策略过去是否赚钱、是否跑赢基准，以及错过了哪些大涨股。</p>
                 </div>
-                <button type="button" onClick={() => explainLocalScript('backtest')}>Run backtest</button>
+                <button type="button" onClick={() => explainLocalScript('backtest')}>运行回测</button>
               </div>
               {latestBacktest && (
                 <div className="stock-account-overview">
                   <section>
-                    <span>Strategy return</span>
+                    <span>策略收益</span>
                     <strong><ColorNumber value={latestBacktest.totalReturnRate} suffix="%" /></strong>
                   </section>
                   <section>
-                    <span>Excess return</span>
+                    <span>超额收益</span>
                     <strong><ColorNumber value={latestBacktest.excessReturnRate} suffix="%" /></strong>
                   </section>
                   <section>
-                    <span>Max drawdown</span>
+                    <span>最大回撤</span>
                     <strong>{latestBacktest.maxDrawdownRate.toFixed(2)}%</strong>
                   </section>
                   <section>
-                    <span>Win rate</span>
+                    <span>胜率</span>
                     <strong>{latestBacktest.winRate.toFixed(2)}%</strong>
                   </section>
                   <section>
-                    <span>P/L ratio</span>
+                    <span>盈亏比</span>
                     <strong>{latestBacktest.profitLossRatio.toFixed(2)}</strong>
                   </section>
                   <section>
-                    <span>Trades</span>
+                    <span>交易次数</span>
                     <strong>{latestBacktest.tradeCount}</strong>
                   </section>
                   <section>
-                    <span>Avg holding days</span>
+                    <span>平均持仓天数</span>
                     <strong>{latestBacktest.avgHoldingDays.toFixed(1)}</strong>
                   </section>
                 </div>
               )}
               <section>
-                <h3>Backtest runs</h3>
+                <h3>回测记录</h3>
                 <DataTable columns={backtestRunColumns} data={backtestRuns} />
               </section>
               <section>
-                <h3>Equity curve</h3>
+                <h3>权益曲线</h3>
                 <DataTable columns={backtestCurveColumns} data={backtestCurve} />
               </section>
               <section>
-                <h3>Trade samples</h3>
+                <h3>回测交易样本</h3>
                 <DataTable columns={backtestTradeColumns} data={backtestTrades} onRowClick={setSelectedStock} />
               </section>
               <section>
-                <h3>Missed big runners</h3>
+                <h3>错过的大涨股</h3>
                 <DataTable columns={missedRunnerColumns} data={missedRunners} onRowClick={setSelectedStock} />
               </section>
             </div>
