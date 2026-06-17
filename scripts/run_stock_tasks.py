@@ -138,6 +138,7 @@ def write_watchlist_csv(rows: list[dict[str, Any]], filename: str) -> Path | Non
 
 
 def resolve_watchlist(client: SupabaseRest) -> str | None:
+    live_limit = int(os.environ.get("STOCK_LIVE_TOP", "10"))
     strong_watchlist = ENGINE_DIR / "watchlists" / "latest_strong_watchlist.csv"
     if has_csv_rows(strong_watchlist):
         return "watchlists/latest_strong_watchlist.csv"
@@ -145,12 +146,12 @@ def resolve_watchlist(client: SupabaseRest) -> str | None:
     if has_csv_rows(regular_watchlist):
         return "watchlists/latest_watchlist.csv"
 
-    strong_rows = latest_watch_rows(client, "stock_strong_picks", "scan_date", 50)
+    strong_rows = latest_watch_rows(client, "stock_strong_picks", "scan_date", live_limit)
     rebuilt_strong = write_watchlist_csv(strong_rows, "latest_strong_watchlist.csv")
     if rebuilt_strong and has_csv_rows(rebuilt_strong):
         return "watchlists/latest_strong_watchlist.csv"
 
-    scan_rows = latest_watch_rows(client, "stock_scan_results", "scan_date", 50)
+    scan_rows = latest_watch_rows(client, "stock_scan_results", "scan_date", live_limit)
     rebuilt_regular = write_watchlist_csv(scan_rows, "latest_watchlist.csv")
     if rebuilt_regular and has_csv_rows(rebuilt_regular):
         return "watchlists/latest_watchlist.csv"
