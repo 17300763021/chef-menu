@@ -1,5 +1,9 @@
 name: Stock Tasks
 
+concurrency:
+  group: stock-tasks
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: "*/5 * * * 1-5"

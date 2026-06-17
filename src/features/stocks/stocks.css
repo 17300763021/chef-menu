@@ -396,7 +396,9 @@
 
 .stock-row-actions button,
 .stock-task-actions button,
-.stock-modal-actions button {
+.stock-modal-actions button,
+.stock-inline-button,
+.stock-timeline-heading button {
   border: 1px solid #cdd5df;
   border-radius: 6px;
   padding: 6px 9px;
@@ -415,6 +417,57 @@
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.stock-execution-timeline {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  background: rgba(15, 23, 42, .68);
+  border: 1px solid rgba(148, 163, 184, .18);
+  border-radius: 16px;
+}
+
+.stock-execution-timeline h3 {
+  margin: 0;
+}
+
+.stock-timeline-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.stock-execution-timeline article {
+  display: grid;
+  grid-template-columns: 150px 1fr 110px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid rgba(148, 163, 184, .12);
+}
+
+.stock-execution-timeline time {
+  color: #9cc9ff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+
+.stock-execution-timeline b,
+.stock-execution-timeline p {
+  display: block;
+  margin: 0;
+}
+
+.stock-execution-timeline p {
+  margin-top: 4px;
+  color: #9fb0c6;
+  font-size: 12px;
+}
+
+.stock-execution-timeline strong {
+  text-align: right;
 }
 
 .stock-task-actions button:first-child,

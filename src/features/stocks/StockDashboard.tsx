@@ -143,6 +143,8 @@ export default function StockDashboard() {
   const [savedMessage, setSavedMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(false)
+  const [showTodayExecution, setShowTodayExecution] = useState(false)
+  const [executionStock, setExecutionStock] = useState<{ code: string; name: string } | null>(null)
   const [loginOpen, setLoginOpen] = useState(false)
   const [loginError, setLoginError] = useState('')
 
@@ -164,6 +166,18 @@ export default function StockDashboard() {
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
   const latestSnapshot = portfolioSnapshots[0]
   const latestBacktest = backtestRuns[0]
+  const todayOrders = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10)
+    return paperOrders
+      .filter((order) => order.orderDate === today)
+      .sort((a, b) => a.orderTime.localeCompare(b.orderTime))
+  }, [paperOrders])
+  const stockExecutionOrders = useMemo(() => {
+    if (!executionStock) return []
+    return paperOrders
+      .filter((order) => order.code === executionStock.code)
+      .sort((a, b) => b.orderTime.localeCompare(a.orderTime))
+  }, [executionStock, paperOrders])
 
   async function loadStockData() {
     const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
@@ -399,6 +413,22 @@ export default function StockDashboard() {
     { header: '实现盈亏', cell: (row) => <ColorNumber value={row.realizedPnl} />, align: 'right' },
     { header: '触发原因', cell: (row) => row.reason },
   ]
+
+  paperOrderColumns.push({
+    header: '执行记录',
+    cell: (row) => (
+      <button
+        type="button"
+        className="stock-inline-button"
+        onClick={(event) => {
+          event.stopPropagation()
+          setExecutionStock({ code: row.code, name: row.name })
+        }}
+      >
+        查看
+      </button>
+    ),
+  })
 
   const snapshotColumns: Column<PortfolioSnapshot>[] = [
     { header: '时间', cell: (row) => row.snapshotTime },
@@ -845,6 +875,44 @@ export default function StockDashboard() {
                   <p>100 万虚拟资金按策略自动演算买卖，沉淀账户曲线和成交记录。</p>
                 </div>
               </div>
+              <button type="button" onClick={() => setShowTodayExecution((value) => !value)}>
+                {showTodayExecution ? '隐藏今日自动执行记录' : '查看今日自动执行记录'}
+              </button>
+              {showTodayExecution && (
+                <section className="stock-execution-timeline">
+                  <h3>今日自动执行记录</h3>
+                  {todayOrders.length === 0 && <div className="stock-empty">今天还没有自动买卖记录</div>}
+                  {todayOrders.map((order) => (
+                    <article key={order.id}>
+                      <time>{order.orderTime}</time>
+                      <div>
+                        <b>{order.side === 'buy' ? '虚拟买入' : '虚拟卖出'}：{order.name} {order.code}</b>
+                        <p>{formatPrice(order.price)} 元 / {order.shares} 股 / {formatMoney(order.amount)} 元；原因：{order.reason}</p>
+                      </div>
+                      <strong><ColorNumber value={order.realizedPnl} /></strong>
+                    </article>
+                  ))}
+                </section>
+              )}
+              {executionStock && (
+                <section className="stock-execution-timeline">
+                  <div className="stock-timeline-heading">
+                    <h3>{executionStock.name} {executionStock.code} 执行记录</h3>
+                    <button type="button" onClick={() => setExecutionStock(null)}>关闭</button>
+                  </div>
+                  {stockExecutionOrders.length === 0 && <div className="stock-empty">这只股票还没有自动买卖记录</div>}
+                  {stockExecutionOrders.map((order) => (
+                    <article key={order.id}>
+                      <time>{order.orderTime}</time>
+                      <div>
+                        <b>{order.side === 'buy' ? '虚拟买入' : '虚拟卖出'}</b>
+                        <p>{formatPrice(order.price)} 元 / {order.shares} 股 / {formatMoney(order.amount)} 元；原因：{order.reason}</p>
+                      </div>
+                      <strong><ColorNumber value={order.realizedPnl} /></strong>
+                    </article>
+                  ))}
+                </section>
+              )}
               {latestSnapshot && (
                 <div className="stock-account-overview">
                   <section>
