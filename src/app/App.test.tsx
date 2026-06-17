@@ -61,14 +61,14 @@ describe('chef menu application', () => {
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
 
     expect(await screen.findByRole('heading', { name: '股票策略助手' }, { timeout: 7000 })).toBeInTheDocument()
-    expect(screen.getByText('盘中实时决策')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '自动模拟盘' })).toBeInTheDocument()
   })
 
   it('asks visitors to log in before adding a stock holding', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
-    await userEvent.click(await screen.findByRole('tab', { name: '当前持仓' }))
+    await userEvent.click(await screen.findByRole('tab', { name: '持仓执行' }))
     await userEvent.click(screen.getByRole('button', { name: '新增持仓' }))
 
     expect(await screen.findByRole('dialog')).toBeInTheDocument()
