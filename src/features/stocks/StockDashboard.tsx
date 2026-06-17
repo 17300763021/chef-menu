@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useApp } from '../../app/AppContext'
+import { signIn } from '../auth'
 import { buildAccountSummary, recommendSignalBuy } from './account'
 import { stockRepository } from './repository'
 import type { PositionAllocation } from './account'
@@ -128,6 +130,7 @@ function DataTable<T extends StockRow>({
 }
 
 export default function StockDashboard() {
+  const { adminEmail, refreshAdminUser, adminSignOut } = useApp()
   const [activeTab, setActiveTab] = useState<TabId>('account')
   const [loading, setLoading] = useState(true)
   const [selectedStock, setSelectedStock] = useState<StockRow | null>(null)
@@ -136,6 +139,8 @@ export default function StockDashboard() {
   const [savedMessage, setSavedMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(false)
+  const [loginOpen, setLoginOpen] = useState(false)
+  const [loginError, setLoginError] = useState('')
 
   const [overview, setOverview] = useState<OverviewStats | null>(null)
   const [roughStocks, setRoughStocks] = useState<RoughStock[]>([])
@@ -291,6 +296,7 @@ export default function StockDashboard() {
           {(['加仓', '减仓', '清仓'] as TradeAction[]).map((action) => (
             <button key={action} type="button" onClick={(event) => {
               event.stopPropagation()
+              if (!requireStockLogin()) return
               setTradeModal({ action, stock: row })
             }}>{action}</button>
           ))}
@@ -390,7 +396,15 @@ export default function StockDashboard() {
     return new Date().toISOString().slice(0, 10)
   }
 
+  function requireStockLogin() {
+    if (adminEmail) return true
+    setLoginOpen(true)
+    setErrorMessage('请先登录后查看或记录股票数据。')
+    return false
+  }
+
   async function handleSignalBuy(signal: SignalEvent) {
+    if (!requireStockLogin()) return
     const recommendation = recommendSignalBuy(signal, accountSummary)
     if (recommendation.maxShares <= 0) {
       setErrorMessage(recommendation.reason)
@@ -418,6 +432,7 @@ export default function StockDashboard() {
   }
 
   async function handleSignalSell(signal: SignalEvent) {
+    if (!requireStockLogin()) return
     const holding = holdings.find((item) => item.code === signal.code)
     if (!holding) {
       setErrorMessage('没有找到对应持仓，请先刷新或手动检查当前持仓。')
@@ -446,6 +461,7 @@ export default function StockDashboard() {
   }
 
   async function handleSignalT(signal: SignalEvent) {
+    if (!requireStockLogin()) return
     const holding = holdings.find((item) => item.code === signal.code)
     if (!holding) {
       setErrorMessage('做 T 需要已有持仓。')
@@ -480,6 +496,7 @@ export default function StockDashboard() {
   }
 
   async function handleIgnoreSignal(signal: SignalEvent) {
+    if (!requireStockLogin()) return
     setErrorMessage('')
     try {
       await stockRepository.markSignalEvent(signal.id, '已忽略')
@@ -504,6 +521,7 @@ export default function StockDashboard() {
 
   async function submitTrade(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (!requireStockLogin()) return
     if (!tradeModal) return
     setErrorMessage('')
     const form = new FormData(event.currentTarget)
@@ -533,6 +551,7 @@ export default function StockDashboard() {
 
   async function submitHolding(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (!requireStockLogin()) return
     const form = new FormData(event.currentTarget)
     setErrorMessage('')
     try {
@@ -558,6 +577,7 @@ export default function StockDashboard() {
   }
 
   function explainLocalScript(action: 'night' | 'live' | 'paper' | 'sync') {
+    if (!requireStockLogin()) return
     setErrorMessage('')
     const jobTypes = {
       night: 'night_scan' as const,
@@ -591,6 +611,21 @@ export default function StockDashboard() {
     }
   }
 
+  async function submitStockLogin(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    setLoginError('')
+    try {
+      await signIn(String(form.get('email') || ''), String(form.get('password') || ''))
+      await refreshAdminUser()
+      await loadStockData()
+      setLoginOpen(false)
+      setSavedMessage('登录成功，数据已刷新。')
+    } catch (reason) {
+      setLoginError(reason instanceof Error ? reason.message : '登录失败')
+    }
+  }
+
   if (loading) {
     return <section className="stock-dashboard stock-loading">正在同步策略工作台数据...</section>
   }
@@ -602,6 +637,19 @@ export default function StockDashboard() {
           <span className="eyebrow">A 股策略工作台</span>
           <h1>股票策略助手</h1>
           <p>盘中信号、仓位跟踪、自动模拟盘与收益复盘。</p>
+        </div>
+        <div className="stock-login-box">
+          {adminEmail ? (
+            <>
+              <span>{adminEmail}</span>
+              <button type="button" onClick={() => void adminSignOut().then(loadStockData)}>退出</button>
+            </>
+          ) : (
+            <>
+              <span>登录后读取策略数据</span>
+              <button type="button" onClick={() => setLoginOpen(true)}>登录</button>
+            </>
+          )}
         </div>
       </header>
 
@@ -769,7 +817,9 @@ export default function StockDashboard() {
                   <h2>当前持仓</h2>
                   <p>手动记录线下买入后的持仓，也可以先写自己的跟踪建议。</p>
                 </div>
-                <button type="button" onClick={() => setShowAddHoldingModal(true)}>新增持仓</button>
+                <button type="button" onClick={() => {
+                  if (requireStockLogin()) setShowAddHoldingModal(true)
+                }}>新增持仓</button>
               </div>
               <DataTable columns={holdingColumns} data={holdings} onRowClick={setSelectedStock} />
             </div>
@@ -794,6 +844,21 @@ export default function StockDashboard() {
 
       {savedMessage && <div className="stock-toast">{savedMessage}</div>}
       {errorMessage && <div className="stock-toast stock-toast-error">{errorMessage}</div>}
+
+      {loginOpen && (
+        <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label="股票助手登录">
+          <form className="stock-modal stock-login-modal" onSubmit={submitStockLogin}>
+            <h2>登录股票助手</h2>
+            <label>邮箱<input name="email" type="email" autoComplete="email" required /></label>
+            <label>密码<input name="password" type="password" autoComplete="current-password" required /></label>
+            {loginError && <p className="stock-form-error">{loginError}</p>}
+            <div className="stock-modal-actions">
+              <button type="button" onClick={() => setLoginOpen(false)}>取消</button>
+              <button type="submit">登录</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {tradeModal && (
         <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label={`记录${tradeModal.action}`}>

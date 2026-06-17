@@ -64,33 +64,23 @@ describe('chef menu application', () => {
     expect(screen.getByText('盘中实时决策')).toBeInTheDocument()
   })
 
-  it('adds a holding with a custom suggestion in the stock assistant', async () => {
+  it('asks visitors to log in before adding a stock holding', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
     await userEvent.click(await screen.findByRole('tab', { name: '当前持仓' }))
     await userEvent.click(screen.getByRole('button', { name: '新增持仓' }))
 
-    await userEvent.type(screen.getByLabelText('股票代码'), '000001')
-    await userEvent.type(screen.getByLabelText('股票名称'), '平安银行')
-    await userEvent.clear(screen.getByLabelText('成本价'))
-    await userEvent.type(screen.getByLabelText('成本价'), '10.50')
-    await userEvent.clear(screen.getByLabelText('持仓股数'))
-    await userEvent.type(screen.getByLabelText('持仓股数'), '100')
-    await userEvent.type(screen.getByLabelText('当前建议'), '等待回踩，不追高')
-    await userEvent.click(screen.getByRole('button', { name: '保存持仓' }))
-
-    expect(await screen.findByText('平安银行')).toBeInTheDocument()
-    expect(screen.getByText('等待回踩，不追高')).toBeInTheDocument()
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
   })
 
-  it('shows feedback after requesting a cloud stock task', async () => {
+  it('asks visitors to log in before requesting a cloud stock task', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
     await userEvent.click(await screen.findByRole('tab', { name: '任务中心' }))
     await userEvent.click(screen.getByRole('button', { name: '运行实时决策' }))
 
-    expect(await screen.findByText(/任务请求提交失败|不能提交线上任务请求/)).toBeInTheDocument()
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
   })
 })
