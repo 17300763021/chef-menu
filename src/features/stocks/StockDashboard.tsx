@@ -24,7 +24,7 @@ import type {
 import './stocks.css'
 
 type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner | BacktestEquityPoint
-type TabId = 'account' | 'auto' | 'backtest' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
+type TabId = 'auto' | 'holdings' | 'backtest' | 'tasks' | 'account' | 'signals' | 'live' | 'rough' | 'fine' | 'history' | 'trades'
 
 interface Column<T> {
   header: string
@@ -135,7 +135,8 @@ function DataTable<T extends StockRow>({
 
 export default function StockDashboard() {
   const { adminEmail, refreshAdminUser, adminSignOut } = useApp()
-  const [activeTab, setActiveTab] = useState<TabId>('account')
+  const [activeTab, setActiveTab] = useState<TabId>('auto')
+  const [showMoreTabs, setShowMoreTabs] = useState(false)
   const [loading, setLoading] = useState(true)
   const [selectedStock, setSelectedStock] = useState<StockRow | null>(null)
   const [tradeModal, setTradeModal] = useState<{ action: TradeAction; stock: HoldingStock } | null>(null)
@@ -268,17 +269,19 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
-    { id: 'backtest' as const, label: '回测中心' },
     { id: 'auto' as const, label: '自动模拟盘' },
+    { id: 'holdings' as const, label: '持仓执行' },
+    { id: 'backtest' as const, label: '回测中心' },
+    { id: 'tasks' as const, label: '任务中心' },
+  ], [])
+  const secondaryTabs = useMemo(() => [
     { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
-    { id: 'holdings' as const, label: '当前持仓' },
     { id: 'rough' as const, label: '今日海选' },
     { id: 'fine' as const, label: '今日精选' },
     { id: 'history' as const, label: '历史精选' },
     { id: 'trades' as const, label: '清仓复盘' },
-    { id: 'tasks' as const, label: '任务中心' },
   ], [])
 
   const roughColumns: Column<RoughStock>[] = [
@@ -763,14 +766,10 @@ export default function StockDashboard() {
       <div className="stock-stats">
         {[
           ['总资产', formatMoney(accountSummary.totalAssets)],
-          ['可用现金', formatMoney(accountSummary.cash)],
+          ['今日盈亏', latestSnapshot ? `${latestSnapshot.totalPnl >= 0 ? '+' : ''}${formatMoney(latestSnapshot.totalPnl)}` : `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
           ['总盈亏', `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
-          ['今日海选', overview?.roughCount],
-          ['今日精选', overview?.fineCount],
+          ['总收益率', `${accountSummary.totalReturnRate >= 0 ? '+' : ''}${accountSummary.totalReturnRate.toFixed(2)}%`],
           ['当前持仓', holdings.length],
-          ['可买入', overview?.buyableCount],
-          ['风控提醒', overview?.alertCount],
-          ['新信号', signals.filter((item) => item.status === '新信号').length],
         ].map(([label, value]) => (
           <article key={label}>
             <span>{label}</span>
@@ -779,7 +778,7 @@ export default function StockDashboard() {
         ))}
       </div>
 
-      <div className="stock-account-overview">
+      <div className="stock-account-overview stock-account-overview-secondary">
         <section>
           <span>初始本金</span>
           <strong>¥{formatMoney(accountSummary.initialCapital)}</strong>
@@ -829,7 +828,31 @@ export default function StockDashboard() {
               {tab.label}
             </button>
           ))}
+          <button
+            type="button"
+            className="stock-more-tab"
+            aria-expanded={showMoreTabs}
+            onClick={() => setShowMoreTabs((value) => !value)}
+          >
+            更多数据
+          </button>
         </div>
+        {showMoreTabs && (
+          <div className="stock-secondary-tabs" role="tablist" aria-label="股票辅助数据视图">
+            {secondaryTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                className={activeTab === tab.id ? 'active' : ''}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="stock-panel">
           {activeTab === 'account' && (

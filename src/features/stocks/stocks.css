@@ -231,6 +231,15 @@
   overflow-x: auto;
 }
 
+.stock-secondary-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(8, 15, 26, .78);
+  border-bottom: 1px solid rgba(148, 163, 184, .16);
+}
+
 .stock-tabs button {
   border: 1px solid transparent;
   border-bottom: 0;
@@ -243,10 +252,36 @@
   white-space: nowrap;
 }
 
+.stock-secondary-tabs button {
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 999px;
+  padding: 5px 10px;
+  color: #94a3b8;
+  background: rgba(15, 23, 42, .52);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .stock-tabs button.active {
   color: #111827;
   background: #fff;
   border-color: #dbe4ee;
+}
+
+.stock-secondary-tabs button.active {
+  color: #e0f2fe;
+  border-color: rgba(125, 211, 252, .36);
+  background: rgba(14, 165, 233, .18);
+}
+
+.stock-tabs .stock-more-tab {
+  margin-left: auto;
+  font-size: 12px;
+  opacity: .86;
+}
+
+.stock-account-overview-secondary {
+  display: none;
 }
 
 .stock-panel {
@@ -693,9 +728,6 @@
   margin: 12px 0;
 }
 
-.stock-stats article:nth-child(4),
-.stock-stats article:nth-child(5),
-.stock-stats article:nth-child(9),
 .stock-dashboard > .stock-account-overview {
   display: none;
 }
