@@ -681,11 +681,12 @@
 }
 
 .stock-dashboard {
+  position: relative;
+  isolation: isolate;
   padding: 16px;
   background:
-    radial-gradient(circle at 12% 0%, rgba(28, 116, 180, .28), transparent 32%),
-    radial-gradient(circle at 85% 12%, rgba(16, 185, 129, .16), transparent 26%),
-    linear-gradient(135deg, #050914 0%, #071524 45%, #0a101a 100%);
+    linear-gradient(180deg, rgba(5, 9, 20, .78), rgba(7, 17, 29, .9)),
+    linear-gradient(135deg, #050914 0%, #071524 46%, #0a101a 100%);
 }
 
 .stock-dashboard::before {
@@ -693,11 +694,54 @@
   position: fixed;
   inset: 0;
   pointer-events: none;
+  z-index: -2;
   background-image:
     linear-gradient(rgba(148, 163, 184, .055) 1px, transparent 1px),
     linear-gradient(90deg, rgba(148, 163, 184, .055) 1px, transparent 1px);
   background-size: 28px 28px;
   mask-image: linear-gradient(180deg, rgba(0,0,0,.9), rgba(0,0,0,.2));
+}
+
+.stock-dashboard::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  opacity: .34;
+  background-image:
+    linear-gradient(rgba(239, 68, 68, .58), rgba(239, 68, 68, .58)),
+    linear-gradient(rgba(239, 68, 68, .46), rgba(239, 68, 68, .46)),
+    linear-gradient(rgba(34, 197, 94, .52), rgba(34, 197, 94, .52)),
+    linear-gradient(rgba(34, 197, 94, .42), rgba(34, 197, 94, .42)),
+    linear-gradient(rgba(239, 68, 68, .42), rgba(239, 68, 68, .42)),
+    linear-gradient(rgba(239, 68, 68, .34), rgba(239, 68, 68, .34)),
+    linear-gradient(rgba(34, 197, 94, .46), rgba(34, 197, 94, .46)),
+    linear-gradient(rgba(34, 197, 94, .34), rgba(34, 197, 94, .34)),
+    linear-gradient(90deg, rgba(125, 211, 252, .12), rgba(125, 211, 252, 0));
+  background-position:
+    28px 36px,
+    23px 48px,
+    72px 24px,
+    67px 38px,
+    116px 46px,
+    111px 58px,
+    160px 30px,
+    155px 44px,
+    0 78px;
+  background-size:
+    2px 74px,
+    12px 34px,
+    2px 66px,
+    12px 28px,
+    2px 62px,
+    12px 24px,
+    2px 70px,
+    12px 36px,
+    220px 1px;
+  background-repeat: repeat;
+  mix-blend-mode: screen;
+  mask-image: linear-gradient(180deg, rgba(0,0,0,.82), rgba(0,0,0,.34) 55%, transparent 100%);
 }
 
 .stock-hero,
