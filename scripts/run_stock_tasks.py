@@ -72,6 +72,92 @@ def write_holdings_csv(client: SupabaseRest) -> Path | None:
     return path
 
 
+def latest_table_date(client: SupabaseRest, table: str, date_column: str) -> str:
+    rows = client.request(
+        "GET",
+        f"{table}?select={date_column}&order={date_column}.desc&limit=1",
+    )
+    if not rows:
+        return ""
+    return str(rows[0].get(date_column) or "")
+
+
+def latest_watch_rows(client: SupabaseRest, table: str, date_column: str, limit: int) -> list[dict[str, Any]]:
+    latest_date = latest_table_date(client, table, date_column)
+    if not latest_date:
+        return []
+    rows = client.request(
+        "GET",
+        f"{table}?{date_column}=eq.{latest_date}&select=*&order=score.desc&limit={limit}",
+    )
+    return rows or []
+
+
+def write_watchlist_csv(rows: list[dict[str, Any]], filename: str) -> Path | None:
+    if not rows:
+        return None
+    path = ENGINE_DIR / "watchlists" / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "生成日期",
+        "代码",
+        "名称",
+        "排名分",
+        "昨收",
+        "信号",
+        "动作",
+        "支撑1",
+        "压力1",
+        "建议止损",
+        "入选理由",
+        "主要风险",
+        "策略等级",
+        "策略复核",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "生成日期": row.get("scan_date", ""),
+                "代码": str(row.get("code", "")).zfill(6),
+                "名称": row.get("name", ""),
+                "排名分": row.get("score", 0),
+                "昨收": row.get("prev_close", 0),
+                "信号": row.get("signal", ""),
+                "动作": row.get("action", ""),
+                "支撑1": row.get("support_level", 0),
+                "压力1": row.get("resistance_level", 0),
+                "建议止损": row.get("stop_loss", 0),
+                "入选理由": row.get("reason", ""),
+                "主要风险": row.get("risk", ""),
+                "策略等级": row.get("strategy_level", ""),
+                "策略复核": row.get("review_status", ""),
+            })
+    return path
+
+
+def resolve_watchlist(client: SupabaseRest) -> str | None:
+    strong_watchlist = ENGINE_DIR / "watchlists" / "latest_strong_watchlist.csv"
+    if has_csv_rows(strong_watchlist):
+        return "watchlists/latest_strong_watchlist.csv"
+    regular_watchlist = ENGINE_DIR / "watchlists" / "latest_watchlist.csv"
+    if has_csv_rows(regular_watchlist):
+        return "watchlists/latest_watchlist.csv"
+
+    strong_rows = latest_watch_rows(client, "stock_strong_picks", "scan_date", 50)
+    rebuilt_strong = write_watchlist_csv(strong_rows, "latest_strong_watchlist.csv")
+    if rebuilt_strong and has_csv_rows(rebuilt_strong):
+        return "watchlists/latest_strong_watchlist.csv"
+
+    scan_rows = latest_watch_rows(client, "stock_scan_results", "scan_date", 50)
+    rebuilt_regular = write_watchlist_csv(scan_rows, "latest_watchlist.csv")
+    if rebuilt_regular and has_csv_rows(rebuilt_regular):
+        return "watchlists/latest_watchlist.csv"
+
+    return None
+
+
 def sync_generated(stock_dir: Path, include_holdings: bool = False) -> None:
     args = [sys.executable, str(ROOT / "scripts" / "sync_stock_data.py"), "--stock-dir", str(stock_dir)]
     if include_holdings:
@@ -114,19 +200,22 @@ def run_night_scan() -> None:
 def run_live_decision() -> None:
     env = os.environ.copy()
     env["A_STOCK_SPOT_SOURCE"] = env.get("A_STOCK_SPOT_SOURCE", "tencent")
-    strong_watchlist = ENGINE_DIR / "watchlists" / "latest_strong_watchlist.csv"
-    watchlist = "watchlists/latest_strong_watchlist.csv" if has_csv_rows(strong_watchlist) else "watchlists/latest_watchlist.csv"
-    holdings_path = write_holdings_csv(get_client())
+    client = get_client()
+    watchlist = resolve_watchlist(client)
+    holdings_path = write_holdings_csv(client)
+    if not watchlist and not holdings_path:
+        print("No watchlist or open positions available for live decision; skipping.", flush=True)
+        return
     command = [
         sys.executable,
         "-B",
         "a_stock_live_decision_v8.py",
-        "--watchlist",
-        watchlist,
         "--show-checks",
         "--minute-period",
         "5",
     ]
+    if watchlist:
+        command.extend(["--watchlist", watchlist])
     if holdings_path:
         command.extend(["--holdings", holdings_path.name])
     print("+", " ".join(command), flush=True)
