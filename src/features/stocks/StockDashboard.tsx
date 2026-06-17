@@ -208,7 +208,7 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
-    { id: 'auto' as const, label: 'Auto Paper' },
+    { id: 'auto' as const, label: '自动模拟盘' },
     { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
@@ -341,26 +341,26 @@ export default function StockDashboard() {
   ]
 
   const paperOrderColumns: Column<PaperTradeOrder>[] = [
-    { header: 'Time', cell: (row) => row.orderTime },
-    { header: 'Side', cell: (row) => <StatusTag status={row.side} /> },
-    { header: 'Code', cell: (row) => row.code },
-    { header: 'Name', cell: (row) => row.name },
-    { header: 'Price', cell: (row) => formatPrice(row.price), align: 'right' },
-    { header: 'Shares', cell: (row) => row.shares, align: 'right' },
-    { header: 'Amount', cell: (row) => formatMoney(row.amount), align: 'right' },
-    { header: 'Realized P/L', cell: (row) => <ColorNumber value={row.realizedPnl} />, align: 'right' },
-    { header: 'Reason', cell: (row) => row.reason },
+    { header: '时间', cell: (row) => row.orderTime },
+    { header: '方向', cell: (row) => <StatusTag status={row.side === 'buy' ? '买入' : '卖出'} /> },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '价格', cell: (row) => formatPrice(row.price), align: 'right' },
+    { header: '股数', cell: (row) => row.shares, align: 'right' },
+    { header: '金额', cell: (row) => formatMoney(row.amount), align: 'right' },
+    { header: '实现盈亏', cell: (row) => <ColorNumber value={row.realizedPnl} />, align: 'right' },
+    { header: '触发原因', cell: (row) => row.reason },
   ]
 
   const snapshotColumns: Column<PortfolioSnapshot>[] = [
-    { header: 'Time', cell: (row) => row.snapshotTime },
-    { header: 'Total Assets', cell: (row) => formatMoney(row.totalAssets), align: 'right' },
-    { header: 'Cash', cell: (row) => formatMoney(row.cash), align: 'right' },
-    { header: 'Holding Value', cell: (row) => formatMoney(row.holdingMarketValue), align: 'right' },
-    { header: 'Total P/L', cell: (row) => <ColorNumber value={row.totalPnl} />, align: 'right' },
-    { header: 'Return', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
-    { header: 'Positions', cell: (row) => row.positionCount, align: 'right' },
-    { header: 'Orders', cell: (row) => row.tradeCount, align: 'right' },
+    { header: '时间', cell: (row) => row.snapshotTime },
+    { header: '总资产', cell: (row) => formatMoney(row.totalAssets), align: 'right' },
+    { header: '现金', cell: (row) => formatMoney(row.cash), align: 'right' },
+    { header: '持仓市值', cell: (row) => formatMoney(row.holdingMarketValue), align: 'right' },
+    { header: '总盈亏', cell: (row) => <ColorNumber value={row.totalPnl} />, align: 'right' },
+    { header: '收益率', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
+    { header: '持仓数', cell: (row) => row.positionCount, align: 'right' },
+    { header: '成交数', cell: (row) => row.tradeCount, align: 'right' },
   ]
 
   function numberPrompt(message: string, fallback: number) {
@@ -550,7 +550,7 @@ export default function StockDashboard() {
       sync: 'sync_latest' as const,
     }
     const labels = {
-      paper: 'Auto Paper',
+      paper: '自动模拟盘',
       night: '夜间筛选',
       live: '实时决策',
       sync: '同步数据库',
@@ -583,11 +583,10 @@ export default function StockDashboard() {
     <section className="stock-dashboard">
       <header className="stock-hero">
         <div>
-          <span className="eyebrow">STOCK STRATEGY DESK</span>
+          <span className="eyebrow">A 股策略工作台</span>
           <h1>股票策略助手</h1>
-          <p>“市场短期是投票机，长期是称重机。” 今日只做记录、复核和纪律提醒。</p>
+          <p>盘中信号、仓位跟踪、自动模拟盘与收益复盘。</p>
         </div>
-        <div className="stock-risk-note">不接证券账户，不自动下单。所有买卖仅作为个人记录和复盘依据。</div>
       </header>
 
       <div className="stock-stats">
@@ -701,36 +700,36 @@ export default function StockDashboard() {
             <div className="stock-section-stack">
               <div className="stock-panel-heading">
                 <div>
-                  <h2>Auto Paper Trading</h2>
-                  <p>Virtual 1,000,000 yuan account. It records simulated orders only and never connects to a broker.</p>
+                  <h2>自动模拟盘</h2>
+                  <p>100 万虚拟资金按策略自动演算买卖，沉淀账户曲线和成交记录。</p>
                 </div>
               </div>
               {latestSnapshot && (
                 <div className="stock-account-overview">
                   <section>
-                    <span>Total Assets</span>
+                    <span>总资产</span>
                     <strong>{formatMoney(latestSnapshot.totalAssets)}</strong>
                   </section>
                   <section>
-                    <span>Cash</span>
+                    <span>现金</span>
                     <strong>{formatMoney(latestSnapshot.cash)}</strong>
                   </section>
                   <section>
-                    <span>Total P/L</span>
+                    <span>总盈亏</span>
                     <strong><ColorNumber value={latestSnapshot.totalPnl} /></strong>
                   </section>
                   <section>
-                    <span>Return</span>
+                    <span>收益率</span>
                     <strong><ColorNumber value={latestSnapshot.totalReturnRate} suffix="%" /></strong>
                   </section>
                 </div>
               )}
               <section>
-                <h3>Portfolio Snapshots</h3>
+                <h3>账户快照</h3>
                 <DataTable columns={snapshotColumns} data={portfolioSnapshots} onRowClick={setSelectedStock} />
               </section>
               <section>
-                <h3>Auto Orders</h3>
+                <h3>自动交易流水</h3>
                 <DataTable columns={paperOrderColumns} data={paperOrders} onRowClick={setSelectedStock} />
               </section>
             </div>
