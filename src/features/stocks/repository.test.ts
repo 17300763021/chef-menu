@@ -201,11 +201,14 @@ describe('stock repository', () => {
         id: 'run-1',
         run_time: '2026-06-17T08:00:00Z',
         strategy_name: 'strong_pick_v1',
+        benchmark_name: 'pick_equal_weight',
         start_date: '2026-05-01',
         end_date: '2026-06-16',
         initial_cash: 1000000,
         final_value: 1080000,
         total_return_rate: 8,
+        benchmark_return_rate: 5,
+        excess_return_rate: 3,
         max_drawdown_rate: 3.2,
         win_rate: 55.5,
         profit_loss_ratio: 1.8,
@@ -241,6 +244,16 @@ describe('stock repository', () => {
         days_to_high: 5,
         reason: 'not bought',
       }],
+      stock_backtest_equity_curve: [{
+        id: 'curve-1',
+        run_id: 'run-1',
+        curve_date: '2026-05-14',
+        equity_value: 1001000,
+        daily_return_rate: 0.1,
+        drawdown_rate: 0,
+        benchmark_value: 1000500,
+        benchmark_return_rate: 0.05,
+      }],
     }
     const client = {
       from: (table: string) => ({
@@ -255,6 +268,8 @@ describe('stock repository', () => {
       id: 'run-1',
       strategyName: 'strong_pick_v1',
       totalReturnRate: 8,
+      benchmarkReturnRate: 5,
+      excessReturnRate: 3,
       tradeCount: 18,
     }])
     await expect(repository.getBacktestTrades()).resolves.toMatchObject([{
@@ -268,6 +283,13 @@ describe('stock repository', () => {
       code: '000002',
       maxReturnRate: 25,
       daysToHigh: 5,
+    }])
+    await expect(repository.getBacktestEquityCurve()).resolves.toMatchObject([{
+      id: 'curve-1',
+      runId: 'run-1',
+      equityValue: 1001000,
+      benchmarkValue: 1000500,
+      drawdownRate: 0,
     }])
   })
 })

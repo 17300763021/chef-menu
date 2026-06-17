@@ -99,11 +99,14 @@ export interface BacktestRun {
   id: string
   runTime: string
   strategyName: string
+  benchmarkName: string
   startDate: string
   endDate: string
   initialCash: number
   finalValue: number
   totalReturnRate: number
+  benchmarkReturnRate: number
+  excessReturnRate: number
   maxDrawdownRate: number
   winRate: number
   profitLossRatio: number
@@ -140,6 +143,17 @@ export interface MissedRunner {
   maxReturnRate: number
   daysToHigh: number
   reason: string
+}
+
+export interface BacktestEquityPoint {
+  id: string
+  runId: string
+  curveDate: string
+  equityValue: number
+  dailyReturnRate: number
+  drawdownRate: number
+  benchmarkValue: number
+  benchmarkReturnRate: number
 }
 
 export interface SignalEvent {

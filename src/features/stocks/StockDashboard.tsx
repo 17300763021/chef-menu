@@ -6,6 +6,7 @@ import { stockRepository } from './repository'
 import type { PositionAllocation } from './account'
 import type {
   BacktestRun,
+  BacktestEquityPoint,
   BacktestTrade,
   FineStock,
   HoldingStock,
@@ -22,7 +23,7 @@ import type {
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner | BacktestEquityPoint
 type TabId = 'account' | 'auto' | 'backtest' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
 
 interface Column<T> {
@@ -159,12 +160,13 @@ export default function StockDashboard() {
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([])
   const [backtestTrades, setBacktestTrades] = useState<BacktestTrade[]>([])
   const [missedRunners, setMissedRunners] = useState<MissedRunner[]>([])
+  const [backtestCurve, setBacktestCurve] = useState<BacktestEquityPoint[]>([])
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
   const latestSnapshot = portfolioSnapshots[0]
   const latestBacktest = backtestRuns[0]
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -179,6 +181,7 @@ export default function StockDashboard() {
       stockRepository.getBacktestRuns(),
       stockRepository.getBacktestTrades(),
       stockRepository.getMissedRunners(),
+      stockRepository.getBacktestEquityCurve(),
     ])
     setOverview(stats)
     setRoughStocks(rough)
@@ -194,13 +197,14 @@ export default function StockDashboard() {
     setBacktestRuns(btRuns)
     setBacktestTrades(btTrades)
     setMissedRunners(missed)
+    setBacktestCurve(curve)
   }
 
   useEffect(() => {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -215,6 +219,7 @@ export default function StockDashboard() {
         stockRepository.getBacktestRuns(),
         stockRepository.getBacktestTrades(),
         stockRepository.getMissedRunners(),
+        stockRepository.getBacktestEquityCurve(),
       ])
       if (!mounted) return
       setOverview(stats)
@@ -231,6 +236,7 @@ export default function StockDashboard() {
       setBacktestRuns(btRuns)
       setBacktestTrades(btTrades)
       setMissedRunners(missed)
+      setBacktestCurve(curve)
       setLoading(false)
     }
     void load()
@@ -408,8 +414,11 @@ export default function StockDashboard() {
   const backtestRunColumns: Column<BacktestRun>[] = [
     { header: 'Run time', cell: (row) => row.runTime },
     { header: 'Strategy', cell: (row) => row.strategyName },
+    { header: 'Benchmark', cell: (row) => row.benchmarkName },
     { header: 'Range', cell: (row) => `${row.startDate} ~ ${row.endDate}` },
     { header: 'Return', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Benchmark return', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Excess', cell: (row) => <ColorNumber value={row.excessReturnRate} suffix="%" />, align: 'right' },
     { header: 'Max DD', cell: (row) => `${row.maxDrawdownRate.toFixed(2)}%`, align: 'right' },
     { header: 'Win rate', cell: (row) => `${row.winRate.toFixed(2)}%`, align: 'right' },
     { header: 'P/L ratio', cell: (row) => row.profitLossRatio.toFixed(2), align: 'right' },
@@ -440,6 +449,15 @@ export default function StockDashboard() {
     { header: 'Max return', cell: (row) => <ColorNumber value={row.maxReturnRate} suffix="%" />, align: 'right' },
     { header: 'Days to high', cell: (row) => row.daysToHigh, align: 'right' },
     { header: 'Reason', cell: (row) => row.reason },
+  ]
+
+  const backtestCurveColumns: Column<BacktestEquityPoint>[] = [
+    { header: 'Date', cell: (row) => row.curveDate },
+    { header: 'Equity', cell: (row) => formatMoney(row.equityValue), align: 'right' },
+    { header: 'Daily return', cell: (row) => <ColorNumber value={row.dailyReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Drawdown', cell: (row) => `${row.drawdownRate.toFixed(2)}%`, align: 'right' },
+    { header: 'Benchmark', cell: (row) => formatMoney(row.benchmarkValue), align: 'right' },
+    { header: 'Benchmark return', cell: (row) => <ColorNumber value={row.benchmarkReturnRate} suffix="%" />, align: 'right' },
   ]
 
   function numberPrompt(message: string, fallback: number) {
@@ -873,6 +891,10 @@ export default function StockDashboard() {
                     <strong><ColorNumber value={latestBacktest.totalReturnRate} suffix="%" /></strong>
                   </section>
                   <section>
+                    <span>Excess return</span>
+                    <strong><ColorNumber value={latestBacktest.excessReturnRate} suffix="%" /></strong>
+                  </section>
+                  <section>
                     <span>Max drawdown</span>
                     <strong>{latestBacktest.maxDrawdownRate.toFixed(2)}%</strong>
                   </section>
@@ -897,6 +919,10 @@ export default function StockDashboard() {
               <section>
                 <h3>Backtest runs</h3>
                 <DataTable columns={backtestRunColumns} data={backtestRuns} />
+              </section>
+              <section>
+                <h3>Equity curve</h3>
+                <DataTable columns={backtestCurveColumns} data={backtestCurve} />
               </section>
               <section>
                 <h3>Trade samples</h3>

@@ -3,6 +3,7 @@ import { supabase } from '../../lib/supabase'
 import { stocksApi } from './mockApi'
 import type {
   AddHoldingInput,
+  BacktestEquityPoint,
   BacktestRun,
   BacktestTrade,
   ConfirmSignalBuyInput,
@@ -240,11 +241,14 @@ function mapBacktestRun(row: Row): BacktestRun {
     id: text(row, 'id'),
     runTime: text(row, 'run_time'),
     strategyName: text(row, 'strategy_name'),
+    benchmarkName: text(row, 'benchmark_name'),
     startDate: text(row, 'start_date'),
     endDate: text(row, 'end_date'),
     initialCash: numberValue(row, 'initial_cash'),
     finalValue: numberValue(row, 'final_value'),
     totalReturnRate: numberValue(row, 'total_return_rate'),
+    benchmarkReturnRate: numberValue(row, 'benchmark_return_rate'),
+    excessReturnRate: numberValue(row, 'excess_return_rate'),
     maxDrawdownRate: numberValue(row, 'max_drawdown_rate'),
     winRate: numberValue(row, 'win_rate'),
     profitLossRatio: numberValue(row, 'profit_loss_ratio'),
@@ -252,6 +256,19 @@ function mapBacktestRun(row: Row): BacktestRun {
     avgHoldingDays: numberValue(row, 'avg_holding_days'),
     missedRunnerCount: numberValue(row, 'missed_runner_count'),
     note: text(row, 'note'),
+  }
+}
+
+function mapBacktestEquityPoint(row: Row): BacktestEquityPoint {
+  return {
+    id: text(row, 'id'),
+    runId: text(row, 'run_id'),
+    curveDate: text(row, 'curve_date'),
+    equityValue: numberValue(row, 'equity_value'),
+    dailyReturnRate: numberValue(row, 'daily_return_rate'),
+    drawdownRate: numberValue(row, 'drawdown_rate'),
+    benchmarkValue: numberValue(row, 'benchmark_value'),
+    benchmarkReturnRate: numberValue(row, 'benchmark_return_rate'),
   }
 }
 
@@ -325,6 +342,7 @@ export interface StockRepository {
   getBacktestRuns(): Promise<BacktestRun[]>
   getBacktestTrades(): Promise<BacktestTrade[]>
   getMissedRunners(): Promise<MissedRunner[]>
+  getBacktestEquityCurve(): Promise<BacktestEquityPoint[]>
   getSignalEvents(): Promise<SignalEvent[]>
   getHistoricalFineStocks(): Promise<FineStock[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
@@ -424,6 +442,10 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
     async getMissedRunners() {
       const rows = await selectRows('stock_missed_runners', 'max_return_rate')
       return (rows ?? []).map(mapMissedRunner)
+    },
+    async getBacktestEquityCurve() {
+      const rows = await selectRows('stock_backtest_equity_curve', 'curve_date')
+      return (rows ?? []).map(mapBacktestEquityPoint)
     },
     async getSignalEvents() {
       const rows = await selectRows('stock_signal_events', 'signal_time')

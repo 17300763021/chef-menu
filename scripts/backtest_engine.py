@@ -143,13 +143,14 @@ def stock_history(code: str, start_date: str, end_date: str) -> Any:
     )
     if raw.empty:
         return raw
+    columns = list(raw.columns)
     frame = raw.rename(columns={
-        "日期": "datetime",
-        "开盘": "open",
-        "最高": "high",
-        "最低": "low",
-        "收盘": "close",
-        "成交量": "volume",
+        columns[0]: "datetime",
+        columns[1]: "open",
+        columns[2]: "close",
+        columns[3]: "high",
+        columns[4]: "low",
+        columns[5]: "volume",
     })
     frame["datetime"] = pd.to_datetime(frame["datetime"])
     frame = frame.set_index("datetime")
@@ -261,23 +262,74 @@ def summarize(trades: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
+def benchmark_return(picks: list[dict[str, Any]], end: date) -> float:
+    returns: list[float] = []
+    for pick in picks[: min(len(picks), 40)]:
+        try:
+            code = str(pick.get("code", "")).zfill(6)
+            pick_date = date.fromisoformat(str(pick.get("scan_date")))
+            history = stock_history(code, pick_date.isoformat(), end.isoformat())
+            if len(history) < 2:
+                continue
+            entry = float(history.iloc[0]["close"])
+            latest = float(history.iloc[-1]["close"])
+            if entry > 0:
+                returns.append((latest - entry) / entry * 100)
+        except Exception as reason:
+            print(json.dumps({"benchmark_skip": pick.get("code"), "reason": str(reason)}, ensure_ascii=False), flush=True)
+    return sum(returns) / len(returns) if returns else 0
+
+
+def equity_curve(trades: list[dict[str, Any]], benchmark_rate: float) -> list[dict[str, Any]]:
+    sorted_trades = sorted(trades, key=lambda item: str(item.get("exit_date", "")))
+    if not sorted_trades:
+        return []
+    equity = INITIAL_CASH
+    previous_equity = INITIAL_CASH
+    peak = INITIAL_CASH
+    points: list[dict[str, Any]] = []
+    total = max(1, len(sorted_trades))
+    for index, trade in enumerate(sorted_trades, start=1):
+        equity += number(trade.get("pnl_amount"))
+        peak = max(peak, equity)
+        daily_return = (equity - previous_equity) / previous_equity * 100 if previous_equity else 0
+        drawdown = (peak - equity) / peak * 100 if peak else 0
+        benchmark_progress = benchmark_rate * index / total
+        points.append({
+            "curve_date": trade.get("exit_date"),
+            "equity_value": equity,
+            "daily_return_rate": daily_return,
+            "drawdown_rate": drawdown,
+            "benchmark_value": INITIAL_CASH * (1 + benchmark_progress / 100),
+            "benchmark_return_rate": benchmark_progress,
+        })
+        previous_equity = equity
+    return points
+
+
 def insert_results(
     client: SupabaseRest,
     picks: list[dict[str, Any]],
     trades: list[dict[str, Any]],
     missed: list[dict[str, Any]],
+    curve: list[dict[str, Any]],
+    benchmark_rate: float,
     dry_run: bool,
 ) -> dict[str, Any]:
     start_date = min(str(item.get("scan_date")) for item in picks)
     end_date = date.today().isoformat()
     metrics = summarize(trades)
+    excess_return = metrics["total_return_rate"] - benchmark_rate
     run_payload = {
         "strategy_name": "strong_pick_v1_backtrader",
+        "benchmark_name": "pick_equal_weight",
         "start_date": start_date,
         "end_date": end_date,
         "initial_cash": INITIAL_CASH,
         "final_value": metrics["final_value"],
         "total_return_rate": metrics["total_return_rate"],
+        "benchmark_return_rate": benchmark_rate,
+        "excess_return_rate": excess_return,
         "max_drawdown_rate": metrics["max_drawdown_rate"],
         "win_rate": metrics["win_rate"],
         "profit_loss_ratio": metrics["profit_loss_ratio"],
@@ -287,13 +339,15 @@ def insert_results(
         "note": f"Backtrader lightweight validation, picks={len(picks)}",
     }
     if dry_run:
-        return {"run": run_payload, "trades": len(trades), "missed": len(missed)}
+        return {"run": run_payload, "trades": len(trades), "missed": len(missed), "curve": len(curve)}
     run_rows = client.request("POST", "stock_backtest_runs", run_payload, prefer="return=representation")
     run_id = run_rows[0]["id"]
     if trades:
         client.insert("stock_backtest_trades", [{**item, "run_id": run_id} for item in trades])
     if missed:
         client.insert("stock_missed_runners", [{**item, "run_id": run_id} for item in missed])
+    if curve:
+        client.insert("stock_backtest_equity_curve", [{**item, "run_id": run_id} for item in curve])
     return {"run_id": run_id, "trades": len(trades), "missed": len(missed), **run_payload}
 
 
@@ -320,7 +374,9 @@ def run(dry_run: bool = False) -> dict[str, Any]:
                     missed.append(runner)
         except Exception as reason:
             print(json.dumps({"skip": pick.get("code"), "reason": str(reason)}, ensure_ascii=False), flush=True)
-    return insert_results(client, picks, trades, missed, dry_run)
+    benchmark_rate = benchmark_return(picks, end)
+    curve = equity_curve(trades, benchmark_rate)
+    return insert_results(client, picks, trades, missed, curve, benchmark_rate, dry_run)
 
 
 def main() -> int:
