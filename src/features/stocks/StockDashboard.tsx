@@ -336,6 +336,10 @@ export default function StockDashboard() {
       header: '操作',
       cell: (row) => (
         <div className="stock-row-actions">
+          <button type="button" onClick={(event) => {
+            event.stopPropagation()
+            setExecutionStock({ code: row.code, name: row.name })
+          }}>{'\u6267\u884c\u8bb0\u5f55'}</button>
           {(['加仓', '减仓', '清仓'] as TradeAction[]).map((action) => (
             <button key={action} type="button" onClick={(event) => {
               event.stopPropagation()
