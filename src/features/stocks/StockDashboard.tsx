@@ -81,11 +81,18 @@ function DataTable<T extends StockRow>({
   columns,
   data,
   onRowClick,
+  pageSize = 8,
 }: {
   columns: Column<T>[]
   data: T[]
   onRowClick?: (row: T) => void
+  pageSize?: number
 }) {
+  const [page, setPage] = useState(0)
+  const pageCount = Math.max(1, Math.ceil(data.length / pageSize))
+  const safePage = Math.min(page, pageCount - 1)
+  const visibleData = data.slice(safePage * pageSize, safePage * pageSize + pageSize)
+
   return (
     <div className="stock-table-wrap">
       <table className="stock-table">
@@ -97,7 +104,7 @@ function DataTable<T extends StockRow>({
           </tr>
         </thead>
         <tbody>
-          {data.map((row, index) => (
+          {visibleData.map((row, index) => (
             <tr key={`${'code' in row ? row.code : 'id' in row ? row.id : index}-${index}`} onClick={() => onRowClick?.(row)}>
               {columns.map((column) => (
                 <td key={column.header} className={column.align === 'right' ? 'right' : undefined}>{column.cell(row)}</td>
@@ -106,6 +113,15 @@ function DataTable<T extends StockRow>({
           ))}
         </tbody>
       </table>
+      {data.length > pageSize && (
+        <div className="stock-pagination">
+          <span>{safePage + 1} / {pageCount} · 共 {data.length} 条</span>
+          <div>
+            <button type="button" disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button>
+            <button type="button" disabled={safePage >= pageCount - 1} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}>下一页</button>
+          </div>
+        </div>
+      )}
       {data.length === 0 && <div className="stock-empty">暂无数据</div>}
     </div>
   )
