@@ -4,3 +4,4 @@ numpy
 openpyxl
 matplotlib
 requests
+backtrader

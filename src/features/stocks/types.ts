@@ -93,7 +93,54 @@ export interface SaveTradeResult {
   tradeRecord?: TradeRecord
 }
 
-export type StockJobType = 'night_scan' | 'live_decision' | 'paper_trade' | 'sync_latest'
+export type StockJobType = 'night_scan' | 'live_decision' | 'paper_trade' | 'backtest' | 'sync_latest'
+
+export interface BacktestRun {
+  id: string
+  runTime: string
+  strategyName: string
+  startDate: string
+  endDate: string
+  initialCash: number
+  finalValue: number
+  totalReturnRate: number
+  maxDrawdownRate: number
+  winRate: number
+  profitLossRatio: number
+  tradeCount: number
+  avgHoldingDays: number
+  missedRunnerCount: number
+  note: string
+}
+
+export interface BacktestTrade {
+  id: string
+  runId: string
+  code: string
+  name: string
+  entryDate: string
+  exitDate: string
+  entryPrice: number
+  exitPrice: number
+  shares: number
+  pnlAmount: number
+  pnlRate: number
+  holdingDays: number
+  exitReason: string
+}
+
+export interface MissedRunner {
+  id: string
+  runId: string
+  pickDate: string
+  code: string
+  name: string
+  pickPrice: number
+  maxPrice: number
+  maxReturnRate: number
+  daysToHigh: number
+  reason: string
+}
 
 export interface SignalEvent {
   id: string

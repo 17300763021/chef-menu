@@ -194,4 +194,80 @@ describe('stock repository', () => {
       expect.objectContaining({ table: 'stock_signal_events', action: 'update' }),
     ]))
   })
+
+  it('loads backtest runs, trades, and missed runners from the cloud repository', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_backtest_runs: [{
+        id: 'run-1',
+        run_time: '2026-06-17T08:00:00Z',
+        strategy_name: 'strong_pick_v1',
+        start_date: '2026-05-01',
+        end_date: '2026-06-16',
+        initial_cash: 1000000,
+        final_value: 1080000,
+        total_return_rate: 8,
+        max_drawdown_rate: 3.2,
+        win_rate: 55.5,
+        profit_loss_ratio: 1.8,
+        trade_count: 18,
+        avg_holding_days: 6.4,
+        missed_runner_count: 3,
+        note: 'ok',
+      }],
+      stock_backtest_trades: [{
+        id: 'trade-1',
+        run_id: 'run-1',
+        code: '000001',
+        name: '平安银行',
+        entry_date: '2026-05-06',
+        exit_date: '2026-05-14',
+        entry_price: 10,
+        exit_price: 11,
+        shares: 1000,
+        pnl_amount: 1000,
+        pnl_rate: 10,
+        holding_days: 8,
+        exit_reason: 'take_profit',
+      }],
+      stock_missed_runners: [{
+        id: 'miss-1',
+        run_id: 'run-1',
+        pick_date: '2026-05-06',
+        code: '000002',
+        name: '万科A',
+        pick_price: 8,
+        max_price: 10,
+        max_return_rate: 25,
+        days_to_high: 5,
+        reason: 'not bought',
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getBacktestRuns()).resolves.toMatchObject([{
+      id: 'run-1',
+      strategyName: 'strong_pick_v1',
+      totalReturnRate: 8,
+      tradeCount: 18,
+    }])
+    await expect(repository.getBacktestTrades()).resolves.toMatchObject([{
+      id: 'trade-1',
+      code: '000001',
+      pnlRate: 10,
+      holdingDays: 8,
+    }])
+    await expect(repository.getMissedRunners()).resolves.toMatchObject([{
+      id: 'miss-1',
+      code: '000002',
+      maxReturnRate: 25,
+      daysToHigh: 5,
+    }])
+  })
 })

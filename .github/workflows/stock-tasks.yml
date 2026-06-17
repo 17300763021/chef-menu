@@ -18,6 +18,7 @@ on:
           - night_scan
           - live_decision
           - paper_trade
+          - backtest
           - sync_latest
           - pending
 

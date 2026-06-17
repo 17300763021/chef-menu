@@ -5,8 +5,11 @@ import { buildAccountSummary, recommendSignalBuy } from './account'
 import { stockRepository } from './repository'
 import type { PositionAllocation } from './account'
 import type {
+  BacktestRun,
+  BacktestTrade,
   FineStock,
   HoldingStock,
+  MissedRunner,
   OverviewStats,
   PaperTradeOrder,
   PortfolioSnapshot,
@@ -19,8 +22,8 @@ import type {
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot
-type TabId = 'account' | 'auto' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner
+type TabId = 'account' | 'auto' | 'backtest' | 'signals' | 'live' | 'holdings' | 'rough' | 'fine' | 'history' | 'trades' | 'tasks'
 
 interface Column<T> {
   header: string
@@ -153,11 +156,15 @@ export default function StockDashboard() {
   const [historicalFineStocks, setHistoricalFineStocks] = useState<FineStock[]>([])
   const [paperOrders, setPaperOrders] = useState<PaperTradeOrder[]>([])
   const [portfolioSnapshots, setPortfolioSnapshots] = useState<PortfolioSnapshot[]>([])
+  const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([])
+  const [backtestTrades, setBacktestTrades] = useState<BacktestTrade[]>([])
+  const [missedRunners, setMissedRunners] = useState<MissedRunner[]>([])
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
   const latestSnapshot = portfolioSnapshots[0]
+  const latestBacktest = backtestRuns[0]
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -169,6 +176,9 @@ export default function StockDashboard() {
       stockRepository.getHistoricalFineStocks(),
       stockRepository.getPaperTradeOrders(),
       stockRepository.getPortfolioSnapshots(),
+      stockRepository.getBacktestRuns(),
+      stockRepository.getBacktestTrades(),
+      stockRepository.getMissedRunners(),
     ])
     setOverview(stats)
     setRoughStocks(rough)
@@ -181,13 +191,16 @@ export default function StockDashboard() {
     setHistoricalFineStocks(historicalPicks)
     setPaperOrders(autoOrders)
     setPortfolioSnapshots(snapshots)
+    setBacktestRuns(btRuns)
+    setBacktestTrades(btTrades)
+    setMissedRunners(missed)
   }
 
   useEffect(() => {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -199,6 +212,9 @@ export default function StockDashboard() {
         stockRepository.getHistoricalFineStocks(),
         stockRepository.getPaperTradeOrders(),
         stockRepository.getPortfolioSnapshots(),
+        stockRepository.getBacktestRuns(),
+        stockRepository.getBacktestTrades(),
+        stockRepository.getMissedRunners(),
       ])
       if (!mounted) return
       setOverview(stats)
@@ -212,6 +228,9 @@ export default function StockDashboard() {
       setHistoricalFineStocks(historicalPicks)
       setPaperOrders(autoOrders)
       setPortfolioSnapshots(snapshots)
+      setBacktestRuns(btRuns)
+      setBacktestTrades(btTrades)
+      setMissedRunners(missed)
       setLoading(false)
     }
     void load()
@@ -229,6 +248,7 @@ export default function StockDashboard() {
   }, [autoRefresh])
 
   const tabs = useMemo(() => [
+    { id: 'backtest' as const, label: 'Backtest' },
     { id: 'auto' as const, label: '自动模拟盘' },
     { id: 'account' as const, label: '账户总览' },
     { id: 'signals' as const, label: '信号中心' },
@@ -383,6 +403,43 @@ export default function StockDashboard() {
     { header: '收益率', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
     { header: '持仓数', cell: (row) => row.positionCount, align: 'right' },
     { header: '成交数', cell: (row) => row.tradeCount, align: 'right' },
+  ]
+
+  const backtestRunColumns: Column<BacktestRun>[] = [
+    { header: 'Run time', cell: (row) => row.runTime },
+    { header: 'Strategy', cell: (row) => row.strategyName },
+    { header: 'Range', cell: (row) => `${row.startDate} ~ ${row.endDate}` },
+    { header: 'Return', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Max DD', cell: (row) => `${row.maxDrawdownRate.toFixed(2)}%`, align: 'right' },
+    { header: 'Win rate', cell: (row) => `${row.winRate.toFixed(2)}%`, align: 'right' },
+    { header: 'P/L ratio', cell: (row) => row.profitLossRatio.toFixed(2), align: 'right' },
+    { header: 'Trades', cell: (row) => row.tradeCount, align: 'right' },
+    { header: 'Avg days', cell: (row) => row.avgHoldingDays.toFixed(1), align: 'right' },
+    { header: 'Missed', cell: (row) => row.missedRunnerCount, align: 'right' },
+  ]
+
+  const backtestTradeColumns: Column<BacktestTrade>[] = [
+    { header: 'Code', cell: (row) => row.code },
+    { header: 'Name', cell: (row) => row.name },
+    { header: 'Entry', cell: (row) => row.entryDate },
+    { header: 'Exit', cell: (row) => row.exitDate },
+    { header: 'Entry price', cell: (row) => formatPrice(row.entryPrice), align: 'right' },
+    { header: 'Exit price', cell: (row) => formatPrice(row.exitPrice), align: 'right' },
+    { header: 'P/L', cell: (row) => <ColorNumber value={row.pnlAmount} />, align: 'right' },
+    { header: 'Return', cell: (row) => <ColorNumber value={row.pnlRate} suffix="%" />, align: 'right' },
+    { header: 'Days', cell: (row) => row.holdingDays, align: 'right' },
+    { header: 'Reason', cell: (row) => row.exitReason },
+  ]
+
+  const missedRunnerColumns: Column<MissedRunner>[] = [
+    { header: 'Pick date', cell: (row) => row.pickDate },
+    { header: 'Code', cell: (row) => row.code },
+    { header: 'Name', cell: (row) => row.name },
+    { header: 'Pick price', cell: (row) => formatPrice(row.pickPrice), align: 'right' },
+    { header: 'Max price', cell: (row) => formatPrice(row.maxPrice), align: 'right' },
+    { header: 'Max return', cell: (row) => <ColorNumber value={row.maxReturnRate} suffix="%" />, align: 'right' },
+    { header: 'Days to high', cell: (row) => row.daysToHigh, align: 'right' },
+    { header: 'Reason', cell: (row) => row.reason },
   ]
 
   function numberPrompt(message: string, fallback: number) {
@@ -576,16 +633,18 @@ export default function StockDashboard() {
     }
   }
 
-  function explainLocalScript(action: 'night' | 'live' | 'paper' | 'sync') {
+  function explainLocalScript(action: 'night' | 'live' | 'paper' | 'backtest' | 'sync') {
     if (!requireStockLogin()) return
     setErrorMessage('')
     const jobTypes = {
       night: 'night_scan' as const,
       live: 'live_decision' as const,
       paper: 'paper_trade' as const,
+      backtest: 'backtest' as const,
       sync: 'sync_latest' as const,
     }
     const labels = {
+      backtest: 'Backtest',
       paper: '自动模拟盘',
       night: '夜间筛选',
       live: '实时决策',
@@ -798,6 +857,57 @@ export default function StockDashboard() {
               </section>
             </div>
           )}
+          {activeTab === 'backtest' && (
+            <div className="stock-section-stack">
+              <div className="stock-panel-heading">
+                <div>
+                  <h2>Backtest Center</h2>
+                  <p>Lightweight Backtrader validation for recent strong picks and missed runners.</p>
+                </div>
+                <button type="button" onClick={() => explainLocalScript('backtest')}>Run backtest</button>
+              </div>
+              {latestBacktest && (
+                <div className="stock-account-overview">
+                  <section>
+                    <span>Strategy return</span>
+                    <strong><ColorNumber value={latestBacktest.totalReturnRate} suffix="%" /></strong>
+                  </section>
+                  <section>
+                    <span>Max drawdown</span>
+                    <strong>{latestBacktest.maxDrawdownRate.toFixed(2)}%</strong>
+                  </section>
+                  <section>
+                    <span>Win rate</span>
+                    <strong>{latestBacktest.winRate.toFixed(2)}%</strong>
+                  </section>
+                  <section>
+                    <span>P/L ratio</span>
+                    <strong>{latestBacktest.profitLossRatio.toFixed(2)}</strong>
+                  </section>
+                  <section>
+                    <span>Trades</span>
+                    <strong>{latestBacktest.tradeCount}</strong>
+                  </section>
+                  <section>
+                    <span>Avg holding days</span>
+                    <strong>{latestBacktest.avgHoldingDays.toFixed(1)}</strong>
+                  </section>
+                </div>
+              )}
+              <section>
+                <h3>Backtest runs</h3>
+                <DataTable columns={backtestRunColumns} data={backtestRuns} />
+              </section>
+              <section>
+                <h3>Trade samples</h3>
+                <DataTable columns={backtestTradeColumns} data={backtestTrades} onRowClick={setSelectedStock} />
+              </section>
+              <section>
+                <h3>Missed big runners</h3>
+                <DataTable columns={missedRunnerColumns} data={missedRunners} onRowClick={setSelectedStock} />
+              </section>
+            </div>
+          )}
           {activeTab === 'live' && <DataTable columns={realtimeColumns} data={realtime} onRowClick={setSelectedStock} />}
           {activeTab === 'signals' && (
             <div className="stock-section-stack">
@@ -833,6 +943,7 @@ export default function StockDashboard() {
               <div className="stock-task-actions">
                 <button type="button" onClick={() => explainLocalScript('night')}>运行夜间筛选</button>
                 <button type="button" onClick={() => explainLocalScript('live')}>运行实时决策</button>
+                <button type="button" onClick={() => explainLocalScript('backtest')}>运行回测</button>
                 <button type="button" onClick={() => explainLocalScript('sync')}>同步到数据库</button>
                 <button type="button" onClick={() => void toggleAutoRefresh()}>{autoRefresh ? '停止每分钟刷新' : '每分钟刷新'}</button>
               </div>

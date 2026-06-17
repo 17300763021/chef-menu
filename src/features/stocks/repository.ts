@@ -3,9 +3,12 @@ import { supabase } from '../../lib/supabase'
 import { stocksApi } from './mockApi'
 import type {
   AddHoldingInput,
+  BacktestRun,
+  BacktestTrade,
   ConfirmSignalBuyInput,
   FineStock,
   HoldingStock,
+  MissedRunner,
   OverviewStats,
   PaperTradeOrder,
   PortfolioSnapshot,
@@ -232,6 +235,59 @@ function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
   }
 }
 
+function mapBacktestRun(row: Row): BacktestRun {
+  return {
+    id: text(row, 'id'),
+    runTime: text(row, 'run_time'),
+    strategyName: text(row, 'strategy_name'),
+    startDate: text(row, 'start_date'),
+    endDate: text(row, 'end_date'),
+    initialCash: numberValue(row, 'initial_cash'),
+    finalValue: numberValue(row, 'final_value'),
+    totalReturnRate: numberValue(row, 'total_return_rate'),
+    maxDrawdownRate: numberValue(row, 'max_drawdown_rate'),
+    winRate: numberValue(row, 'win_rate'),
+    profitLossRatio: numberValue(row, 'profit_loss_ratio'),
+    tradeCount: numberValue(row, 'trade_count'),
+    avgHoldingDays: numberValue(row, 'avg_holding_days'),
+    missedRunnerCount: numberValue(row, 'missed_runner_count'),
+    note: text(row, 'note'),
+  }
+}
+
+function mapBacktestTrade(row: Row): BacktestTrade {
+  return {
+    id: text(row, 'id'),
+    runId: text(row, 'run_id'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    entryDate: text(row, 'entry_date'),
+    exitDate: text(row, 'exit_date'),
+    entryPrice: numberValue(row, 'entry_price'),
+    exitPrice: numberValue(row, 'exit_price'),
+    shares: numberValue(row, 'shares'),
+    pnlAmount: numberValue(row, 'pnl_amount'),
+    pnlRate: numberValue(row, 'pnl_rate'),
+    holdingDays: numberValue(row, 'holding_days'),
+    exitReason: text(row, 'exit_reason'),
+  }
+}
+
+function mapMissedRunner(row: Row): MissedRunner {
+  return {
+    id: text(row, 'id'),
+    runId: text(row, 'run_id'),
+    pickDate: text(row, 'pick_date'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    pickPrice: numberValue(row, 'pick_price'),
+    maxPrice: numberValue(row, 'max_price'),
+    maxReturnRate: numberValue(row, 'max_return_rate'),
+    daysToHigh: numberValue(row, 'days_to_high'),
+    reason: text(row, 'reason'),
+  }
+}
+
 function mapSignalEvent(row: Row): SignalEvent {
   return {
     id: text(row, 'id'),
@@ -266,6 +322,9 @@ export interface StockRepository {
   getTasks(): Promise<TaskRecord[]>
   getPaperTradeOrders(): Promise<PaperTradeOrder[]>
   getPortfolioSnapshots(): Promise<PortfolioSnapshot[]>
+  getBacktestRuns(): Promise<BacktestRun[]>
+  getBacktestTrades(): Promise<BacktestTrade[]>
+  getMissedRunners(): Promise<MissedRunner[]>
   getSignalEvents(): Promise<SignalEvent[]>
   getHistoricalFineStocks(): Promise<FineStock[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
@@ -353,6 +412,18 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
     async getPortfolioSnapshots() {
       const rows = await selectRows('stock_portfolio_snapshots', 'snapshot_time')
       return (rows ?? []).map(mapPortfolioSnapshot)
+    },
+    async getBacktestRuns() {
+      const rows = await selectRows('stock_backtest_runs', 'run_time')
+      return (rows ?? []).map(mapBacktestRun)
+    },
+    async getBacktestTrades() {
+      const rows = await selectRows('stock_backtest_trades', 'entry_date')
+      return (rows ?? []).map(mapBacktestTrade)
+    },
+    async getMissedRunners() {
+      const rows = await selectRows('stock_missed_runners', 'max_return_rate')
+      return (rows ?? []).map(mapMissedRunner)
     },
     async getSignalEvents() {
       const rows = await selectRows('stock_signal_events', 'signal_time')
