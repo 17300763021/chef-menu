@@ -28,6 +28,11 @@ class StockWorkflowScheduleTest(unittest.TestCase):
         for schedule in expected:
             self.assertIn(schedule, stock_tasks)
 
+    def test_stock_jobs_use_shanghai_timezone(self) -> None:
+        for workflow_name in ["stock-tasks.yml", "stock-pending.yml"]:
+            workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
+            self.assertIn("TZ: Asia/Shanghai", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

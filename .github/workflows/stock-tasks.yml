@@ -42,6 +42,7 @@ jobs:
         run: python -m pip install -r scripts/stock_engine/requirements.txt
       - name: Run stock task
         env:
+          TZ: Asia/Shanghai
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EVENT_NAME: ${{ github.event_name }}

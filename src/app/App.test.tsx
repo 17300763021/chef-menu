@@ -62,6 +62,9 @@ describe('chef menu application', () => {
 
     expect(await screen.findByRole('heading', { name: '股票策略助手' }, { timeout: 7000 })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '自动模拟盘' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '更多数据' }))
+    expect(screen.getByRole('tab', { name: '最近盘后精选' })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '今日精选' })).not.toBeInTheDocument()
   })
 
   it('asks visitors to log in before adding a stock holding', async () => {

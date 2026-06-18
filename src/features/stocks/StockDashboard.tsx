@@ -279,7 +279,7 @@ export default function StockDashboard() {
     { id: 'signals' as const, label: '信号中心' },
     { id: 'live' as const, label: '盘中实时决策' },
     { id: 'rough' as const, label: '今日海选' },
-    { id: 'fine' as const, label: '今日精选' },
+    { id: 'fine' as const, label: '最近盘后精选' },
     { id: 'history' as const, label: '历史精选' },
     { id: 'trades' as const, label: '清仓复盘' },
   ], [])
