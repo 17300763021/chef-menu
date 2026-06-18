@@ -6,11 +6,8 @@ concurrency:
 
 on:
   schedule:
-    - cron: "30-55/5 1 * * 1-5"
-    - cron: "*/5 2 * * 1-5"
-    - cron: "0-30/5 3 * * 1-5"
-    - cron: "*/5 5-6 * * 1-5"
-    - cron: "0 7 * * 1-5"
+    - cron: "25 1 * * 1-5"
+    - cron: "55 4 * * 1-5"
     - cron: "40 7 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -23,6 +20,7 @@ on:
           - full
           - night_scan
           - live_decision
+          - live_session
           - paper_trade
           - backtest
           - sync_latest
@@ -31,7 +29,7 @@ on:
 jobs:
   stock-tasks:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,8 +47,11 @@ jobs:
           EVENT_SCHEDULE: ${{ github.event.schedule }}
           INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
-          MODE="${INPUT_MODE:-live_decision}"
+          MODE="${INPUT_MODE:-live_session}"
           if [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" = "40 7 * * 1-5" ]; then
             MODE="full"
+          fi
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$EVENT_SCHEDULE" != "40 7 * * 1-5" ]; then
+            MODE="live_session"
           fi
           python scripts/run_stock_tasks.py --mode "$MODE"

@@ -34,6 +34,7 @@ A股实时买卖一体决策脚本 v8
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import time
 from pathlib import Path
@@ -817,6 +818,7 @@ def main():
     ap.add_argument("--capital", type=float, default=None, help="账户总资金；填写后自动按止损距离估算建议股数")
     ap.add_argument("--risk-pct", type=float, default=1.0, help="单笔账户风险百分比，默认 1%%")
     ap.add_argument("--sleep", type=float, default=0.1)
+    ap.add_argument("--workers", type=int, default=4, help="并行分析股票数，默认 4")
     args = ap.parse_args()
 
     if not args.watchlist and not args.holdings and not args.code:
@@ -836,8 +838,9 @@ def main():
     market_context = get_market_context()
     print(f"开始实时买卖一体分析，共 {len(items)} 只。")
     print(f"大盘环境：{market_context.get('市场环境', '缺失')} | {market_context.get('市场建议', '')}")
-    rows = []
-    for i, item in enumerate(items, start=1):
+    rows_by_index = {}
+
+    def analyze(index, item):
         try:
             d = get_live_decision(
                 item,
@@ -846,27 +849,35 @@ def main():
                 capital=args.capital,
                 account_risk_pct=args.risk_pct,
             )
-            rows.append(d)
-
-            clear_action = (
-                d["买入判断"] == "可以买小仓"
-                or "止损" in d["最终动作"]
-                or "减仓" in d["最终动作"]
-                or "止盈" in d["最终动作"]
-                or "加仓" in d["最终动作"]
-            )
-
-            if not args.only_action or clear_action:
-                print_decision(d, show_checks=args.show_checks)
-
+            return index, d, None
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            code = item.get("代码", "")
-            name = item.get("名称", "")
-            print(f"[跳过] {code} {name}: {e}")
+            return index, None, (item, e)
 
-        time.sleep(args.sleep)
+    worker_count = max(1, min(args.workers, len(items)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(analyze, index, item) for index, item in enumerate(items)]
+        for future in as_completed(futures):
+            index, decision, error = future.result()
+            if decision is not None:
+                rows_by_index[index] = decision
+            elif error:
+                item, reason = error
+                print(f"[跳过] {item.get('代码', '')} {item.get('名称', '')}: {reason}")
+            time.sleep(args.sleep)
+
+    rows = [rows_by_index[index] for index in sorted(rows_by_index)]
+    for d in rows:
+        clear_action = (
+            d["买入判断"] == "可以买小仓"
+            or "止损" in d["最终动作"]
+            or "减仓" in d["最终动作"]
+            or "止盈" in d["最终动作"]
+            or "加仓" in d["最终动作"]
+        )
+        if not args.only_action or clear_action:
+            print_decision(d, show_checks=args.show_checks)
 
     save_results(rows)
 

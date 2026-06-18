@@ -19,14 +19,12 @@ class StockWorkflowScheduleTest(unittest.TestCase):
         stock_tasks = (ROOT / ".github" / "workflows" / "stock-tasks.yml").read_text(encoding="utf-8")
 
         expected = [
-            'cron: "30-55/5 1 * * 1-5"',
-            'cron: "*/5 2 * * 1-5"',
-            'cron: "0-30/5 3 * * 1-5"',
-            'cron: "*/5 5-6 * * 1-5"',
-            'cron: "0 7 * * 1-5"',
+            'cron: "25 1 * * 1-5"',
+            'cron: "55 4 * * 1-5"',
         ]
         for schedule in expected:
             self.assertIn(schedule, stock_tasks)
+        self.assertIn('MODE="live_session"', stock_tasks)
 
     def test_stock_jobs_use_shanghai_timezone(self) -> None:
         for workflow_name in ["stock-tasks.yml", "stock-pending.yml"]:

@@ -8,15 +8,18 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_DIR = ROOT / "scripts" / "stock_engine"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def run_command(args: list[str], cwd: Path) -> None:
@@ -32,6 +35,34 @@ def get_client() -> SupabaseRest:
         print("Missing SUPABASE_SERVICE_ROLE_KEY", file=sys.stderr)
         raise SystemExit(1)
     return SupabaseRest(url, key)
+
+
+def live_session_window(now: datetime) -> tuple[datetime, datetime] | None:
+    local_now = now.astimezone(SHANGHAI)
+    morning_start = datetime.combine(local_now.date(), clock_time(9, 30), SHANGHAI)
+    morning_end = datetime.combine(local_now.date(), clock_time(11, 30), SHANGHAI)
+    afternoon_start = datetime.combine(local_now.date(), clock_time(13, 0), SHANGHAI)
+    afternoon_end = datetime.combine(local_now.date(), clock_time(15, 0), SHANGHAI)
+    if local_now <= morning_end and local_now >= morning_start - timedelta(minutes=15):
+        return morning_start, morning_end
+    if local_now <= afternoon_end and local_now >= afternoon_start - timedelta(minutes=15):
+        return afternoon_start, afternoon_end
+    return None
+
+
+def seconds_until_next_cycle(now: datetime) -> int:
+    local_now = now.astimezone(SHANGHAI)
+    elapsed = local_now.minute % 5 * 60 + local_now.second
+    return 300 - elapsed if elapsed else 300
+
+
+def record_job(client: SupabaseRest, job_type: str, status: str, imported_count: int, error_message: str = "") -> None:
+    client.insert("stock_job_runs", [{
+        "job_type": job_type,
+        "status": status,
+        "imported_count": imported_count,
+        "error_message": error_message,
+    }])
 
 
 def patch_request(client: SupabaseRest, request_id: str, payload: dict[str, Any]) -> None:
@@ -222,6 +253,8 @@ def run_live_decision() -> None:
         "--show-checks",
         "--minute-period",
         "5",
+        "--workers",
+        os.environ.get("STOCK_LIVE_WORKERS", "4"),
     ]
     if watchlist:
         command.extend(["--watchlist", watchlist])
@@ -229,6 +262,43 @@ def run_live_decision() -> None:
         command.extend(["--holdings", holdings_path.name])
     print("+", " ".join(command), flush=True)
     subprocess.run(command, cwd=ENGINE_DIR, env=env, check=True)
+
+
+def run_live_session() -> int:
+    client = get_client()
+    window = live_session_window(datetime.now(SHANGHAI))
+    if not window:
+        print("Outside A-share live session; skipping.", flush=True)
+        return 0
+    start, end = window
+    now = datetime.now(SHANGHAI)
+    if now < start:
+        wait_seconds = max(0, int((start - now).total_seconds()))
+        print(f"Waiting {wait_seconds}s for session open at {start:%H:%M}.", flush=True)
+        time.sleep(wait_seconds)
+
+    completed = 0
+    while datetime.now(SHANGHAI) < end:
+        cycle_started = datetime.now(SHANGHAI)
+        try:
+            imported = execute_job("live_decision")
+            completed += 1
+            record_job(client, "GitHub Actions: live_decision", "success", imported)
+        except Exception as reason:
+            record_job(client, "GitHub Actions: live_decision", "failed", 0, str(reason))
+            print(f"Live decision cycle failed: {reason}", file=sys.stderr, flush=True)
+
+        now = datetime.now(SHANGHAI)
+        if now >= end:
+            break
+        delay = min(seconds_until_next_cycle(now), max(0, int((end - now).total_seconds())))
+        print(
+            f"Cycle started {cycle_started:%H:%M:%S}; next cycle in {delay}s.",
+            flush=True,
+        )
+        if delay > 0:
+            time.sleep(delay)
+    return completed
 
 
 def execute_job(job_type: str) -> int:
@@ -241,6 +311,8 @@ def execute_job(job_type: str) -> int:
         sync_generated(ENGINE_DIR)
         run_paper_trade()
         return 2
+    if job_type == "live_session":
+        return run_live_session()
     if job_type == "paper_trade":
         run_paper_trade()
         return 1
@@ -303,19 +375,16 @@ def process_pending() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["auto", "full", "night_scan", "live_decision", "paper_trade", "backtest", "sync_latest", "pending"], default="pending")
+    parser.add_argument("--mode", choices=["auto", "full", "night_scan", "live_decision", "live_session", "paper_trade", "backtest", "sync_latest", "pending"], default="pending")
     args = parser.parse_args()
     if args.mode == "pending":
         process_pending()
+    elif args.mode == "live_session":
+        execute_job(args.mode)
     else:
         imported = execute_job(args.mode)
         client = get_client()
-        client.insert("stock_job_runs", [{
-            "job_type": f"GitHub Actions: {args.mode}",
-            "status": "success",
-            "imported_count": imported,
-            "error_message": "",
-        }])
+        record_job(client, f"GitHub Actions: {args.mode}", "success", imported)
     return 0
 
 

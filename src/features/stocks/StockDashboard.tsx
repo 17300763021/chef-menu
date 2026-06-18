@@ -143,7 +143,7 @@ export default function StockDashboard() {
   const [showAddHoldingModal, setShowAddHoldingModal] = useState(false)
   const [savedMessage, setSavedMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
-  const [autoRefresh, setAutoRefresh] = useState(false)
+  const [autoRefresh, setAutoRefresh] = useState(true)
   const [showTodayExecution, setShowTodayExecution] = useState(false)
   const [executionStock, setExecutionStock] = useState<{ code: string; name: string } | null>(null)
   const [loginOpen, setLoginOpen] = useState(false)

@@ -62,10 +62,12 @@ describe('chef menu application', () => {
 
     expect(await screen.findByRole('heading', { name: '股票策略助手' }, { timeout: 7000 })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '自动模拟盘' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('tab', { name: '任务中心' }))
+    expect(screen.getByRole('button', { name: '停止每分钟刷新' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '更多数据' }))
     expect(screen.getByRole('tab', { name: '最近盘后精选' })).toBeInTheDocument()
     expect(screen.queryByRole('tab', { name: '今日精选' })).not.toBeInTheDocument()
-  })
+  }, 10000)
 
   it('asks visitors to log in before adding a stock holding', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
@@ -81,7 +83,7 @@ describe('chef menu application', () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
-    await userEvent.click(await screen.findByRole('tab', { name: '任务中心' }))
+    await userEvent.click(await screen.findByRole('tab', { name: '任务中心' }, { timeout: 7000 }))
     await userEvent.click(screen.getByRole('button', { name: '运行实时决策' }))
 
     expect(await screen.findByRole('dialog')).toBeInTheDocument()
