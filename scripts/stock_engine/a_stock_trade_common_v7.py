@@ -1609,6 +1609,14 @@ def market_risk_policy(market_state: str) -> Dict[str, Any]:
     }
 
 
+def strategy_risk_count(risk_notes: List[str]) -> int:
+    soft_data_markers = ["数据缺失", "不能确认主线强度"]
+    return sum(
+        1 for note in risk_notes
+        if not any(marker in note for marker in soft_data_markers)
+    )
+
+
 def decision_from_realtime(
     candidate: Dict[str, Any],
     rt: Optional[Dict[str, Any]],
@@ -1748,7 +1756,7 @@ def decision_from_realtime(
     sector_continuity = str(sector_context.get("板块持续性") or "")
     if not sector_state or sector_state == "缺失":
         checks.append(("板块数据可用", False))
-        add_data_issue("板块数据缺失，不能确认主线强度，新买降级", 20, True)
+        add_data_issue("板块数据缺失，不能确认主线强度，新买降级", 20, False)
     elif sector_state == "弱":
         sector_ok = relative_state == "强于板块"
         checks.append(("板块不弱或个股明显强于板块", sector_ok))
@@ -1954,7 +1962,13 @@ def decision_from_realtime(
     else:
         pnl_pct = float("nan")
 
-    if pass_count >= max(5, check_total - 2) and not hard_blockers and not chase_block and price_in_buy_zone and len(risk_notes) <= 1:
+    if (
+        pass_count >= max(5, check_total - 2)
+        and not hard_blockers
+        and not chase_block
+        and price_in_buy_zone
+        and strategy_risk_count(risk_notes) <= 1
+    ):
         buy_action = "可以买小仓"
     elif pass_count >= 4 and "触及止损" not in hard_blockers and "跌破有效支撑" not in hard_blockers:
         buy_action = "谨慎观察，等回踩确认"
