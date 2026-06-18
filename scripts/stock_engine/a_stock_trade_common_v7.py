@@ -647,7 +647,7 @@ def get_market_context(spot: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             advice = "市场赚钱效应较好，允许按规则小仓试错"
         elif up_ratio <= 38 or median_pct <= -0.45 or weak_ratio >= max(18, strong_ratio * 1.5):
             state = "弱势"
-            advice = "市场偏弱，原则上不新开仓，优先处理持仓风险"
+            advice = "市场偏弱，只允许3%试错仓，优先处理持仓风险"
         else:
             state = "震荡"
             advice = "市场分化，只做板块强、位置低、风控清楚的票"
