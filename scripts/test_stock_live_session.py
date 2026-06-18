@@ -38,7 +38,7 @@ class StockLiveSessionTest(unittest.TestCase):
         source = (ROOT / "scripts" / "stock_engine" / "a_stock_live_decision_v8.py").read_text(encoding="utf-8")
 
         self.assertIn('ap.add_argument("--workers"', source)
-        self.assertIn("ThreadPoolExecutor", source)
+        self.assertIn("ProcessPoolExecutor", source)
 
 
 if __name__ == "__main__":

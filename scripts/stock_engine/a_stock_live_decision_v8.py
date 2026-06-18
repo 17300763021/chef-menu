@@ -34,7 +34,7 @@ A股实时买卖一体决策脚本 v8
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
 import time
 from pathlib import Path
@@ -840,30 +840,26 @@ def main():
     print(f"大盘环境：{market_context.get('市场环境', '缺失')} | {market_context.get('市场建议', '')}")
     rows_by_index = {}
 
-    def analyze(index, item):
-        try:
-            d = get_live_decision(
+    worker_count = max(1, min(args.workers, len(items)))
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                get_live_decision,
                 item,
                 minute_period=args.minute_period,
                 market_context=market_context,
                 capital=args.capital,
                 account_risk_pct=args.risk_pct,
-            )
-            return index, d, None
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            return index, None, (item, e)
-
-    worker_count = max(1, min(args.workers, len(items)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(analyze, index, item) for index, item in enumerate(items)]
+            ): (index, item)
+            for index, item in enumerate(items)
+        }
         for future in as_completed(futures):
-            index, decision, error = future.result()
-            if decision is not None:
-                rows_by_index[index] = decision
-            elif error:
-                item, reason = error
+            index, item = futures[future]
+            try:
+                rows_by_index[index] = future.result()
+            except KeyboardInterrupt:
+                raise
+            except Exception as reason:
                 print(f"[跳过] {item.get('代码', '')} {item.get('名称', '')}: {reason}")
             time.sleep(args.sleep)
 
