@@ -295,6 +295,8 @@ def get_live_decision(
             final_action = "继续持有观察"
     else:
         final_action = buy_action
+        if buy_action == "可以买小仓" and str(buy_d.get("市场环境") or "") == "弱势":
+            final_action = "弱势市场仅可3%试错仓"
 
     no_buy_reason = ""
     if buy_action != "可以买小仓":
@@ -400,7 +402,10 @@ def get_live_decision(
         risk_budget = capital * max(account_risk_pct, 0.1) / 100
         if not math.isnan(stop_risk_pct) and stop_risk_pct > 6.5:
             risk_budget *= 0.5
-        if str(buy_d.get("市场环境") or "") == "震荡":
+        market_state = str(buy_d.get("市场环境") or "")
+        if market_state == "弱势":
+            risk_budget *= 0.4
+        elif market_state == "震荡":
             risk_budget *= 0.7
         suggested_shares = _round_lot(risk_budget / max(buy_low - stop, 0.01))
         suggested_amount = suggested_shares * buy_low if suggested_shares else float("nan")

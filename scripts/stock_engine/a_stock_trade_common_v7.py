@@ -1586,6 +1586,29 @@ def balanced_pool(pool: pd.DataFrame, limit: int, mode: str = "balanced") -> pd.
     return pd.concat([head, rest], ignore_index=True).copy()
 
 
+def market_risk_policy(market_state: str) -> Dict[str, Any]:
+    if market_state == "弱势":
+        return {
+            "check_ok": False,
+            "hard_block": False,
+            "position_rate": 0.03,
+            "note": "大盘环境弱，仅允许3%试错仓",
+        }
+    if market_state == "震荡":
+        return {
+            "check_ok": True,
+            "hard_block": False,
+            "position_rate": 0.06,
+            "note": "大盘震荡，只能降低仓位",
+        }
+    return {
+        "check_ok": market_state == "强势",
+        "hard_block": not bool(market_state) or market_state == "缺失",
+        "position_rate": 0.08,
+        "note": "",
+    }
+
+
 def decision_from_realtime(
     candidate: Dict[str, Any],
     rt: Optional[Dict[str, Any]],
@@ -1712,14 +1735,13 @@ def decision_from_realtime(
     if not market_state or market_state == "缺失":
         checks.append(("大盘数据可用", False))
         add_data_issue("大盘环境数据缺失，新开仓降级观察", 20, True)
-    elif market_state == "弱势":
-        checks.append(("大盘环境不弱", False))
-        risk_notes.append("大盘环境弱，原则上不新开仓")
-        hard_blockers.append("大盘弱势")
-    elif market_state in ["强势", "震荡"]:
-        checks.append(("大盘环境不弱", True))
-        if market_state == "震荡":
-            risk_notes.append("大盘震荡，只能降低仓位")
+    elif market_state in ["弱势", "强势", "震荡"]:
+        market_policy = market_risk_policy(market_state)
+        checks.append(("大盘环境支持正常仓位", market_policy["check_ok"]))
+        if market_policy["note"]:
+            risk_notes.append(market_policy["note"])
+        if market_policy["hard_block"]:
+            hard_blockers.append("大盘环境不可用")
 
     sector_state = str(sector_context.get("板块强弱") or "")
     relative_state = str(sector_context.get("相对强弱") or "")

@@ -47,6 +47,12 @@ def round_lot(shares: float) -> int:
     return max(0, int(shares // 100) * 100)
 
 
+def initial_position_rate(decision: dict[str, Any]) -> float:
+    if "3%试错仓" in str(decision.get("final_action", "")):
+        return 0.03
+    return INITIAL_POSITION_RATE
+
+
 def latest_decision_date(client: SupabaseRest) -> str:
     rows = client.request(
         "GET",
@@ -187,7 +193,7 @@ def buy_position(
     total_assets = INITIAL_CAPITAL + realized_pnl(trades) + floating_pnl(positions)
     reserve_cash = INITIAL_CAPITAL * CASH_RESERVE_RATE
     available_cash = max(0, cash - reserve_cash)
-    target_amount = INITIAL_CAPITAL * INITIAL_POSITION_RATE
+    target_amount = INITIAL_CAPITAL * initial_position_rate(decision)
     max_single_amount = total_assets * MAX_SINGLE_POSITION_RATE
     risk_per_share = price - stop_loss if stop_loss > 0 and price > stop_loss else price * 0.06
     risk_amount_cap = INITIAL_CAPITAL * RISK_RATE / risk_per_share * price
