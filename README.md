@@ -7,6 +7,9 @@
 - Prefer direct implementation after enough context is available.
 - Save tokens, but do not skip verification that protects performance or prevents bugs.
 - After verified website/code changes, commit and push instead of asking the user to push.
+- Stock assistant roadmap: keep the current simulated paper-trading system first; next improve charts, backtesting, strategy scoring, and auto paper trading review before considering heavier quant frameworks.
+- Quant direction: do not connect real brokerage trading. Evaluate open-source quant tools only as research/backtest engines, not as live money execution.
+- Preferred next stock features: intraday/time-share chart, daily K chart, backtest page, strategy comparison, missed-big-run historical picks review, and paper-trade profit/loss attribution.
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
