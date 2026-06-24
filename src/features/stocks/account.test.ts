@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_ACCOUNT_CONFIG,
   buildAccountSummary,
+  dailyHoldingPnlDetails,
+  dailyHoldingPnl,
+  formatDailyHoldingPnlQuoteWarning,
   realizedPnlForDate,
   recommendSignalBuy,
 } from './account'
-import type { HoldingStock, SignalEvent, TradeRecord } from './types'
+import type { HoldingStock, RealtimeDecision, SignalEvent, TradeRecord } from './types'
 
 function holding(overrides: Partial<HoldingStock>): HoldingStock {
   return {
@@ -67,6 +70,26 @@ function signal(overrides: Partial<SignalEvent>): SignalEvent {
   }
 }
 
+function decision(overrides: Partial<RealtimeDecision>): RealtimeDecision {
+  return {
+    code: '000001',
+    name: '平安银行',
+    date: '2026-06-24',
+    updateTime: '2026-06-24 10:30:00',
+    operationType: '持仓跟踪',
+    currentPrice: 10.5,
+    changeRate: 5,
+    canBuy: false,
+    suggestBuyPrice: null,
+    suggestSellPrice: null,
+    stopLoss: 0,
+    targetPrice1: null,
+    finalAction: '持有',
+    status: '持有观察',
+    ...overrides,
+  }
+}
+
 describe('stock account model', () => {
   it('summarizes a one million account with cash, holdings, realized pnl and total pnl', () => {
     const summary = buildAccountSummary([
@@ -102,6 +125,58 @@ describe('stock account model', () => {
     ], '2026-06-24')
 
     expect(todayPnl).toBe(-15000)
+  })
+
+  it('calculates daily holding pnl from realtime price change', () => {
+    const todayPnl = dailyHoldingPnl([
+      holding({ code: '000001', shares: 1000 }),
+      holding({ code: '000002', shares: 500 }),
+      holding({ code: '000003', shares: 300 }),
+    ], [
+      decision({ code: '000001', currentPrice: 10.5, changeRate: 5 }),
+      decision({ code: '000002', currentPrice: 9.8, changeRate: -2 }),
+    ])
+
+    expect(todayPnl).toBeCloseTo(400, 2)
+  })
+
+  it('reports holdings with missing realtime quotes while counting them as zero daily pnl', () => {
+    const result = dailyHoldingPnlDetails([
+      holding({ code: '000001', name: '平安银行', shares: 1000 }),
+      holding({ code: '000002', name: '万科A', shares: 500 }),
+      holding({ code: '000003', name: '缺行情股票', shares: 300 }),
+    ], [
+      decision({ code: '000001', currentPrice: 10.5, changeRate: 5 }),
+      decision({ code: '000002', currentPrice: 9.8, changeRate: -2 }),
+    ])
+
+    expect(result.total).toBeCloseTo(400, 2)
+    expect(result.missingQuotes).toEqual([{ code: '000003', name: '缺行情股票' }])
+    expect(result.invalidQuotes).toEqual([])
+  })
+
+  it('reports invalid realtime quotes while counting them as zero daily pnl', () => {
+    const result = dailyHoldingPnlDetails([
+      holding({ code: '000001', name: '平安银行', shares: 1000 }),
+      holding({ code: '000002', name: '万科A', shares: 500 }),
+    ], [
+      decision({ code: '000001', currentPrice: 10.5, changeRate: 5 }),
+      decision({ code: '000002', currentPrice: 0, changeRate: 1 }),
+    ])
+
+    expect(result.total).toBeCloseTo(500, 2)
+    expect(result.missingQuotes).toEqual([])
+    expect(result.invalidQuotes).toEqual([{ code: '000002', name: '万科A', reason: '实时价格或涨跌幅异常' }])
+  })
+
+  it('formats a data-quality warning for holdings without usable realtime quotes', () => {
+    const warning = formatDailyHoldingPnlQuoteWarning({
+      total: 0,
+      missingQuotes: [{ code: '000003', name: '缺行情股票' }],
+      invalidQuotes: [{ code: '000002', name: '万科A', reason: '实时价格或涨跌幅异常' }],
+    })
+
+    expect(warning).toBe('行情提示：缺行情股票 000003 缺少实时行情；万科A 000002 实时价格或涨跌幅异常。相关持仓今日盈亏已按 0 计入，请刷新盘中决策或同步行情。')
   })
 
   it('recommends conservative buy sizing from signal quality, cash, position cap and stop risk', () => {

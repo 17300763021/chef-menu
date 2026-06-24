@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useApp } from '../../app/AppContext'
 import { signIn } from '../auth'
-import { buildAccountSummary, realizedPnlForDate, recommendSignalBuy } from './account'
+import { buildAccountSummary, dailyHoldingPnlDetails, formatDailyHoldingPnlQuoteWarning, recommendSignalBuy } from './account'
 import { stockRepository } from './repository'
 import type { PositionAllocation } from './account'
 import type {
@@ -179,7 +179,12 @@ export default function StockDashboard() {
   const latestSnapshot = portfolioSnapshots[0]
   const latestBacktest = backtestRuns[0]
   const today = shanghaiDateValue()
-  const todayRealizedPnl = useMemo(() => realizedPnlForDate(trades, today), [trades, today])
+  const todayHoldingPnlDetails = useMemo(() => dailyHoldingPnlDetails(holdings, realtime), [holdings, realtime])
+  const todayHoldingPnl = todayHoldingPnlDetails.total
+  const todayQuoteWarning = useMemo(
+    () => formatDailyHoldingPnlQuoteWarning(todayHoldingPnlDetails),
+    [todayHoldingPnlDetails],
+  )
   const todayOrders = useMemo(() => {
     return paperOrders
       .filter((order) => order.orderDate === today)
@@ -792,7 +797,7 @@ export default function StockDashboard() {
       <div className="stock-stats">
         {[
           ['总资产', formatMoney(accountSummary.totalAssets)],
-          ['今日已实现', `${todayRealizedPnl >= 0 ? '+' : ''}${formatMoney(todayRealizedPnl)}`],
+          ['今日盈亏', `${todayHoldingPnl >= 0 ? '+' : ''}${formatMoney(todayHoldingPnl)}`],
           ['总盈亏', `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
           ['总收益率', `${accountSummary.totalReturnRate >= 0 ? '+' : ''}${accountSummary.totalReturnRate.toFixed(2)}%`],
           ['当前持仓', holdings.length],
@@ -831,6 +836,7 @@ export default function StockDashboard() {
         </section>
       </div>
       {accountSummary.positionCountWarning && <div className="stock-account-warning">{accountSummary.positionCountWarning}</div>}
+      {todayQuoteWarning && <div className="stock-account-warning">{todayQuoteWarning}</div>}
 
       <div className="stock-workbench">
         <div className="stock-toolbar">

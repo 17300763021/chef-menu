@@ -1,4 +1,4 @@
-import type { HoldingStock, SignalEvent, TradeRecord } from './types'
+import type { HoldingStock, RealtimeDecision, SignalEvent, TradeRecord } from './types'
 
 export interface AccountConfig {
   initialCapital: number
@@ -46,6 +46,21 @@ export interface BuyRecommendation {
   estimatedAmount: number
   riskBudget: number
   reason: string
+}
+
+export interface DailyHoldingPnlQuoteIssue {
+  code: string
+  name: string
+}
+
+export interface DailyHoldingPnlInvalidQuote extends DailyHoldingPnlQuoteIssue {
+  reason: string
+}
+
+export interface DailyHoldingPnlDetails {
+  total: number
+  missingQuotes: DailyHoldingPnlQuoteIssue[]
+  invalidQuotes: DailyHoldingPnlInvalidQuote[]
 }
 
 export const DEFAULT_ACCOUNT_CONFIG: AccountConfig = {
@@ -119,6 +134,44 @@ export function realizedPnlForDate(trades: TradeRecord[], tradeDate: string) {
   return trades
     .filter((item) => item.sellDate === tradeDate)
     .reduce((sum, item) => sum + item.pnlAmount, 0)
+}
+
+export function dailyHoldingPnl(holdings: HoldingStock[], realtime: RealtimeDecision[]) {
+  return dailyHoldingPnlDetails(holdings, realtime).total
+}
+
+export function dailyHoldingPnlDetails(holdings: HoldingStock[], realtime: RealtimeDecision[]): DailyHoldingPnlDetails {
+  const decisionsByCode = new Map(realtime.map((item) => [item.code, item]))
+  const missingQuotes: DailyHoldingPnlQuoteIssue[] = []
+  const invalidQuotes: DailyHoldingPnlInvalidQuote[] = []
+  const total = holdings.reduce((sum, holding) => {
+    const decision = decisionsByCode.get(holding.code)
+    if (!decision) {
+      missingQuotes.push({ code: holding.code, name: holding.name })
+      return sum
+    }
+    if (decision.currentPrice <= 0 || decision.changeRate <= -100) {
+      invalidQuotes.push({ code: holding.code, name: holding.name, reason: '实时价格或涨跌幅异常' })
+      return sum
+    }
+
+    const previousClose = decision.currentPrice / (1 + decision.changeRate / 100)
+    return sum + (decision.currentPrice - previousClose) * holding.shares
+  }, 0)
+  return {
+    total: round2(total),
+    missingQuotes,
+    invalidQuotes,
+  }
+}
+
+export function formatDailyHoldingPnlQuoteWarning(details: DailyHoldingPnlDetails) {
+  const missingText = details.missingQuotes.map((item) => `${item.name} ${item.code} 缺少实时行情`)
+  const invalidText = details.invalidQuotes.map((item) => `${item.name} ${item.code} ${item.reason}`)
+  const issues = [...missingText, ...invalidText]
+  if (issues.length === 0) return ''
+
+  return `行情提示：${issues.join('；')}。相关持仓今日盈亏已按 0 计入，请刷新盘中决策或同步行情。`
 }
 
 export function recommendSignalBuy(
