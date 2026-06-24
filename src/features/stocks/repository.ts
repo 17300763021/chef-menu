@@ -40,6 +40,28 @@ function optionalNumber(row: Row, key: string) {
   return value === null || value === undefined ? null : Number(value)
 }
 
+function formatDateTime(value: unknown) {
+  const textValue = String(value ?? '').trim()
+  if (!textValue || textValue === '--') return textValue || '--'
+  if (!textValue.includes('T')) return textValue
+
+  const date = new Date(textValue)
+  if (Number.isNaN(date.getTime())) return textValue
+
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date)
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`
+}
+
 function calculateHolding(input: AddHoldingInput): HoldingStock {
   const marketValue = input.currentPrice * input.shares
   const floatingPnl = (input.currentPrice - input.costPrice) * input.shares
@@ -137,7 +159,7 @@ function mapRealtimeDecision(row: Row): RealtimeDecision {
     code: text(row, 'code'),
     name: text(row, 'name'),
     date: text(row, 'decision_date'),
-    updateTime: text(row, 'update_time'),
+    updateTime: formatDateTime(row.update_time),
     operationType: text(row, 'operation_type'),
     currentPrice: numberValue(row, 'current_price'),
     changeRate: numberValue(row, 'change_rate'),
@@ -191,8 +213,8 @@ function mapTask(row: Row): TaskRecord {
   return {
     id: text(row, 'id'),
     type: text(row, 'job_type'),
-    startTime: text(row, 'started_at'),
-    endTime: text(row, 'finished_at', '--'),
+    startTime: formatDateTime(row.started_at),
+    endTime: formatDateTime(row.finished_at || '--'),
     status: text(row, 'status', '成功') as TaskRecord['status'],
     importedCount: numberValue(row, 'imported_count'),
     errorMsg: text(row, 'error_message'),
@@ -202,7 +224,7 @@ function mapTask(row: Row): TaskRecord {
 function mapPaperTradeOrder(row: Row): PaperTradeOrder {
   return {
     id: text(row, 'id'),
-    orderTime: text(row, 'order_time'),
+    orderTime: formatDateTime(row.order_time),
     orderDate: text(row, 'order_date'),
     code: text(row, 'code'),
     name: text(row, 'name'),
@@ -221,7 +243,7 @@ function mapPaperTradeOrder(row: Row): PaperTradeOrder {
 function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
   return {
     id: text(row, 'id'),
-    snapshotTime: text(row, 'snapshot_time'),
+    snapshotTime: formatDateTime(row.snapshot_time),
     snapshotDate: text(row, 'snapshot_date'),
     cash: numberValue(row, 'cash'),
     holdingMarketValue: numberValue(row, 'holding_market_value'),
@@ -239,7 +261,7 @@ function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
 function mapBacktestRun(row: Row): BacktestRun {
   return {
     id: text(row, 'id'),
-    runTime: text(row, 'run_time'),
+    runTime: formatDateTime(row.run_time),
     strategyName: text(row, 'strategy_name'),
     benchmarkName: text(row, 'benchmark_name'),
     startDate: text(row, 'start_date'),
@@ -308,7 +330,7 @@ function mapMissedRunner(row: Row): MissedRunner {
 function mapSignalEvent(row: Row): SignalEvent {
   return {
     id: text(row, 'id'),
-    signalTime: text(row, 'signal_time'),
+    signalTime: formatDateTime(row.signal_time),
     signalDate: text(row, 'signal_date'),
     code: text(row, 'code'),
     name: text(row, 'name'),
@@ -325,7 +347,7 @@ function mapSignalEvent(row: Row): SignalEvent {
     finalAction: text(row, 'final_action'),
     reason: text(row, 'reason'),
     risk: text(row, 'risk'),
-    createdAt: text(row, 'created_at'),
+    createdAt: formatDateTime(row.created_at),
   }
 }
 
@@ -361,12 +383,14 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
     return [...localHoldings]
   }
 
-  async function selectRows(table: string, orderColumn: string) {
+  async function selectRows(table: string, orderColumn: string, filters: Record<string, string> = {}) {
     if (!client) return null
     try {
-      const { data, error } = await withTimeout(
-        client.from(table).select('*').order(orderColumn, { ascending: false }),
-      )
+      let query = client.from(table).select('*')
+      for (const [column, value] of Object.entries(filters)) {
+        query = query.eq(column, value)
+      }
+      const { data, error } = await withTimeout(query.order(orderColumn, { ascending: false }))
       if (error || !data) return null
       return data as Row[]
     } catch {
@@ -408,7 +432,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       return (rows ?? []).map(mapRealtimeDecision)
     },
     async getHoldings() {
-      const rows = await selectRows('stock_positions', 'created_at')
+      const rows = await selectRows('stock_positions', 'created_at', { status: 'open' })
       if (rows) return rows.map(mapHolding)
       if (client) return []
       return localHoldingList()

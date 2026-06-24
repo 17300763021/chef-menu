@@ -3,6 +3,95 @@ import { createStockRepository } from './repository'
 import type { SignalEvent } from './types'
 
 describe('stock repository', () => {
+  it('loads only open holdings from the cloud repository', async () => {
+    const calls: Array<{ table: string; filters: Array<[string, string]> }> = []
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_positions: [{
+        id: 'holding-open',
+        code: '000001',
+        name: '平安银行',
+        cost_price: 10,
+        shares: 100,
+        current_price: 11,
+        market_value: 1100,
+        floating_pnl: 100,
+        pnl_rate: 10,
+        buy_date: '2026-06-16',
+        holding_days: 8,
+        current_suggestion: '继续持有',
+        status: 'open',
+      }],
+    }
+    const client = {
+      from: (table: string) => {
+        const filters: Array<[string, string]> = []
+        calls.push({ table, filters })
+        return {
+          select: () => ({
+            eq: (column: string, value: string) => {
+              filters.push([column, value])
+              return {
+                order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+              }
+            },
+            order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+          }),
+        }
+      },
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getHoldings()).resolves.toHaveLength(1)
+    expect(calls.find((call) => call.table === 'stock_positions')?.filters).toContainEqual(['status', 'open'])
+  })
+
+  it('formats timestamp fields for display', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_job_runs: [{
+        id: 'job-1',
+        job_type: 'GitHub Actions: live_decision',
+        started_at: '2026-06-24T05:55:28.529979+00:00',
+        finished_at: '2026-06-24T05:56:01.000000+00:00',
+        status: 'success',
+        imported_count: 2,
+        error_message: '',
+      }],
+      stock_auto_trade_orders: [{
+        id: 'order-1',
+        order_time: '2026-06-24T05:55:28.529979+00:00',
+        order_date: '2026-06-24',
+        code: '000001',
+        name: '平安银行',
+        side: 'sell',
+        reason: '止盈',
+        price: 11,
+        shares: 100,
+        amount: 1100,
+        cash_before: 0,
+        cash_after: 1100,
+        realized_pnl: 100,
+        status: 'filled',
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getTasks()).resolves.toMatchObject([{
+      startTime: '2026-06-24 13:55:28',
+      endTime: '2026-06-24 13:56:01',
+    }])
+    await expect(repository.getPaperTradeOrders()).resolves.toMatchObject([{
+      orderTime: '2026-06-24 13:55:28',
+      orderDate: '2026-06-24',
+    }])
+  })
+
   it('does not show mock stock prices when a cloud repository is configured but empty', async () => {
     const emptyClient = {
       from: () => ({

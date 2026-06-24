@@ -179,6 +179,12 @@ export default function StockDashboard() {
       .filter((order) => order.code === executionStock.code)
       .sort((a, b) => b.orderTime.localeCompare(a.orderTime))
   }, [executionStock, paperOrders])
+  const stockExecutionTrades = useMemo(() => {
+    if (!executionStock) return []
+    return trades
+      .filter((trade) => trade.code === executionStock.code)
+      .sort((a, b) => b.sellDate.localeCompare(a.sellDate))
+  }, [executionStock, trades])
 
   async function loadStockData() {
     const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
@@ -927,7 +933,7 @@ export default function StockDashboard() {
                     <h3>{executionStock.name} {executionStock.code} 执行记录</h3>
                     <button type="button" onClick={() => setExecutionStock(null)}>关闭</button>
                   </div>
-                  {stockExecutionOrders.length === 0 && <div className="stock-empty">这只股票还没有自动买卖记录</div>}
+                  {stockExecutionOrders.length === 0 && stockExecutionTrades.length === 0 && <div className="stock-empty">这只股票还没有买卖或手动复盘记录</div>}
                   {stockExecutionOrders.map((order) => (
                     <article key={order.id}>
                       <time>{order.orderTime}</time>
@@ -936,6 +942,16 @@ export default function StockDashboard() {
                         <p>{formatPrice(order.price)} 元 / {order.shares} 股 / {formatMoney(order.amount)} 元；原因：{order.reason}</p>
                       </div>
                       <strong><ColorNumber value={order.realizedPnl} /></strong>
+                    </article>
+                  ))}
+                  {stockExecutionTrades.map((trade, index) => (
+                    <article key={`manual-${trade.code}-${trade.sellDate}-${index}`}>
+                      <time>{trade.sellDate}</time>
+                      <div>
+                        <b>{trade.isCleared ? '手动清仓' : '手动减仓'}</b>
+                        <p>{formatPrice(trade.sellPrice)} 元 / {trade.shares} 股；说明：{trade.sellMemo || '无'}</p>
+                      </div>
+                      <strong><ColorNumber value={trade.pnlAmount} /></strong>
                     </article>
                   ))}
                 </section>
