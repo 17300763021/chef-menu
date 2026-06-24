@@ -115,6 +115,12 @@ export function buildAccountSummary(
   }
 }
 
+export function realizedPnlForDate(trades: TradeRecord[], tradeDate: string) {
+  return trades
+    .filter((item) => item.sellDate === tradeDate)
+    .reduce((sum, item) => sum + item.pnlAmount, 0)
+}
+
 export function recommendSignalBuy(
   signal: SignalEvent,
   account: AccountSummary,

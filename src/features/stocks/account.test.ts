@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_ACCOUNT_CONFIG,
   buildAccountSummary,
+  realizedPnlForDate,
   recommendSignalBuy,
 } from './account'
 import type { HoldingStock, SignalEvent, TradeRecord } from './types'
@@ -91,6 +92,16 @@ describe('stock account model', () => {
       pnlContributionRate: 0.99,
       overSinglePositionLimit: false,
     })
+  })
+
+  it('calculates realized pnl for a single trade date', () => {
+    const todayPnl = realizedPnlForDate([
+      trade({ sellDate: '2026-06-24', pnlAmount: -20000 }),
+      trade({ sellDate: '2026-06-24', pnlAmount: 5000 }),
+      trade({ sellDate: '2026-06-23', pnlAmount: 12000 }),
+    ], '2026-06-24')
+
+    expect(todayPnl).toBe(-15000)
   })
 
   it('recommends conservative buy sizing from signal quality, cash, position cap and stop risk', () => {

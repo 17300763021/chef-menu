@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useApp } from '../../app/AppContext'
 import { signIn } from '../auth'
-import { buildAccountSummary, recommendSignalBuy } from './account'
+import { buildAccountSummary, realizedPnlForDate, recommendSignalBuy } from './account'
 import { stockRepository } from './repository'
 import type { PositionAllocation } from './account'
 import type {
@@ -49,6 +49,17 @@ function ColorNumber({ value, suffix = '' }: { value: number; suffix?: string })
 function StatusTag({ status }: { status: string }) {
   const tone = status.includes('止损') ? 'risk' : status.includes('止盈') ? 'profit' : status.includes('可买') ? 'buy' : status.includes('成功') ? 'ok' : 'neutral'
   return <span className={`stock-status stock-status-${tone}`}>{status}</span>
+}
+
+function shanghaiDateValue() {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  return `${values.year}-${values.month}-${values.day}`
 }
 
 function isHoldingStock(row: StockRow): row is HoldingStock {
@@ -167,8 +178,9 @@ export default function StockDashboard() {
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
   const latestSnapshot = portfolioSnapshots[0]
   const latestBacktest = backtestRuns[0]
+  const today = shanghaiDateValue()
+  const todayRealizedPnl = useMemo(() => realizedPnlForDate(trades, today), [trades, today])
   const todayOrders = useMemo(() => {
-    const today = new Date().toISOString().slice(0, 10)
     return paperOrders
       .filter((order) => order.orderDate === today)
       .sort((a, b) => a.orderTime.localeCompare(b.orderTime))
@@ -515,7 +527,7 @@ export default function StockDashboard() {
   }
 
   function todayInputValue() {
-    return new Date().toISOString().slice(0, 10)
+    return shanghaiDateValue()
   }
 
   function requireStockLogin() {
@@ -780,7 +792,7 @@ export default function StockDashboard() {
       <div className="stock-stats">
         {[
           ['总资产', formatMoney(accountSummary.totalAssets)],
-          ['今日盈亏', latestSnapshot ? `${latestSnapshot.totalPnl >= 0 ? '+' : ''}${formatMoney(latestSnapshot.totalPnl)}` : `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
+          ['今日已实现', `${todayRealizedPnl >= 0 ? '+' : ''}${formatMoney(todayRealizedPnl)}`],
           ['总盈亏', `${accountSummary.totalPnl >= 0 ? '+' : ''}${formatMoney(accountSummary.totalPnl)}`],
           ['总收益率', `${accountSummary.totalReturnRate >= 0 ? '+' : ''}${accountSummary.totalReturnRate.toFixed(2)}%`],
           ['当前持仓', holdings.length],
