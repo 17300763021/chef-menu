@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import math
 import os
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import warnings
@@ -790,17 +792,75 @@ def get_sector_context(
     }
 
 
-def get_hist(code: str, days: int = 500) -> Tuple[pd.DataFrame, str]:
-    """获取日K，默认前复权。"""
+def _hist_cache_dir() -> Path:
+    configured = os.environ.get("A_STOCK_HIST_CACHE_DIR", "").strip()
+    return Path(configured) if configured else Path(__file__).resolve().parent / "history_cache"
+
+
+def _hist_cache_paths(code: str, hist_source: str) -> Tuple[Path, Path]:
+    cache_mode = "raw" if hist_source == "sina_fast" else "qfq"
+    stem = f"{normalize_code(code)}_{cache_mode}"
+    directory = _hist_cache_dir()
+    return directory / f"{stem}.csv", directory / f"{stem}.json"
+
+
+def _load_hist_cache(code: str, hist_source: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    csv_path, meta_path = _hist_cache_paths(code, hist_source)
+    if not csv_path.exists():
+        return pd.DataFrame(), {}
+    try:
+        frame = standardize_hist(pd.read_csv(csv_path, encoding="utf-8-sig"))
+        metadata = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        return frame, metadata
+    except Exception:
+        return pd.DataFrame(), {}
+
+
+def _save_hist_cache(
+    code: str,
+    hist_source: str,
+    frame: pd.DataFrame,
+    source_name: str,
+    full_refresh: bool,
+) -> None:
+    csv_path, meta_path = _hist_cache_paths(code, hist_source)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_temp = csv_path.with_suffix(".csv.tmp")
+    meta_temp = meta_path.with_suffix(".json.tmp")
+    output = frame.copy()
+    output["date"] = pd.to_datetime(output["date"]).dt.strftime("%Y-%m-%d")
+    output.to_csv(csv_temp, index=False, encoding="utf-8-sig")
+    previous = {}
+    if meta_path.exists():
+        try:
+            previous = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            previous = {}
+    now = datetime.now().isoformat(timespec="seconds")
+    metadata = {
+        "code": normalize_code(code),
+        "source": source_name,
+        "mode": "raw" if hist_source == "sina_fast" else "qfq",
+        "updated_at": now,
+        "full_refresh_at": now if full_refresh else previous.get("full_refresh_at", now),
+        "rows": len(output),
+        "first_date": output["date"].iloc[0] if not output.empty else "",
+        "last_date": output["date"].iloc[-1] if not output.empty else "",
+    }
+    meta_temp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(csv_temp, csv_path)
+    os.replace(meta_temp, meta_path)
+
+
+def _fetch_hist_remote(
+    code: str,
+    start: str,
+    end: str,
+    hist_source: str,
+) -> Tuple[pd.DataFrame, str]:
     ak = import_akshare()
     kill_proxy_env()
-    hist_source = os.environ.get("A_STOCK_HIST_SOURCE", "auto").strip().lower()
-    code = normalize_code(code)
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=max(days * 2, 800))).strftime("%Y%m%d")
-
     errors = []
-
     if hist_source in ["sina", "sina_fast"]:
         try:
             with suppress_output():
@@ -816,7 +876,7 @@ def get_hist(code: str, days: int = 500) -> Tuple[pd.DataFrame, str]:
             df = standardize_hist(df)
             if not df.empty:
                 source_name = "新浪快速日线" if hist_source == "sina_fast" else "新浪前复权日线"
-                return df.tail(days).reset_index(drop=True), source_name
+                return df.reset_index(drop=True), source_name
         except Exception as e:
             errors.append(f"新浪失败：{e}")
         raise RuntimeError("日线数据获取失败；" + " | ".join(errors[:2]))
@@ -837,7 +897,7 @@ def get_hist(code: str, days: int = 500) -> Tuple[pd.DataFrame, str]:
                 )
             df = standardize_hist(df)
             if not df.empty:
-                return df.tail(days).reset_index(drop=True), "东方财富前复权日线"
+                return df.reset_index(drop=True), "东方财富前复权日线"
         except Exception as e:
             errors.append(f"东方财富失败：{e}")
 
@@ -855,11 +915,58 @@ def get_hist(code: str, days: int = 500) -> Tuple[pd.DataFrame, str]:
             )
         df = standardize_hist(df)
         if not df.empty:
-            return df.tail(days).reset_index(drop=True), "新浪前复权日线"
+            return df.reset_index(drop=True), "新浪前复权日线"
     except Exception as e:
         errors.append(f"新浪失败：{e}")
 
     raise RuntimeError("日线数据获取失败；" + " | ".join(errors[:2]))
+
+
+def get_hist(code: str, days: int = 500) -> Tuple[pd.DataFrame, str]:
+    """获取日K；优先读取本地缓存，过期时增量补齐并定期全量刷新。"""
+    hist_source = os.environ.get("A_STOCK_HIST_SOURCE", "auto").strip().lower()
+    code = normalize_code(code)
+    cache_enabled = os.environ.get("A_STOCK_HIST_CACHE_ENABLED", "1").strip().lower() not in ["0", "false", "no"]
+    max_age_hours = max(0, safe_float(os.environ.get("A_STOCK_HIST_CACHE_MAX_AGE_HOURS"), 18))
+    full_refresh_days = max(1, int(safe_float(os.environ.get("A_STOCK_HIST_CACHE_FULL_REFRESH_DAYS"), 30)))
+    overlap_days = max(5, int(safe_float(os.environ.get("A_STOCK_HIST_CACHE_OVERLAP_DAYS"), 30)))
+    end = datetime.now()
+    broad_start = end - timedelta(days=max(days * 2, 800))
+    cached, metadata = _load_hist_cache(code, hist_source) if cache_enabled else (pd.DataFrame(), {})
+
+    if not cached.empty and len(cached) >= days:
+        updated_at = pd.to_datetime(metadata.get("updated_at"), errors="coerce")
+        if pd.notna(updated_at) and datetime.now() - updated_at.to_pydatetime() <= timedelta(hours=max_age_hours):
+            return cached.tail(days).reset_index(drop=True), f"{metadata.get('source', '历史日线')}（本地缓存）"
+
+    full_refresh_at = pd.to_datetime(metadata.get("full_refresh_at"), errors="coerce")
+    full_refresh = (
+        cached.empty
+        or len(cached) < days
+        or pd.isna(full_refresh_at)
+        or datetime.now() - full_refresh_at.to_pydatetime() >= timedelta(days=full_refresh_days)
+    )
+    if full_refresh:
+        fetch_start = broad_start
+    else:
+        last_date = pd.to_datetime(cached["date"].max()).to_pydatetime()
+        fetch_start = max(broad_start, last_date - timedelta(days=overlap_days))
+
+    fresh, source_name = _fetch_hist_remote(
+        code,
+        fetch_start.strftime("%Y%m%d"),
+        end.strftime("%Y%m%d"),
+        hist_source,
+    )
+    if cached.empty or full_refresh:
+        combined = fresh
+    else:
+        combined = pd.concat([cached, fresh], ignore_index=True)
+        combined = standardize_hist(combined).drop_duplicates("date", keep="last").reset_index(drop=True)
+    if cache_enabled and not combined.empty:
+        _save_hist_cache(code, hist_source, combined, source_name, full_refresh)
+    suffix = "全量刷新" if full_refresh else "增量更新"
+    return combined.tail(days).reset_index(drop=True), f"{source_name}（{suffix}）"
 
 
 def _finalize_minute_df(out: pd.DataFrame) -> pd.DataFrame:

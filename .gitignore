@@ -25,3 +25,4 @@ dist-ssr
 .env.local
 __pycache__/
 scripts/stock_engine/replay_reports*/
+scripts/stock_engine/history_cache/
