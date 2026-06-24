@@ -62,6 +62,7 @@ export interface HoldingStock {
   buyDate: string
   holdingDays: number
   currentSuggestion: string
+  buyMemo?: string
 }
 
 export interface AddHoldingInput {

@@ -185,6 +185,10 @@ export default function StockDashboard() {
       .filter((trade) => trade.code === executionStock.code)
       .sort((a, b) => b.sellDate.localeCompare(a.sellDate))
   }, [executionStock, trades])
+  const stockExecutionHolding = useMemo(() => {
+    if (!executionStock) return null
+    return holdings.find((holding) => holding.code === executionStock.code) ?? null
+  }, [executionStock, holdings])
 
   async function loadStockData() {
     const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
@@ -927,35 +931,6 @@ export default function StockDashboard() {
                   ))}
                 </section>
               )}
-              {executionStock && (
-                <section className="stock-execution-timeline">
-                  <div className="stock-timeline-heading">
-                    <h3>{executionStock.name} {executionStock.code} 执行记录</h3>
-                    <button type="button" onClick={() => setExecutionStock(null)}>关闭</button>
-                  </div>
-                  {stockExecutionOrders.length === 0 && stockExecutionTrades.length === 0 && <div className="stock-empty">这只股票还没有买卖或手动复盘记录</div>}
-                  {stockExecutionOrders.map((order) => (
-                    <article key={order.id}>
-                      <time>{order.orderTime}</time>
-                      <div>
-                        <b>{order.side === 'buy' ? '虚拟买入' : '虚拟卖出'}</b>
-                        <p>{formatPrice(order.price)} 元 / {order.shares} 股 / {formatMoney(order.amount)} 元；原因：{order.reason}</p>
-                      </div>
-                      <strong><ColorNumber value={order.realizedPnl} /></strong>
-                    </article>
-                  ))}
-                  {stockExecutionTrades.map((trade, index) => (
-                    <article key={`manual-${trade.code}-${trade.sellDate}-${index}`}>
-                      <time>{trade.sellDate}</time>
-                      <div>
-                        <b>{trade.isCleared ? '手动清仓' : '手动减仓'}</b>
-                        <p>{formatPrice(trade.sellPrice)} 元 / {trade.shares} 股；说明：{trade.sellMemo || '无'}</p>
-                      </div>
-                      <strong><ColorNumber value={trade.pnlAmount} /></strong>
-                    </article>
-                  ))}
-                </section>
-              )}
               {latestSnapshot && (
                 <div className="stock-account-overview">
                   <section>
@@ -1092,6 +1067,55 @@ export default function StockDashboard() {
 
       {savedMessage && <div className="stock-toast">{savedMessage}</div>}
       {errorMessage && <div className="stock-toast stock-toast-error">{errorMessage}</div>}
+
+      {executionStock && (
+        <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label={`${executionStock.name} 执行记录`}>
+          <section className="stock-modal stock-execution-modal">
+            <div className="stock-timeline-heading">
+              <div>
+                <h2>{executionStock.name} 执行记录</h2>
+                <p>{executionStock.code}</p>
+              </div>
+              <button type="button" onClick={() => setExecutionStock(null)}>关闭</button>
+            </div>
+            <div className="stock-execution-timeline">
+              {!stockExecutionHolding && stockExecutionOrders.length === 0 && stockExecutionTrades.length === 0 && (
+                <div className="stock-empty">这只股票还没有买入、卖出或自动执行记录</div>
+              )}
+              {stockExecutionHolding && (
+                <article>
+                  <time>{stockExecutionHolding.buyDate}</time>
+                  <div>
+                    <b>当前持仓买入</b>
+                    <p>买入价 {formatPrice(stockExecutionHolding.costPrice)} 元 / {stockExecutionHolding.shares} 股；理由：{stockExecutionHolding.buyMemo || stockExecutionHolding.currentSuggestion || '无'}</p>
+                  </div>
+                  <strong><ColorNumber value={stockExecutionHolding.floatingPnl} /></strong>
+                </article>
+              )}
+              {stockExecutionTrades.map((trade, index) => (
+                <article key={`manual-${trade.code}-${trade.sellDate}-${index}`}>
+                  <time>{trade.sellDate}</time>
+                  <div>
+                    <b>{trade.isCleared ? '手动清仓' : '手动减仓'}</b>
+                    <p>买入：{trade.buyDate} / {formatPrice(trade.costPrice)} 元；卖出：{formatPrice(trade.sellPrice)} 元 / {trade.shares} 股；理由：{trade.sellMemo || trade.buyMemo || '无'}</p>
+                  </div>
+                  <strong><ColorNumber value={trade.pnlAmount} /></strong>
+                </article>
+              ))}
+              {stockExecutionOrders.map((order) => (
+                <article key={order.id}>
+                  <time>{order.orderTime}</time>
+                  <div>
+                    <b>{order.side === 'buy' ? '自动模拟买入' : '自动模拟卖出'}</b>
+                    <p>{formatPrice(order.price)} 元 / {order.shares} 股 / {formatMoney(order.amount)} 元；原因：{order.reason || '无'}</p>
+                  </div>
+                  <strong><ColorNumber value={order.realizedPnl} /></strong>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
 
       {loginOpen && (
         <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label="股票助手登录">

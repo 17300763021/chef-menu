@@ -92,6 +92,57 @@ describe('stock repository', () => {
     }])
   })
 
+  it('translates automatic trading reasons for display', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_auto_trade_orders: [{
+        id: 'order-1',
+        order_time: '2026-06-24T05:55:28.529979+00:00',
+        order_date: '2026-06-24',
+        code: '000001',
+        name: '平安银行',
+        side: 'sell',
+        reason: 'Auto paper sell: stop loss touched',
+        price: 9,
+        shares: 100,
+        amount: 900,
+        cash_before: 0,
+        cash_after: 900,
+        realized_pnl: -100,
+        status: 'filled',
+      }],
+      stock_trade_history: [{
+        code: '000001',
+        name: '平安银行',
+        buy_date: '2026-06-20',
+        sell_date: '2026-06-24',
+        cost_price: 10,
+        sell_price: 9,
+        shares: 100,
+        pnl_amount: -100,
+        pnl_rate: -10,
+        buy_memo: 'Auto paper trading engine',
+        sell_memo: 'Auto paper sell: stop loss touched',
+        is_cleared: true,
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getPaperTradeOrders()).resolves.toMatchObject([{
+      reason: '自动模拟卖出：触发止损',
+    }])
+    await expect(repository.getTradeRecords()).resolves.toMatchObject([{
+      buyMemo: '自动模拟交易引擎',
+      sellMemo: '自动模拟卖出：触发止损',
+    }])
+  })
+
   it('does not show mock stock prices when a cloud repository is configured but empty', async () => {
     const emptyClient = {
       from: () => ({

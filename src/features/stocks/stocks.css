@@ -552,6 +552,17 @@
   box-shadow: 0 22px 60px rgba(15, 23, 42, .24);
 }
 
+.stock-execution-modal {
+  width: min(760px, 100%);
+  max-height: min(720px, calc(100vh - 36px));
+  overflow: auto;
+}
+
+.stock-execution-modal .stock-execution-timeline {
+  max-height: 560px;
+  overflow: auto;
+}
+
 .stock-modal h2,
 .stock-modal p {
   margin: 0;

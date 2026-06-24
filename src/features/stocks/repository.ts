@@ -62,6 +62,34 @@ function formatDateTime(value: unknown) {
   return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`
 }
 
+function translateStockText(value: unknown) {
+  let textValue = String(value ?? '').trim()
+  if (!textValue) return ''
+
+  const replacements: Array<[RegExp, string]> = [
+    [/Auto paper trading engine/g, '自动模拟交易引擎'],
+    [/Auto paper buy:/g, '自动模拟买入：'],
+    [/Auto paper sell:/g, '自动模拟卖出：'],
+    [/Auto paper partial sell:/g, '自动模拟减仓：'],
+    [/Auto paper closed:/g, '自动模拟清仓：'],
+    [/stop loss touched/g, '触发止损'],
+    [/take profit touched/g, '触发止盈'],
+    [/target 1 touched/g, '触发第一止盈位'],
+    [/target touched/g, '触发目标价'],
+    [/max holding days/g, '达到最长持仓天数'],
+    [/risk control/g, '风控触发'],
+    [/insufficient cash/g, '现金不足'],
+    [/not bought/g, '未买入'],
+    [/already holding/g, '已有持仓'],
+    [/max holdings/g, '达到持仓数量上限'],
+  ]
+
+  for (const [pattern, replacement] of replacements) {
+    textValue = textValue.replace(pattern, replacement)
+  }
+  return textValue.replace(/：\s+/g, '：')
+}
+
 function calculateHolding(input: AddHoldingInput): HoldingStock {
   const marketValue = input.currentPrice * input.shares
   const floatingPnl = (input.currentPrice - input.costPrice) * input.shares
@@ -78,6 +106,7 @@ function calculateHolding(input: AddHoldingInput): HoldingStock {
     buyDate: input.buyDate,
     holdingDays: 0,
     currentSuggestion: input.currentSuggestion,
+    buyMemo: input.buyMemo,
   }
 }
 
@@ -188,7 +217,8 @@ function mapHolding(row: Row): HoldingStock {
     pnlRate: numberValue(row, 'pnl_rate'),
     buyDate: text(row, 'buy_date'),
     holdingDays: numberValue(row, 'holding_days'),
-    currentSuggestion: text(row, 'current_suggestion'),
+    currentSuggestion: translateStockText(row.current_suggestion),
+    buyMemo: translateStockText(row.buy_memo),
   }
 }
 
@@ -203,8 +233,8 @@ function mapTrade(row: Row): TradeRecord {
     shares: numberValue(row, 'shares'),
     pnlAmount: numberValue(row, 'pnl_amount'),
     pnlRate: numberValue(row, 'pnl_rate'),
-    buyMemo: text(row, 'buy_memo'),
-    sellMemo: text(row, 'sell_memo'),
+    buyMemo: translateStockText(row.buy_memo),
+    sellMemo: translateStockText(row.sell_memo),
     isCleared: Boolean(row.is_cleared),
   }
 }
@@ -229,7 +259,7 @@ function mapPaperTradeOrder(row: Row): PaperTradeOrder {
     code: text(row, 'code'),
     name: text(row, 'name'),
     side: text(row, 'side', 'buy') as PaperTradeOrder['side'],
-    reason: text(row, 'reason'),
+    reason: translateStockText(row.reason),
     price: numberValue(row, 'price'),
     shares: numberValue(row, 'shares'),
     amount: numberValue(row, 'amount'),

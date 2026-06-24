@@ -214,8 +214,8 @@ def buy_position(
         "pnl_rate": 0,
         "buy_date": date.today().isoformat(),
         "holding_days": 0,
-        "current_suggestion": f"Auto paper buy: {decision.get('final_action', '')}",
-        "buy_memo": "Auto paper trading engine",
+        "current_suggestion": f"自动模拟买入：{decision.get('final_action', '')}",
+        "buy_memo": "自动模拟交易引擎",
         "status": "open",
     }
     rows = client.request("POST", "stock_positions", payload, prefer="return=representation")
@@ -260,7 +260,7 @@ def sell_position(
         "pnl_amount": pnl,
         "pnl_rate": (price - cost_price) / cost_price * 100 if cost_price > 0 else 0,
         "buy_memo": position.get("buy_memo", ""),
-        "sell_memo": f"Auto paper sell: {reason}",
+        "sell_memo": f"自动模拟卖出：{reason}",
         "is_cleared": is_cleared,
     }])
 
@@ -274,7 +274,7 @@ def sell_position(
                 "market_value": 0,
                 "floating_pnl": pnl,
                 "pnl_rate": (price - cost_price) / cost_price * 100 if cost_price > 0 else 0,
-                "current_suggestion": f"Auto paper closed: {reason}",
+                "current_suggestion": f"自动模拟清仓：{reason}",
                 "status": "closed",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -286,7 +286,7 @@ def sell_position(
             client,
             {**position, "shares": next_shares},
             price,
-            f"Auto paper partial sell: {reason}",
+            f"自动模拟减仓：{reason}",
         )
         client.request(
             "PATCH",
@@ -317,9 +317,9 @@ def sell_reason(decision: dict[str, Any], position: dict[str, Any]) -> tuple[str
     target = number(decision.get("target_price_1"))
     shares = integer(position.get("shares"))
     if price > 0 and stop_loss > 0 and price <= stop_loss:
-        return "stop loss touched", shares
+        return "触发止损", shares
     if price > 0 and target > 0 and price >= target:
-        return "target 1 touched", max(100, round_lot(shares / 2))
+        return "触发第一止盈位", max(100, round_lot(shares / 2))
     status = str(decision.get("status", "")).lower()
     action = str(decision.get("final_action", "")).lower()
     if "sell" in status or "risk" in status or "sell" in action:
