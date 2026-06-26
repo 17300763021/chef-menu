@@ -316,7 +316,7 @@ def main() -> int:
         counts["stock_positions"] = client.upsert("stock_positions", holding_rows, "code,status")
 
     client.insert("stock_job_runs", [{
-        "job_type": "本地CSV同步",
+        "job_type": "策略结果入库",
         "status": "成功",
         "imported_count": sum(counts.values()),
         "error_message": "",

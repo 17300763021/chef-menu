@@ -92,6 +92,51 @@ describe('stock repository', () => {
     }])
   })
 
+  it('maps stock task job types to user-facing names', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_job_runs: [
+        {
+          id: 'job-full',
+          job_type: 'GitHub Actions: full',
+          started_at: '2026-06-26T05:18:20Z',
+          status: 'success',
+          imported_count: 4,
+          error_message: '',
+        },
+        {
+          id: 'job-sync',
+          job_type: '本地CSV同步',
+          started_at: '2026-06-26T05:32:39Z',
+          status: 'success',
+          imported_count: 122,
+          error_message: '',
+        },
+        {
+          id: 'job-web',
+          job_type: 'Web request: live_decision',
+          started_at: '2026-06-26T05:40:00Z',
+          status: 'success',
+          imported_count: 2,
+          error_message: '',
+        },
+      ],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getTasks()).resolves.toMatchObject([
+      { type: '线上全链路任务' },
+      { type: '策略结果入库' },
+      { type: '页面触发：线上实时决策' },
+    ])
+  })
+
   it('translates automatic trading reasons for display', async () => {
     const rowsByTable: Record<string, unknown[]> = {
       stock_auto_trade_orders: [{

@@ -239,10 +239,39 @@ function mapTrade(row: Row): TradeRecord {
   }
 }
 
+const taskTypeLabels: Record<string, string> = {
+  full: '线上全链路任务',
+  night_scan: '线上股票池筛选',
+  live_decision: '线上实时决策',
+  live_session: '线上盘中轮询',
+  paper_trade: '线上模拟交易执行',
+  backtest: '线上策略回测',
+  sync_latest: '线上结果入库',
+  pending: '线上任务请求处理',
+  '本地CSV同步': '策略结果入库',
+}
+
+function formatTaskType(value: unknown): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  if (taskTypeLabels[raw]) return taskTypeLabels[raw]
+  const githubPrefix = 'GitHub Actions: '
+  if (raw.startsWith(githubPrefix)) {
+    const mode = raw.slice(githubPrefix.length)
+    return taskTypeLabels[mode] ?? `线上任务：${mode}`
+  }
+  const webPrefix = 'Web request: '
+  if (raw.startsWith(webPrefix)) {
+    const mode = raw.slice(webPrefix.length)
+    return `页面触发：${taskTypeLabels[mode] ?? mode}`
+  }
+  return raw
+}
+
 function mapTask(row: Row): TaskRecord {
   return {
     id: text(row, 'id'),
-    type: text(row, 'job_type'),
+    type: formatTaskType(row.job_type),
     startTime: formatDateTime(row.started_at),
     endTime: formatDateTime(row.finished_at || '--'),
     status: text(row, 'status', '成功') as TaskRecord['status'],
