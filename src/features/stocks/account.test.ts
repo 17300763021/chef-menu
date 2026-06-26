@@ -65,6 +65,11 @@ function signal(overrides: Partial<SignalEvent>): SignalEvent {
     finalAction: '可以买小仓',
     reason: '回踩确认',
     risk: '',
+    executionStatus: 'not_executed',
+    executionStatusText: '策略建议，未执行',
+    executionOrderId: '',
+    executionReason: '',
+    executionHandledAt: '--',
     createdAt: '2026-06-16T10:00:00Z',
     ...overrides,
   }

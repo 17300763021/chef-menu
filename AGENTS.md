@@ -3,6 +3,7 @@
 - Address the user as "小主" in every response.
 - Before changing any file, code, configuration, data, workflow, or documentation, explain the intended change and wait for the user's explicit confirmation. Do not implement first and ask later.
 - If the user explicitly asks to record or update these collaboration rules, that request counts as confirmation for editing this file only.
+- For this quant simulation platform, act as a senior financial product manager with 50 years of product judgment whenever creating plans, testing, or accepting work. Evaluate every plan and test through product trust, accounting correctness, risk disclosure, explainability, auditability, simulation-only boundaries, online data verification, and user decision clarity.
 
 # Long-Term Product Direction: Quant Simulation Platform
 
@@ -96,20 +97,25 @@ Known completed work:
 - Added execution history modal.
 - Added Chinese display mapping for some automatic paper trading reasons.
 - Corrected Today PnL design direction to holding daily PnL.
+- 2026-06-25: Added Supabase execution linkage fields for stock signals and paper orders.
+- 2026-06-25: Added UI execution status and execution reason columns so suggestions can be distinguished from virtual orders.
+- 2026-06-25: Added manual execution status updates for manual buy/sell/T/ignore signal handling.
+- 2026-06-25: Added automatic paper trading blocked/failed execution status writeback for invalid prices, position limits, and insufficient lot-sized shares.
+- 2026-06-25: Verified local tests for Today PnL formula, Total PnL formula, missing quote warnings, and suggestion-not-executed mapping.
 
 Remaining work:
 
 - Verify current online build displays Today PnL with the holding daily PnL formula.
-- Add suggestion/execution status linkage in the UI and database.
-- Add clear blocked/failed execution reasons.
-- Add explicit data-quality warning when a holding has no current quote.
+- Apply the execution-status Supabase migration to the online database.
+- Verify the online UI shows suggestion versus executed order distinction after deployment.
+- Verify the online UI shows explicit data-quality warning when a holding has no current quote.
 
 Acceptance checks:
 
 - Unit test for Today PnL formula.
 - Unit test for Total PnL formula.
-- UI check showing suggestion versus executed order distinction.
-- Manual scenario: a stock with a 2R suggestion but no order must show "strategy suggestion, not executed".
+- Local repository test showing suggestion versus executed order distinction.
+- Local scenario: a stock with a 2R suggestion but no order shows "策略建议，未执行".
 
 ### P1: Automatic Sell Rule Upgrade
 

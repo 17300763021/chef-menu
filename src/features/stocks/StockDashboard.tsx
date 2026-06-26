@@ -403,6 +403,8 @@ export default function StockDashboard() {
     { header: '触发时间', cell: (row) => row.signalTime },
     { header: '类型', cell: (row) => <StatusTag status={row.signalType} /> },
     { header: '状态', cell: (row) => row.status },
+    { header: '执行状态', cell: (row) => <StatusTag status={row.executionStatusText} /> },
+    { header: '执行说明', cell: (row) => row.executionReason || (row.executionStatus === 'not_executed' ? '仅策略建议，尚未形成虚拟订单' : '-') },
     { header: '来源', cell: (row) => row.sourceType },
     { header: '代码', cell: (row) => row.code },
     { header: '名称', cell: (row) => row.name },

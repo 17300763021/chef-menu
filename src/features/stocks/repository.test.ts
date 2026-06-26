@@ -297,6 +297,51 @@ describe('stock repository', () => {
     }])
   })
 
+  it('maps strategy suggestions with no order as not executed', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_signal_events: [{
+        id: 'signal-2r',
+        signal_time: '2026-06-25T02:30:00Z',
+        signal_date: '2026-06-25',
+        code: '000001',
+        name: '平安银行',
+        source_type: '持仓',
+        signal_type: '止盈',
+        status: '新信号',
+        execution_status: 'not_executed',
+        execution_order_id: null,
+        execution_reason: '',
+        execution_handled_at: null,
+        trigger_price: 12,
+        current_price: 12,
+        change_rate: 3,
+        buy_price_text: '不加仓',
+        sell_price_text: '2R 达成，建议止盈',
+        stop_loss: 10,
+        target_price_1: 11,
+        final_action: '2R止盈建议',
+        reason: '达到第二止盈目标',
+        risk: '',
+        created_at: '2026-06-25T02:30:00Z',
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+
+    const repository = createStockRepository(client)
+    await expect(repository.getSignalEvents()).resolves.toMatchObject([{
+      code: '000001',
+      executionStatus: 'not_executed',
+      executionStatusText: '策略建议，未执行',
+      executionReason: '',
+    }])
+  })
+
   it('confirms a buy signal by creating a holding and marking the signal handled', async () => {
     const calls: Array<{ table: string; action: string; payload?: unknown }> = []
     const signalRow = {
@@ -363,6 +408,11 @@ describe('stock repository', () => {
       finalAction: '可以买小仓',
       reason: '分时站上均价线',
       risk: '',
+      executionStatus: 'not_executed',
+      executionStatusText: '策略建议，未执行',
+      executionOrderId: '',
+      executionReason: '',
+      executionHandledAt: '--',
       createdAt: '2026-06-16T10:15:00Z',
     }
 
@@ -376,7 +426,15 @@ describe('stock repository', () => {
 
     expect(calls).toEqual(expect.arrayContaining([
       expect.objectContaining({ table: 'stock_positions', action: 'insert' }),
-      expect.objectContaining({ table: 'stock_signal_events', action: 'update' }),
+      expect.objectContaining({
+        table: 'stock_signal_events',
+        action: 'update',
+        payload: expect.objectContaining({
+          status: '已买入',
+          execution_status: 'manual_executed',
+          execution_reason: '手动记录买入',
+        }),
+      }),
     ]))
   })
 

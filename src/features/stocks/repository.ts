@@ -19,6 +19,7 @@ import type {
   SaveTradeInput,
   SaveTradeResult,
   SignalEvent,
+  SignalExecutionStatus,
   StockJobType,
   TaskRecord,
   TradeRecord,
@@ -88,6 +89,29 @@ function translateStockText(value: unknown) {
     textValue = textValue.replace(pattern, replacement)
   }
   return textValue.replace(/：\s+/g, '：')
+}
+
+const signalExecutionStatusText: Record<SignalExecutionStatus, string> = {
+  not_executed: '策略建议，未执行',
+  auto_executed: '已自动模拟执行',
+  manual_executed: '已手动记录执行',
+  ignored: '已忽略',
+  blocked: '执行受阻',
+  failed: '执行失败',
+}
+
+function signalExecutionStatus(row: Row): SignalExecutionStatus {
+  const value = text(row, 'execution_status', 'not_executed')
+  if (
+    value === 'auto_executed'
+    || value === 'manual_executed'
+    || value === 'ignored'
+    || value === 'blocked'
+    || value === 'failed'
+  ) {
+    return value
+  }
+  return 'not_executed'
 }
 
 function calculateHolding(input: AddHoldingInput): HoldingStock {
@@ -296,6 +320,8 @@ function mapPaperTradeOrder(row: Row): PaperTradeOrder {
     cashAfter: numberValue(row, 'cash_after'),
     realizedPnl: numberValue(row, 'realized_pnl'),
     status: text(row, 'status'),
+    sourceSignalId: text(row, 'source_signal_id'),
+    failureReason: translateStockText(row.failure_reason),
   }
 }
 
@@ -387,6 +413,7 @@ function mapMissedRunner(row: Row): MissedRunner {
 }
 
 function mapSignalEvent(row: Row): SignalEvent {
+  const executionStatus = signalExecutionStatus(row)
   return {
     id: text(row, 'id'),
     signalTime: formatDateTime(row.signal_time),
@@ -406,6 +433,11 @@ function mapSignalEvent(row: Row): SignalEvent {
     finalAction: text(row, 'final_action'),
     reason: text(row, 'reason'),
     risk: text(row, 'risk'),
+    executionStatus,
+    executionStatusText: signalExecutionStatusText[executionStatus],
+    executionOrderId: text(row, 'execution_order_id'),
+    executionReason: translateStockText(row.execution_reason),
+    executionHandledAt: formatDateTime(row.execution_handled_at),
     createdAt: formatDateTime(row.created_at),
   }
 }
@@ -429,7 +461,7 @@ export interface StockRepository {
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
   saveTrade(input: SaveTradeInput): Promise<SaveTradeResult>
   confirmSignalBuy(input: ConfirmSignalBuyInput): Promise<HoldingStock>
-  markSignalEvent(id: string, status: SignalEvent['status']): Promise<void>
+  markSignalEvent(id: string, status: SignalEvent['status'], executionReason?: string): Promise<void>
   recordTTrade(input: RecordTTradeInput): Promise<SaveTradeResult>
   requestJob(jobType: StockJobType): Promise<void>
 }
@@ -674,15 +706,29 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
         currentSuggestion: input.signal.finalAction || input.signal.reason,
         buyMemo: input.memo,
       })
-      await this.markSignalEvent(input.signal.id, '已买入')
+      await this.markSignalEvent(input.signal.id, '已买入', '手动记录买入')
       return holding
     },
-    async markSignalEvent(id, status) {
+    async markSignalEvent(id, status, executionReason) {
       if (!client) return
       try {
+        const executionStatus: SignalExecutionStatus = status === '已忽略' ? 'ignored' : 'manual_executed'
+        const fallbackReason: Record<SignalEvent['status'], string> = {
+          新信号: '',
+          已买入: '手动记录买入',
+          已卖出: '手动记录卖出',
+          已忽略: '用户忽略信号',
+          已记录T: '手动记录做T',
+        }
         const result = await withTimeout(client
           .from('stock_signal_events')
-          .update({ status, handled_at: new Date().toISOString() })
+          .update({
+            status,
+            handled_at: new Date().toISOString(),
+            execution_status: executionStatus,
+            execution_reason: executionReason ?? fallbackReason[status],
+            execution_handled_at: new Date().toISOString(),
+          })
           .eq('id', id))
         const error = (result as { error?: unknown }).error
         if (error) throw error
@@ -699,7 +745,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
         tradeDate: input.tradeDate,
         memo: input.memo || input.action,
       })
-      await this.markSignalEvent(input.signal.id, '已记录T')
+      await this.markSignalEvent(input.signal.id, '已记录T', input.action === '做T买' ? '手动记录做T买入' : '手动记录做T卖出')
       return result
     },
     async requestJob(jobType) {

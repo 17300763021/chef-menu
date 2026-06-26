@@ -8,6 +8,7 @@ import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
@@ -122,6 +123,45 @@ def latest_by_code(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return result
 
 
+def signal_event_id(client: SupabaseRest, decision: dict[str, Any]) -> str:
+    existing = str(decision.get("source_signal_id") or decision.get("signal_event_id") or "")
+    if existing:
+        return existing
+
+    code = quote(str(decision.get("code", "")).zfill(6))
+    signal_date = str(decision.get("decision_date") or date.today().isoformat())
+    rows = client.request(
+        "GET",
+        f"stock_signal_events?code=eq.{code}&signal_date=eq.{quote(signal_date)}&select=id&order=signal_time.desc&limit=1",
+    ) or []
+    return str(rows[0].get("id", "")) if rows else ""
+
+
+def record_signal_execution(
+    client: SupabaseRest,
+    decision: dict[str, Any],
+    status: str,
+    reason: str,
+    order_id: str = "",
+    signal_id: str = "",
+) -> None:
+    target_id = signal_id or signal_event_id(client, decision)
+    if not target_id:
+        return
+
+    client.request(
+        "PATCH",
+        f"stock_signal_events?id=eq.{quote(target_id)}",
+        {
+            "execution_status": status,
+            "execution_order_id": order_id or None,
+            "execution_reason": reason,
+            "execution_handled_at": datetime.now(timezone.utc).isoformat(),
+        },
+        prefer="return=minimal",
+    )
+
+
 def update_position_price(client: SupabaseRest, position: dict[str, Any], price: float, suggestion: str) -> dict[str, Any]:
     shares = integer(position.get("shares"))
     cost_price = number(position.get("cost_price"))
@@ -157,8 +197,10 @@ def insert_order(
     before_shares: int,
     after_shares: int,
     pnl: float = 0,
-) -> None:
-    client.insert("stock_auto_trade_orders", [{
+    failure_reason: str = "",
+) -> str:
+    source_signal_id = signal_event_id(client, decision)
+    rows = client.request("POST", "stock_auto_trade_orders", [{
         "order_date": date.today().isoformat(),
         "code": str(decision.get("code", "")).zfill(6),
         "name": decision.get("name", ""),
@@ -173,9 +215,12 @@ def insert_order(
         "position_shares_after": after_shares,
         "realized_pnl": pnl,
         "status": "filled",
+        "source_signal_id": source_signal_id or None,
+        "failure_reason": failure_reason,
         "source_decision_date": decision.get("decision_date"),
         "source_update_time": decision.get("update_time", ""),
-    }])
+    }], prefer="return=representation")
+    return str(rows[0].get("id", "")) if rows else ""
 
 
 def buy_position(
@@ -186,7 +231,11 @@ def buy_position(
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_buy_price")) or number(decision.get("current_price"))
     stop_loss = number(decision.get("stop_loss"))
-    if price <= 0 or len(positions) >= MAX_HOLDINGS:
+    if price <= 0:
+        record_signal_execution(client, decision, "failed", "自动模拟买入失败：价格无效，未生成虚拟订单")
+        return None
+    if len(positions) >= MAX_HOLDINGS:
+        record_signal_execution(client, decision, "blocked", f"自动模拟买入受阻：已达到持仓数量上限 {MAX_HOLDINGS} 只")
         return None
 
     cash = cash_balance(positions, trades)
@@ -200,6 +249,7 @@ def buy_position(
     allowed_amount = max(0, min(available_cash, target_amount, max_single_amount, risk_amount_cap))
     shares = round_lot(allowed_amount / price)
     if shares <= 0:
+        record_signal_execution(client, decision, "blocked", "自动模拟买入受阻：可用现金或风险预算不足 100 股")
         return None
 
     market = price * shares
@@ -220,7 +270,8 @@ def buy_position(
     }
     rows = client.request("POST", "stock_positions", payload, prefer="return=representation")
     cash_after = cash - market
-    insert_order(client, decision, "buy", "can_buy signal", price, shares, cash, cash_after, 0, shares)
+    order_id = insert_order(client, decision, "buy", "can_buy signal", price, shares, cash, cash_after, 0, shares)
+    record_signal_execution(client, decision, "auto_executed", "自动模拟买入已执行", order_id)
     return rows[0] if rows else payload
 
 
@@ -234,12 +285,17 @@ def sell_position(
     shares_to_sell: int,
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_sell_price")) or number(decision.get("current_price"))
-    if price <= 0 or shares_to_sell <= 0:
+    if price <= 0:
+        record_signal_execution(client, decision, "failed", "自动模拟卖出失败：价格无效，未生成虚拟订单")
+        return position
+    if shares_to_sell <= 0:
+        record_signal_execution(client, decision, "blocked", "自动模拟卖出受阻：策略未给出可卖股数")
         return position
 
     shares = integer(position.get("shares"))
     shares_to_sell = min(shares, round_lot(shares_to_sell))
     if shares_to_sell <= 0:
+        record_signal_execution(client, decision, "blocked", "自动模拟卖出受阻：可卖股数不足 100 股")
         return position
 
     cost_price = number(position.get("cost_price"))
@@ -295,7 +351,7 @@ def sell_position(
             prefer="return=minimal",
         )
 
-    insert_order(
+    order_id = insert_order(
         client,
         decision,
         "sell",
@@ -308,6 +364,7 @@ def sell_position(
         next_shares,
         pnl,
     )
+    record_signal_execution(client, decision, "auto_executed", f"自动模拟卖出已执行：{reason}", order_id)
     return next_position
 
 

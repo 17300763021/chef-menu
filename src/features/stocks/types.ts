@@ -79,6 +79,7 @@ export interface AddHoldingInput {
 export type TradeAction = '加仓' | '减仓' | '清仓'
 export type SignalEventType = '买入' | '卖出' | '减仓' | '止损' | '止盈' | '做T买' | '做T卖' | '观察'
 export type SignalEventStatus = '新信号' | '已买入' | '已卖出' | '已忽略' | '已记录T'
+export type SignalExecutionStatus = 'not_executed' | 'auto_executed' | 'manual_executed' | 'ignored' | 'blocked' | 'failed'
 
 export interface SaveTradeInput {
   action: TradeAction
@@ -176,6 +177,11 @@ export interface SignalEvent {
   finalAction: string
   reason: string
   risk: string
+  executionStatus: SignalExecutionStatus
+  executionStatusText: string
+  executionOrderId: string
+  executionReason: string
+  executionHandledAt: string
   createdAt: string
 }
 
@@ -227,6 +233,8 @@ export interface PaperTradeOrder {
   cashAfter: number
   realizedPnl: number
   status: string
+  sourceSignalId: string
+  failureReason: string
 }
 
 export interface PortfolioSnapshot {
