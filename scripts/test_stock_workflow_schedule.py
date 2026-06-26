@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 
 
@@ -30,6 +31,19 @@ class StockWorkflowScheduleTest(unittest.TestCase):
         for workflow_name in ["stock-tasks.yml", "stock-pending.yml"]:
             workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
             self.assertIn("TZ: Asia/Shanghai", workflow)
+
+    def test_night_scan_defaults_to_broad_after_hours_universe(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import run_stock_tasks
+
+        with patch.dict(run_stock_tasks.os.environ, {}, clear=True), \
+                patch.object(run_stock_tasks.subprocess, "run") as run:
+            run_stock_tasks.run_night_scan()
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--limit") + 1], "1000")
 
 
 if __name__ == "__main__":
