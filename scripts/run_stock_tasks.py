@@ -12,6 +12,7 @@ import time
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from sync_stock_data import SupabaseRest, env_value, read_env_file
@@ -63,6 +64,83 @@ def record_job(client: SupabaseRest, job_type: str, status: str, imported_count:
         "imported_count": imported_count,
         "error_message": error_message,
     }])
+
+
+def today_start(now: datetime) -> datetime:
+    local_now = now.astimezone(SHANGHAI)
+    return datetime.combine(local_now.date(), clock_time(0, 0), SHANGHAI)
+
+
+def has_todays_scheduled_stock_task(client: SupabaseRest, now: datetime) -> bool:
+    started_at = quote(today_start(now).isoformat(), safe="")
+    job_types = [
+        "GitHub Actions: live_decision",
+        "GitHub Actions: full",
+        "GitHub Actions watchdog: live_decision",
+        "GitHub Actions watchdog: full",
+    ]
+    for job_type in job_types:
+        encoded_job_type = quote(job_type, safe="")
+        rows = client.request(
+            "GET",
+            f"stock_job_runs?select=started_at&job_type=eq.{encoded_job_type}"
+            f"&started_at=gte.{started_at}&limit=1",
+        )
+        if rows:
+            return True
+    return False
+
+
+def watchdog_backfill_mode(now: datetime) -> str | None:
+    local_now = now.astimezone(SHANGHAI)
+    if local_now.weekday() >= 5:
+        return None
+
+    date = local_now.date()
+    morning_backfill_start = datetime.combine(date, clock_time(9, 35), SHANGHAI)
+    morning_end = datetime.combine(date, clock_time(11, 30), SHANGHAI)
+    afternoon_backfill_start = datetime.combine(date, clock_time(13, 5), SHANGHAI)
+    afternoon_end = datetime.combine(date, clock_time(15, 0), SHANGHAI)
+    full_backfill_start = datetime.combine(date, clock_time(15, 50), SHANGHAI)
+    full_backfill_end = datetime.combine(date, clock_time(21, 30), SHANGHAI)
+
+    if morning_backfill_start <= local_now <= morning_end:
+        return "live_decision"
+    if afternoon_backfill_start <= local_now <= afternoon_end:
+        return "live_decision"
+    if full_backfill_start <= local_now <= full_backfill_end:
+        return "full"
+    return None
+
+
+def run_stock_task_watchdog(client: SupabaseRest, now: datetime | None = None) -> str | None:
+    if os.environ.get("STOCK_TASK_WATCHDOG", "1").lower() in {"0", "false", "off"}:
+        return None
+
+    current = now or datetime.now(SHANGHAI)
+    mode = watchdog_backfill_mode(current)
+    if not mode or has_todays_scheduled_stock_task(client, current):
+        return None
+
+    try:
+        imported = execute_job(mode)
+        record_job(
+            client,
+            f"GitHub Actions watchdog: {mode}",
+            "success",
+            imported,
+            "Backfilled missing scheduled stock task.",
+        )
+        return mode
+    except Exception as reason:
+        record_job(
+            client,
+            f"GitHub Actions watchdog: {mode}",
+            "failed",
+            0,
+            f"Backfill failed: {reason}",
+        )
+        raise
 
 
 def patch_request(client: SupabaseRest, request_id: str, payload: dict[str, Any]) -> None:
@@ -341,6 +419,10 @@ def process_pending() -> None:
     client = get_client()
     rows = pending_requests(client)
     print(json.dumps({"pending": len(rows)}, ensure_ascii=False), flush=True)
+    if not rows:
+        record_job(client, "GitHub Actions: pending", "success", 0, "No pending stock task requests.")
+        run_stock_task_watchdog(client)
+        return
     for row in rows:
         request_id = str(row["id"])
         job_type = str(row["job_type"])
@@ -371,6 +453,7 @@ def process_pending() -> None:
                 "error_message": str(reason),
             }])
             raise
+    run_stock_task_watchdog(client)
 
 
 def main() -> int:
