@@ -75,7 +75,7 @@ Missing market data must not be guessed. If a holding cannot be matched to curre
 
 ### P0: Accounting And Execution Transparency
 
-Status: In Progress
+Status: Completed
 
 Goal: Make all displayed account numbers, suggestions, and execution states trustworthy and unambiguous.
 
@@ -102,13 +102,11 @@ Known completed work:
 - 2026-06-25: Added manual execution status updates for manual buy/sell/T/ignore signal handling.
 - 2026-06-25: Added automatic paper trading blocked/failed execution status writeback for invalid prices, position limits, and insufficient lot-sized shares.
 - 2026-06-25: Verified local tests for Today PnL formula, Total PnL formula, missing quote warnings, and suggestion-not-executed mapping.
+- 2026-06-29: Completed P0 closure check. Verified local test suite and production build, verified online Supabase execution-status fields, verified deployed GitHub Pages asset includes Today PnL holding-daily formula, execution-status UI logic, and missing quote warning logic, and verified online data has open-position filtering, no current missing-quote holdings, and live signal execution statuses.
 
 Remaining work:
 
-- Verify current online build displays Today PnL with the holding daily PnL formula.
-- Apply the execution-status Supabase migration to the online database.
-- Verify the online UI shows suggestion versus executed order distinction after deployment.
-- Verify the online UI shows explicit data-quality warning when a holding has no current quote.
+- No P0 blocker remains. Defer non-essential wording, layout, and polish optimization until after roadmap progression.
 
 Acceptance checks:
 
@@ -119,7 +117,7 @@ Acceptance checks:
 
 ### P1: Automatic Sell Rule Upgrade
 
-Status: Pending
+Status: In Progress
 
 Goal: Fix the current weakness where losses can trigger full exits but profitable positions mostly only show suggestions or partial exits.
 
@@ -152,6 +150,18 @@ Acceptance checks:
 - Fixture: strong limit-up does not mechanically sell.
 - Fixture: heavy-volume board break triggers reduction.
 - UI shows the exact rule that triggered the order.
+
+Known completed work:
+
+- 2026-06-29: Added P1-MVP automatic sell lifecycle for simulation paper trading. Implemented sell stage tracking fields, stop-loss clear, 1R partial sell, 2R normal-stock profit-taking, strong limit-up skip with raised trailing stop, trailing-stop clear, linked signal status writes, and deterministic Python fixtures.
+
+Remaining work:
+
+- Add heavy-volume stagnation clear/reduce rule.
+- Add consecutive limit-up board-strength tracking.
+- Add heavy-volume board-break reduction.
+- Add failed re-seal after board-break clear/sharp-reduce.
+- Verify UI displays the exact automatic sell trigger rule after online deployment and migration.
 
 ### P2: A-Share Trading Constraints
 

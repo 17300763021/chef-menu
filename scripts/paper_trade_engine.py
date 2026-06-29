@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,20 @@ INITIAL_POSITION_RATE = float(os.environ.get("STOCK_PAPER_INITIAL_RATE", "0.08")
 MAX_SINGLE_POSITION_RATE = float(os.environ.get("STOCK_PAPER_MAX_SINGLE_RATE", "0.15"))
 CASH_RESERVE_RATE = float(os.environ.get("STOCK_PAPER_CASH_RESERVE_RATE", "0.25"))
 RISK_RATE = float(os.environ.get("STOCK_PAPER_RISK_RATE", "0.01"))
+TRAILING_STOP_RATE = float(os.environ.get("STOCK_PAPER_TRAILING_STOP_RATE", "0.93"))
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class SellDecision:
+    reason: str
+    shares: int
+    next_sell_stage: str
+    trailing_stop_price: float | None = None
+    last_profit_taking_price: float | None = None
+    execution_status: str = "auto_executed"
 
 
 def get_client() -> SupabaseRest:
@@ -46,6 +58,30 @@ def integer(value: Any, fallback: int = 0) -> int:
 
 def round_lot(shares: float) -> int:
     return max(0, int(shares // 100) * 100)
+
+
+def position_sell_stage(position: dict[str, Any]) -> str:
+    stage = str(position.get("sell_stage") or "none").strip()
+    return stage if stage else "none"
+
+
+def target_2r(position: dict[str, Any], target_1r: float) -> float:
+    cost_price = number(position.get("cost_price"))
+    if cost_price <= 0 or target_1r <= cost_price:
+        return 0
+    return cost_price + 2 * (target_1r - cost_price)
+
+
+def is_strong_limit_up(decision: dict[str, Any]) -> bool:
+    text_value = " ".join(str(decision.get(key, "")) for key in ("status", "final_action", "sell_reason"))
+    return number(decision.get("change_rate")) >= 9.7 or "涨停" in text_value or "limit-up" in text_value.lower()
+
+
+def next_trailing_stop(decision: dict[str, Any], position: dict[str, Any]) -> float:
+    price = number(decision.get("current_price"))
+    existing = number(position.get("trailing_stop_price"))
+    raised = round(price * TRAILING_STOP_RATE, 2) if price > 0 else 0
+    return max(existing, raised)
 
 
 def initial_position_rate(decision: dict[str, Any]) -> float:
@@ -160,6 +196,38 @@ def record_signal_execution(
         },
         prefer="return=minimal",
     )
+
+
+def sell_state_payload(decision_result: SellDecision) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "sell_stage": decision_result.next_sell_stage,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if decision_result.trailing_stop_price is not None:
+        payload["trailing_stop_price"] = decision_result.trailing_stop_price
+    if decision_result.last_profit_taking_price is not None:
+        payload["last_profit_taking_price"] = decision_result.last_profit_taking_price
+    return payload
+
+
+def record_skipped_sell_decision(
+    client: SupabaseRest,
+    decision: dict[str, Any],
+    position: dict[str, Any],
+    decision_result: SellDecision,
+) -> None:
+    if not decision_result.reason:
+        return
+    client.request(
+        "PATCH",
+        f"stock_positions?id=eq.{position['id']}",
+        {
+            "current_suggestion": decision_result.reason,
+            **sell_state_payload(decision_result),
+        },
+        prefer="return=minimal",
+    )
+    record_signal_execution(client, decision, decision_result.execution_status, decision_result.reason)
 
 
 def update_position_price(client: SupabaseRest, position: dict[str, Any], price: float, suggestion: str) -> dict[str, Any]:
@@ -283,6 +351,7 @@ def sell_position(
     trades: list[dict[str, Any]],
     reason: str,
     shares_to_sell: int,
+    decision_result: SellDecision | None = None,
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_sell_price")) or number(decision.get("current_price"))
     if price <= 0:
@@ -304,6 +373,7 @@ def sell_position(
     cash_after = cash + price * shares_to_sell
     next_shares = shares - shares_to_sell
     is_cleared = next_shares <= 0
+    sell_state = decision_result or SellDecision(reason, shares_to_sell, "closed" if is_cleared else position_sell_stage(position))
 
     client.insert("stock_trade_history", [{
         "code": position.get("code"),
@@ -332,7 +402,7 @@ def sell_position(
                 "pnl_rate": (price - cost_price) / cost_price * 100 if cost_price > 0 else 0,
                 "current_suggestion": f"自动模拟清仓：{reason}",
                 "status": "closed",
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                **sell_state_payload(sell_state),
             },
             prefer="return=minimal",
         )
@@ -347,7 +417,10 @@ def sell_position(
         client.request(
             "PATCH",
             f"stock_positions?id=eq.{position['id']}",
-            {"shares": next_shares},
+            {
+                "shares": next_shares,
+                **sell_state_payload(sell_state),
+            },
             prefer="return=minimal",
         )
 
@@ -366,6 +439,41 @@ def sell_position(
     )
     record_signal_execution(client, decision, "auto_executed", f"自动模拟卖出已执行：{reason}", order_id)
     return next_position
+
+
+def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDecision:
+    price = number(decision.get("current_price"))
+    stop_loss = number(decision.get("stop_loss"))
+    target_1r = number(decision.get("target_price_1"))
+    target_2 = target_2r(position, target_1r)
+    shares = integer(position.get("shares"))
+    stage = position_sell_stage(position)
+    trailing_stop = number(position.get("trailing_stop_price"))
+
+    if price > 0 and stop_loss > 0 and price <= stop_loss:
+        return SellDecision("触发止损", shares, "closed")
+    if price > 0 and trailing_stop > 0 and price <= trailing_stop:
+        return SellDecision("跌破移动止损", shares, "closed")
+    if price > 0 and is_strong_limit_up(decision):
+        return SellDecision(
+            "强势涨停，暂不机械止盈，抬高移动止损",
+            0,
+            "trailing_stop",
+            trailing_stop_price=next_trailing_stop(decision, position),
+            execution_status="blocked",
+        )
+    if price > 0 and target_2 > 0 and price >= target_2 and stage in {"sold_1r", "sold_2r", "trailing_stop"}:
+        return SellDecision("触发第二止盈位", shares, "closed", last_profit_taking_price=price)
+    if price > 0 and target_1r > 0 and price >= target_1r and stage == "none":
+        sell_shares = min(shares, max(100, round_lot(shares * 0.5)))
+        next_stage = "closed" if sell_shares >= shares else "sold_1r"
+        return SellDecision("触发第一止盈位", sell_shares, next_stage, last_profit_taking_price=price)
+
+    status = str(decision.get("status", "")).lower()
+    action = str(decision.get("final_action", "")).lower()
+    if "sell" in status or "risk" in status or "sell" in action:
+        return SellDecision("盘中策略提示卖出或风险控制", shares, "closed")
+    return SellDecision("", 0, stage)
 
 
 def sell_reason(decision: dict[str, Any], position: dict[str, Any]) -> tuple[str, int]:
@@ -445,11 +553,23 @@ def run(dry_run: bool = False) -> dict[str, int]:
         decision = decisions_by_code.get(code)
         if not decision or (code, "sell") in ordered_keys:
             continue
-        reason, shares = sell_reason(decision, position)
-        if not reason:
+        decision_result = sell_decision(decision, position)
+        if not decision_result.reason:
             continue
         if not dry_run:
-            next_position = sell_position(client, decision, position, positions, trades, reason, shares)
+            if decision_result.shares <= 0:
+                record_skipped_sell_decision(client, decision, position, decision_result)
+                continue
+            next_position = sell_position(
+                client,
+                decision,
+                position,
+                positions,
+                trades,
+                decision_result.reason,
+                decision_result.shares,
+                decision_result,
+            )
             trade_count += 1
             trades = trade_history(client)
             if next_position:
