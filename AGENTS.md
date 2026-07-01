@@ -154,10 +154,10 @@ Acceptance checks:
 Known completed work:
 
 - 2026-06-29: Added P1-MVP automatic sell lifecycle for simulation paper trading. Implemented sell stage tracking fields, stop-loss clear, 1R partial sell, 2R normal-stock profit-taking, strong limit-up skip with raised trailing stop, trailing-stop clear, linked signal status writes, and deterministic Python fixtures.
+- 2026-06-30: Added P1 profit-protection sell layer for simulation paper trading. Implemented 10% profit near-pressure reduction, 15% profit heavy-volume stagnation clear, 25% high-profit ordinary holding protection sell, 25% high-profit strong-limit-up skip with raised trailing stop, and order-history fixture coverage so automatic protection sells appear in execution records.
 
 Remaining work:
 
-- Add heavy-volume stagnation clear/reduce rule.
 - Add consecutive limit-up board-strength tracking.
 - Add heavy-volume board-break reduction.
 - Add failed re-seal after board-break clear/sharp-reduce.

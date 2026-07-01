@@ -21,6 +21,9 @@ MAX_SINGLE_POSITION_RATE = float(os.environ.get("STOCK_PAPER_MAX_SINGLE_RATE", "
 CASH_RESERVE_RATE = float(os.environ.get("STOCK_PAPER_CASH_RESERVE_RATE", "0.25"))
 RISK_RATE = float(os.environ.get("STOCK_PAPER_RISK_RATE", "0.01"))
 TRAILING_STOP_RATE = float(os.environ.get("STOCK_PAPER_TRAILING_STOP_RATE", "0.93"))
+PRESSURE_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_PRESSURE_PROFIT_RATE", "10"))
+STAGNATION_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_STAGNATION_PROFIT_RATE", "15"))
+HIGH_PROFIT_PROTECTION_RATE = float(os.environ.get("STOCK_PAPER_HIGH_PROFIT_RATE", "25"))
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +91,49 @@ def initial_position_rate(decision: dict[str, Any]) -> float:
     if "3%试错仓" in str(decision.get("final_action", "")):
         return 0.03
     return INITIAL_POSITION_RATE
+
+
+def profit_rate(price: float, position: dict[str, Any]) -> float:
+    cost_price = number(position.get("cost_price"))
+    if price <= 0 or cost_price <= 0:
+        return 0
+    return (price - cost_price) / cost_price * 100
+
+
+def decision_text(decision: dict[str, Any]) -> str:
+    keys = ("status", "final_action", "reason", "risk", "sell_reason", "buy_reason")
+    return " ".join(str(decision.get(key, "")) for key in keys)
+
+
+def has_any_text(text_value: str, patterns: tuple[str, ...]) -> bool:
+    lowered = text_value.lower()
+    return any(pattern in text_value or pattern.lower() in lowered for pattern in patterns)
+
+
+def is_near_pressure(decision: dict[str, Any]) -> bool:
+    return has_any_text(
+        decision_text(decision),
+        ("临近压力", "接近压力", "压力", "上方抛压", "冲高回落", "上影线"),
+    )
+
+
+def is_heavy_volume_stagnation(decision: dict[str, Any]) -> bool:
+    return has_any_text(
+        decision_text(decision),
+        ("放量滞涨", "量价背离", "放量不涨", "冲高回落", "上影线", "封板松动", "炸板"),
+    )
+
+
+def partial_sell_shares(shares: int, rate: float) -> int:
+    return min(shares, max(100, round_lot(shares * rate)))
+
+
+def next_profit_stage(stage: str) -> str:
+    if stage == "none":
+        return "sold_1r"
+    if stage == "sold_1r":
+        return "sold_2r"
+    return stage
 
 
 def latest_decision_date(client: SupabaseRest) -> str:
@@ -449,11 +495,32 @@ def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDec
     shares = integer(position.get("shares"))
     stage = position_sell_stage(position)
     trailing_stop = number(position.get("trailing_stop_price"))
+    pnl_rate = profit_rate(price, position)
 
     if price > 0 and stop_loss > 0 and price <= stop_loss:
         return SellDecision("触发止损", shares, "closed")
     if price > 0 and trailing_stop > 0 and price <= trailing_stop:
         return SellDecision("跌破移动止损", shares, "closed")
+    if price > 0 and pnl_rate >= HIGH_PROFIT_PROTECTION_RATE and is_strong_limit_up(decision):
+        return SellDecision(
+            "浮盈超过25%且强势涨停，暂不卖出，抬高移动止损保护利润",
+            0,
+            "trailing_stop",
+            trailing_stop_price=next_trailing_stop(decision, position),
+            execution_status="blocked",
+        )
+    if price > 0 and pnl_rate >= STAGNATION_PROFIT_RATE and is_heavy_volume_stagnation(decision):
+        return SellDecision("浮盈超过15%且放量滞涨，清仓保护利润", shares, "closed", last_profit_taking_price=price)
+    if price > 0 and pnl_rate >= HIGH_PROFIT_PROTECTION_RATE:
+        if stage == "none":
+            sell_shares = partial_sell_shares(shares, 0.5)
+            next_stage = "closed" if sell_shares >= shares else "sold_1r"
+            return SellDecision("浮盈超过25%，普通持仓强制减仓保护", sell_shares, next_stage, last_profit_taking_price=price)
+        return SellDecision("浮盈超过25%，普通持仓强制清仓保护", shares, "closed", last_profit_taking_price=price)
+    if price > 0 and pnl_rate >= PRESSURE_PROFIT_RATE and is_near_pressure(decision):
+        sell_shares = partial_sell_shares(shares, 0.3)
+        next_stage = "closed" if sell_shares >= shares else next_profit_stage(stage)
+        return SellDecision("浮盈超过10%且临近压力，减仓保护", sell_shares, next_stage, last_profit_taking_price=price)
     if price > 0 and is_strong_limit_up(decision):
         return SellDecision(
             "强势涨停，暂不机械止盈，抬高移动止损",

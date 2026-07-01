@@ -94,6 +94,49 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertEqual(result.next_sell_stage, "trailing_stop")
         self.assertGreater(result.trailing_stop_price, 10.5)
 
+    def test_high_profit_normal_stock_forces_protection_sell(self) -> None:
+        result = sell_decision(
+            {"current_price": 12.6, "stop_loss": 9, "target_price_1": 0, "change_rate": 4},
+            {"shares": 1000, "cost_price": 10, "sell_stage": "none"},
+        )
+
+        self.assertEqual(result.reason, "浮盈超过25%，普通持仓强制减仓保护")
+        self.assertEqual(result.shares, 500)
+        self.assertEqual(result.next_sell_stage, "sold_1r")
+        self.assertEqual(result.last_profit_taking_price, 12.6)
+
+    def test_profit_near_pressure_reduces_position(self) -> None:
+        result = sell_decision(
+            {"current_price": 11.2, "stop_loss": 9, "target_price_1": 0, "change_rate": 3, "final_action": "临近压力，先减仓保护"},
+            {"shares": 1000, "cost_price": 10, "sell_stage": "none"},
+        )
+
+        self.assertEqual(result.reason, "浮盈超过10%且临近压力，减仓保护")
+        self.assertEqual(result.shares, 300)
+        self.assertEqual(result.next_sell_stage, "sold_1r")
+
+    def test_heavy_volume_stagnation_clears_high_profit_position(self) -> None:
+        result = sell_decision(
+            {"current_price": 11.8, "stop_loss": 9, "target_price_1": 0, "change_rate": 1, "risk": "放量滞涨，上影线较长"},
+            {"shares": 1000, "cost_price": 10, "sell_stage": "sold_1r"},
+        )
+
+        self.assertEqual(result.reason, "浮盈超过15%且放量滞涨，清仓保护利润")
+        self.assertEqual(result.shares, 1000)
+        self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_high_profit_strong_limit_up_records_protection_without_selling(self) -> None:
+        result = sell_decision(
+            {"current_price": 12.6, "stop_loss": 9, "target_price_1": 0, "change_rate": 10.01},
+            {"shares": 1000, "cost_price": 10, "sell_stage": "none", "trailing_stop_price": 10.5},
+        )
+
+        self.assertEqual(result.reason, "浮盈超过25%且强势涨停，暂不卖出，抬高移动止损保护利润")
+        self.assertEqual(result.shares, 0)
+        self.assertEqual(result.execution_status, "blocked")
+        self.assertEqual(result.next_sell_stage, "trailing_stop")
+        self.assertGreater(result.trailing_stop_price, 10.5)
+
     def test_trailing_stop_break_clears_remaining_shares(self) -> None:
         result = sell_decision(
             {"current_price": 10.9, "stop_loss": 9, "target_price_1": 11, "change_rate": -3},
@@ -164,6 +207,32 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertGreater(position_patch["trailing_stop_price"], 10.5)
         self.assertEqual(signal_patch["execution_status"], "blocked")
         self.assertIn("强势涨停", signal_patch["execution_reason"])
+
+    def test_high_profit_protection_sell_is_visible_in_order_history(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {"code": "000001", "name": "平安银行", "current_price": 12.6, "target_price_1": 0}
+        position = {
+            "id": "position-1",
+            "code": "000001",
+            "name": "平安银行",
+            "shares": 1000,
+            "cost_price": 10,
+            "buy_date": "2026-06-25",
+            "sell_stage": "none",
+        }
+        decision_result = sell_decision(decision, position)
+
+        sell_position(client, decision, position, [position], [], decision_result.reason, decision_result.shares, decision_result)
+
+        order_posts = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ]
+        self.assertEqual(len(order_posts), 1)
+        order_payload = order_posts[0][2][0]
+        self.assertEqual(order_payload["side"], "sell")
+        self.assertEqual(order_payload["reason"], "浮盈超过25%，普通持仓强制减仓保护")
+        self.assertEqual(order_payload["shares"], 500)
 
 
 if __name__ == "__main__":
