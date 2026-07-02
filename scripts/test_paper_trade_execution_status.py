@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 import sys
 import unittest
@@ -137,6 +138,59 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertEqual(result.next_sell_stage, "trailing_stop")
         self.assertGreater(result.trailing_stop_price, 10.5)
 
+    def test_consecutive_limit_up_tracks_board_strength_without_selling(self) -> None:
+        result = sell_decision(
+            {
+                "current_price": 13.31,
+                "stop_loss": 9,
+                "target_price_1": 11,
+                "change_rate": 10.02,
+                "final_action": "连续涨停，封单强，继续跟踪",
+                "limit_up_days": 2,
+            },
+            {"shares": 1000, "cost_price": 10, "sell_stage": "sold_1r", "trailing_stop_price": 11.2},
+        )
+
+        self.assertEqual(result.reason, "连续涨停且封板强，暂不卖出，继续抬高移动止损")
+        self.assertEqual(result.shares, 0)
+        self.assertEqual(result.execution_status, "blocked")
+        self.assertEqual(result.next_sell_stage, "trailing_stop")
+        self.assertGreater(result.trailing_stop_price, 11.2)
+
+    def test_heavy_volume_board_break_reduces_position(self) -> None:
+        result = sell_decision(
+            {
+                "current_price": 12.4,
+                "stop_loss": 9,
+                "target_price_1": 11,
+                "change_rate": 6.2,
+                "risk": "放量炸板，封板松动",
+            },
+            {"shares": 1000, "cost_price": 10, "sell_stage": "trailing_stop", "trailing_stop_price": 11},
+        )
+
+        self.assertEqual(result.reason, "放量炸板，减仓保护利润")
+        self.assertEqual(result.shares, 500)
+        self.assertEqual(result.next_sell_stage, "sold_2r")
+        self.assertEqual(result.last_profit_taking_price, 12.4)
+
+    def test_failed_reseal_after_board_break_clears_position(self) -> None:
+        result = sell_decision(
+            {
+                "current_price": 11.6,
+                "stop_loss": 9,
+                "target_price_1": 11,
+                "change_rate": 2.1,
+                "sell_reason": "炸板后回封失败，资金承接转弱",
+            },
+            {"shares": 1000, "cost_price": 10, "sell_stage": "trailing_stop", "trailing_stop_price": 11},
+        )
+
+        self.assertEqual(result.reason, "炸板后回封失败，清仓保护利润")
+        self.assertEqual(result.shares, 1000)
+        self.assertEqual(result.next_sell_stage, "closed")
+        self.assertEqual(result.last_profit_taking_price, 11.6)
+
     def test_trailing_stop_break_clears_remaining_shares(self) -> None:
         result = sell_decision(
             {"current_price": 10.9, "stop_loss": 9, "target_price_1": 11, "change_rate": -3},
@@ -233,6 +287,98 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertEqual(order_payload["side"], "sell")
         self.assertEqual(order_payload["reason"], "浮盈超过25%，普通持仓强制减仓保护")
         self.assertEqual(order_payload["shares"], 500)
+
+    def test_same_day_sell_is_blocked_and_recorded_as_order(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {"code": "000001", "name": "Ping An", "current_price": 11}
+        position = {
+            "id": "position-1",
+            "code": "000001",
+            "name": "Ping An",
+            "shares": 1000,
+            "cost_price": 10,
+            "buy_date": date.today().isoformat(),
+            "sell_stage": "none",
+        }
+
+        result = sell_position(client, decision, position, [position], [], "test sell", 500)
+
+        self.assertEqual(result, position)
+        order_payload = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0][2][0]
+        self.assertEqual(order_payload["status"], "blocked")
+        self.assertEqual(order_payload["shares"], 0)
+        self.assertIn("T+1", order_payload["failure_reason"])
+
+    def test_limit_down_sell_is_blocked_and_recorded_as_order(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {"code": "000001", "name": "Ping An", "current_price": 9, "change_rate": -10.01}
+        position = {
+            "id": "position-1",
+            "code": "000001",
+            "name": "Ping An",
+            "shares": 1000,
+            "cost_price": 10,
+            "buy_date": "2026-06-25",
+            "sell_stage": "none",
+        }
+
+        sell_position(client, decision, position, [position], [], "test sell", 500)
+
+        order_payload = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0][2][0]
+        self.assertEqual(order_payload["status"], "blocked")
+        self.assertIn("limit-down", order_payload["failure_reason"])
+
+    def test_suspended_stock_buy_is_blocked_and_recorded_as_order(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {
+            "code": "000001",
+            "name": "Ping An",
+            "current_price": 10,
+            "suggest_buy_price": 10,
+            "can_buy": True,
+            "status": "suspended",
+        }
+
+        result = buy_position(client, decision, [], [])
+
+        self.assertIsNone(result)
+        order_payload = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0][2][0]
+        self.assertEqual(order_payload["status"], "blocked")
+        self.assertIn("suspended", order_payload["failure_reason"])
+
+    def test_sell_fees_and_slippage_reduce_cash_and_realized_pnl(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {"code": "000001", "name": "Ping An", "current_price": 11}
+        position = {
+            "id": "position-1",
+            "code": "000001",
+            "name": "Ping An",
+            "shares": 1000,
+            "cost_price": 10,
+            "buy_date": "2026-06-25",
+            "sell_stage": "none",
+        }
+
+        sell_position(client, decision, position, [position], [], "test sell", 500)
+
+        order_payload = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0][2][0]
+        self.assertLess(order_payload["price"], 11)
+        self.assertGreater(order_payload["fee_amount"], 0)
+        self.assertGreater(order_payload["slippage_amount"], 0)
+        self.assertLess(order_payload["realized_pnl"], 500)
+        self.assertLess(order_payload["cash_after"], order_payload["cash_before"] + 5500)
 
 
 if __name__ == "__main__":

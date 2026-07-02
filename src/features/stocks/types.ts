@@ -229,6 +229,8 @@ export interface PaperTradeOrder {
   price: number
   shares: number
   amount: number
+  feeAmount: number
+  slippageAmount: number
   cashBefore: number
   cashAfter: number
   realizedPnl: number

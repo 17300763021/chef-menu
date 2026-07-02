@@ -446,8 +446,12 @@ export default function StockDashboard() {
     { header: '价格', cell: (row) => formatPrice(row.price), align: 'right' },
     { header: '股数', cell: (row) => row.shares, align: 'right' },
     { header: '金额', cell: (row) => formatMoney(row.amount), align: 'right' },
+    { header: '费用', cell: (row) => formatMoney(row.feeAmount), align: 'right' },
+    { header: '滑点', cell: (row) => formatMoney(row.slippageAmount), align: 'right' },
     { header: '实现盈亏', cell: (row) => <ColorNumber value={row.realizedPnl} />, align: 'right' },
+    { header: '状态', cell: (row) => <StatusTag status={row.status || 'filled'} /> },
     { header: '触发原因', cell: (row) => row.reason },
+    { header: '阻断/失败', cell: (row) => row.failureReason || '-' },
   ]
 
   paperOrderColumns.push({

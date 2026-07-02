@@ -67,6 +67,8 @@ describe('stock repository', () => {
         price: 11,
         shares: 100,
         amount: 1100,
+        fee_amount: 6,
+        slippage_amount: 1.1,
         cash_before: 0,
         cash_after: 1100,
         realized_pnl: 100,
@@ -89,6 +91,8 @@ describe('stock repository', () => {
     await expect(repository.getPaperTradeOrders()).resolves.toMatchObject([{
       orderTime: '2026-06-24 13:55:28',
       orderDate: '2026-06-24',
+      feeAmount: 6,
+      slippageAmount: 1.1,
     }])
   })
 

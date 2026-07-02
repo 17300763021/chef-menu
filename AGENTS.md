@@ -117,7 +117,7 @@ Acceptance checks:
 
 ### P1: Automatic Sell Rule Upgrade
 
-Status: In Progress
+Status: Completed
 
 Goal: Fix the current weakness where losses can trigger full exits but profitable positions mostly only show suggestions or partial exits.
 
@@ -155,17 +155,15 @@ Known completed work:
 
 - 2026-06-29: Added P1-MVP automatic sell lifecycle for simulation paper trading. Implemented sell stage tracking fields, stop-loss clear, 1R partial sell, 2R normal-stock profit-taking, strong limit-up skip with raised trailing stop, trailing-stop clear, linked signal status writes, and deterministic Python fixtures.
 - 2026-06-30: Added P1 profit-protection sell layer for simulation paper trading. Implemented 10% profit near-pressure reduction, 15% profit heavy-volume stagnation clear, 25% high-profit ordinary holding protection sell, 25% high-profit strong-limit-up skip with raised trailing stop, and order-history fixture coverage so automatic protection sells appear in execution records.
+- 2026-07-02: Added P1 board-break protection layer for simulation paper trading. Implemented consecutive limit-up board-strength skip with raised trailing stop, heavy-volume board-break reduction, failed re-seal clear, and deterministic Python fixture coverage for each trigger.
 
 Remaining work:
 
-- Add consecutive limit-up board-strength tracking.
-- Add heavy-volume board-break reduction.
-- Add failed re-seal after board-break clear/sharp-reduce.
-- Verify UI displays the exact automatic sell trigger rule after online deployment and migration.
+- No P1 blocker remains. Defer non-essential wording, layout, and polish optimization until after roadmap progression.
 
 ### P2: A-Share Trading Constraints
 
-Status: Pending
+Status: In Progress
 
 Goal: Make virtual trading closer to real A-share trading.
 
@@ -187,6 +185,16 @@ Acceptance checks:
 - Suspended stock order is blocked.
 - Non-lot shares are rounded down.
 - Fees and slippage change cash and PnL.
+
+Known completed work:
+
+- 2026-07-02: Added P2-MVP simulation trading constraints. Implemented T+1 same-day sell blocking, suspended-stock order blocking, limit-down sell blocking, limit-up buy blocking, board-lot rounding coverage, configurable slippage and fees, blocked/failed virtual order records, fee/slippage order metadata, and UI order columns for cost and blocked/failure reasons.
+
+Remaining work:
+
+- Apply the fee/slippage metadata migration online when Supabase migration tooling is available. The paper trading engine currently falls back to legacy order columns if the online table has not been migrated yet.
+- Add explicit fixture coverage for limit-up buy blocking.
+- Add broader fee schedule review and UI wording polish after the first online run.
 
 ### P3: Professional Backtest Center
 

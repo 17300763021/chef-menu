@@ -24,6 +24,11 @@ TRAILING_STOP_RATE = float(os.environ.get("STOCK_PAPER_TRAILING_STOP_RATE", "0.9
 PRESSURE_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_PRESSURE_PROFIT_RATE", "10"))
 STAGNATION_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_STAGNATION_PROFIT_RATE", "15"))
 HIGH_PROFIT_PROTECTION_RATE = float(os.environ.get("STOCK_PAPER_HIGH_PROFIT_RATE", "25"))
+DEFAULT_SLIPPAGE_RATE = float(os.environ.get("STOCK_PAPER_SLIPPAGE_RATE", "0.001"))
+COMMISSION_RATE = float(os.environ.get("STOCK_PAPER_COMMISSION_RATE", "0.0003"))
+MIN_COMMISSION = float(os.environ.get("STOCK_PAPER_MIN_COMMISSION", "5"))
+STAMP_DUTY_RATE = float(os.environ.get("STOCK_PAPER_STAMP_DUTY_RATE", "0.0005"))
+TRANSFER_FEE_RATE = float(os.environ.get("STOCK_PAPER_TRANSFER_FEE_RATE", "0.00001"))
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +85,35 @@ def is_strong_limit_up(decision: dict[str, Any]) -> bool:
     return number(decision.get("change_rate")) >= 9.7 or "涨停" in text_value or "limit-up" in text_value.lower()
 
 
+def is_limit_down(decision: dict[str, Any]) -> bool:
+    text_value = decision_text(decision)
+    return number(decision.get("change_rate")) <= -9.7 or "跌停" in text_value or "limit-down" in text_value.lower()
+
+
+def is_suspended(decision: dict[str, Any]) -> bool:
+    return has_any_text(decision_text(decision), ("停牌", "suspended", "halted"))
+
+
+def execution_price(side: str, price: float) -> float:
+    if price <= 0:
+        return price
+    direction = 1 if side == "buy" else -1
+    return round(price * (1 + direction * DEFAULT_SLIPPAGE_RATE), 4)
+
+
+def trading_fee(side: str, gross_amount: float) -> float:
+    if gross_amount <= 0:
+        return 0
+    commission = max(MIN_COMMISSION, gross_amount * COMMISSION_RATE)
+    stamp_duty = gross_amount * STAMP_DUTY_RATE if side == "sell" else 0
+    transfer_fee = gross_amount * TRANSFER_FEE_RATE
+    return round(commission + stamp_duty + transfer_fee, 2)
+
+
+def slippage_amount(raw_price: float, executed_price: float, shares: int) -> float:
+    return round(abs(executed_price - raw_price) * shares, 2)
+
+
 def next_trailing_stop(decision: dict[str, Any], position: dict[str, Any]) -> float:
     price = number(decision.get("current_price"))
     existing = number(position.get("trailing_stop_price"))
@@ -121,6 +155,33 @@ def is_heavy_volume_stagnation(decision: dict[str, Any]) -> bool:
     return has_any_text(
         decision_text(decision),
         ("放量滞涨", "量价背离", "放量不涨", "冲高回落", "上影线", "封板松动", "炸板"),
+    )
+
+
+def is_consecutive_limit_up(decision: dict[str, Any]) -> bool:
+    limit_up_days = integer(
+        decision.get("limit_up_days")
+        or decision.get("consecutive_limit_up_days")
+        or decision.get("board_count")
+        or decision.get("limit_up_count")
+    )
+    return limit_up_days >= 2 or has_any_text(
+        decision_text(decision),
+        ("连续涨停", "连板", "二连板", "三连板", "多连板", "封单强"),
+    )
+
+
+def is_heavy_volume_board_break(decision: dict[str, Any]) -> bool:
+    return has_any_text(
+        decision_text(decision),
+        ("放量炸板", "爆量炸板", "炸板", "封板松动", "打开涨停", "涨停打开"),
+    )
+
+
+def is_failed_reseal(decision: dict[str, Any]) -> bool:
+    return has_any_text(
+        decision_text(decision),
+        ("回封失败", "未能回封", "封板失败", "炸板后回封失败", "资金承接转弱"),
     )
 
 
@@ -312,9 +373,12 @@ def insert_order(
     after_shares: int,
     pnl: float = 0,
     failure_reason: str = "",
+    status: str = "filled",
+    fee_amount: float = 0,
+    order_slippage_amount: float = 0,
 ) -> str:
     source_signal_id = signal_event_id(client, decision)
-    rows = client.request("POST", "stock_auto_trade_orders", [{
+    payload = {
         "order_date": date.today().isoformat(),
         "code": str(decision.get("code", "")).zfill(6),
         "name": decision.get("name", ""),
@@ -328,13 +392,51 @@ def insert_order(
         "position_shares_before": before_shares,
         "position_shares_after": after_shares,
         "realized_pnl": pnl,
-        "status": "filled",
+        "status": status,
         "source_signal_id": source_signal_id or None,
         "failure_reason": failure_reason,
+        "fee_amount": fee_amount,
+        "slippage_amount": order_slippage_amount,
         "source_decision_date": decision.get("decision_date"),
         "source_update_time": decision.get("update_time", ""),
-    }], prefer="return=representation")
+    }
+    try:
+        rows = client.request("POST", "stock_auto_trade_orders", [payload], prefer="return=representation")
+    except RuntimeError as error:
+        if "fee_amount" not in str(error) and "slippage_amount" not in str(error):
+            raise
+        fallback_payload = dict(payload)
+        fallback_payload.pop("fee_amount", None)
+        fallback_payload.pop("slippage_amount", None)
+        rows = client.request("POST", "stock_auto_trade_orders", [fallback_payload], prefer="return=representation")
     return str(rows[0].get("id", "")) if rows else ""
+
+
+def record_unfilled_order(
+    client: SupabaseRest,
+    decision: dict[str, Any],
+    side: str,
+    reason: str,
+    status: str,
+    failure_reason: str,
+    price: float = 0,
+    before_shares: int = 0,
+) -> str:
+    return insert_order(
+        client,
+        decision,
+        side,
+        reason,
+        price,
+        0,
+        cash_before=0,
+        cash_after=0,
+        before_shares=before_shares,
+        after_shares=before_shares,
+        pnl=0,
+        failure_reason=failure_reason,
+        status=status,
+    )
 
 
 def buy_position(
@@ -345,6 +447,16 @@ def buy_position(
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_buy_price")) or number(decision.get("current_price"))
     stop_loss = number(decision.get("stop_loss"))
+    if is_suspended(decision):
+        reason = "自动模拟买入受阻：股票停牌，不能交易"
+        order_id = record_unfilled_order(client, decision, "buy", "blocked buy", "blocked", "suspended stock", price)
+        record_signal_execution(client, decision, "blocked", reason, order_id)
+        return None
+    if is_strong_limit_up(decision):
+        reason = "自动模拟买入受阻：涨停买入成交概率低，未生成虚拟订单"
+        order_id = record_unfilled_order(client, decision, "buy", "blocked buy", "blocked", "limit-up buy blocked", price)
+        record_signal_execution(client, decision, "blocked", reason, order_id)
+        return None
     if price <= 0:
         record_signal_execution(client, decision, "failed", "自动模拟买入失败：价格无效，未生成虚拟订单")
         return None
@@ -361,18 +473,20 @@ def buy_position(
     risk_per_share = price - stop_loss if stop_loss > 0 and price > stop_loss else price * 0.06
     risk_amount_cap = INITIAL_CAPITAL * RISK_RATE / risk_per_share * price
     allowed_amount = max(0, min(available_cash, target_amount, max_single_amount, risk_amount_cap))
-    shares = round_lot(allowed_amount / price)
+    executed_price = execution_price("buy", price)
+    shares = round_lot(allowed_amount / executed_price)
     if shares <= 0:
         record_signal_execution(client, decision, "blocked", "自动模拟买入受阻：可用现金或风险预算不足 100 股")
         return None
 
-    market = price * shares
+    market = executed_price * shares
+    fee = trading_fee("buy", market)
     payload = {
         "code": str(decision.get("code", "")).zfill(6),
         "name": decision.get("name", ""),
-        "cost_price": price,
+        "cost_price": executed_price,
         "shares": shares,
-        "current_price": price,
+        "current_price": executed_price,
         "market_value": market,
         "floating_pnl": 0,
         "pnl_rate": 0,
@@ -383,8 +497,21 @@ def buy_position(
         "status": "open",
     }
     rows = client.request("POST", "stock_positions", payload, prefer="return=representation")
-    cash_after = cash - market
-    order_id = insert_order(client, decision, "buy", "can_buy signal", price, shares, cash, cash_after, 0, shares)
+    cash_after = cash - market - fee
+    order_id = insert_order(
+        client,
+        decision,
+        "buy",
+        "can_buy signal",
+        executed_price,
+        shares,
+        cash,
+        cash_after,
+        0,
+        shares,
+        fee_amount=fee,
+        order_slippage_amount=slippage_amount(price, executed_price, shares),
+    )
     record_signal_execution(client, decision, "auto_executed", "自动模拟买入已执行", order_id)
     return rows[0] if rows else payload
 
@@ -400,23 +527,41 @@ def sell_position(
     decision_result: SellDecision | None = None,
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_sell_price")) or number(decision.get("current_price"))
+    shares = integer(position.get("shares"))
     if price <= 0:
         record_signal_execution(client, decision, "failed", "自动模拟卖出失败：价格无效，未生成虚拟订单")
+        return position
+    if str(position.get("buy_date") or "") == date.today().isoformat():
+        reason_text = "\u81ea\u52a8\u6a21\u62df\u5356\u51fa\u53d7\u963b\uff1aA\u80a1 T+1 \u7ea6\u675f\uff0c\u5f53\u65e5\u4e70\u5165\u4e0d\u80fd\u5f53\u65e5\u5356\u51fa"
+        order_id = record_unfilled_order(client, decision, "sell", reason, "blocked", "T+1 same-day sell blocked", price, shares)
+        record_signal_execution(client, decision, "blocked", reason_text, order_id)
+        return position
+    if is_suspended(decision):
+        reason_text = "自动模拟卖出受阻：股票停牌，不能交易"
+        order_id = record_unfilled_order(client, decision, "sell", reason, "blocked", "suspended stock", price, shares)
+        record_signal_execution(client, decision, "blocked", reason_text, order_id)
+        return position
+    if is_limit_down(decision):
+        reason_text = "自动模拟卖出受阻：跌停卖出成交概率低，未生成成交订单"
+        order_id = record_unfilled_order(client, decision, "sell", reason, "blocked", "limit-down sell blocked", price, shares)
+        record_signal_execution(client, decision, "blocked", reason_text, order_id)
         return position
     if shares_to_sell <= 0:
         record_signal_execution(client, decision, "blocked", "自动模拟卖出受阻：策略未给出可卖股数")
         return position
 
-    shares = integer(position.get("shares"))
     shares_to_sell = min(shares, round_lot(shares_to_sell))
     if shares_to_sell <= 0:
         record_signal_execution(client, decision, "blocked", "自动模拟卖出受阻：可卖股数不足 100 股")
         return position
 
+    executed_price = execution_price("sell", price)
+    gross_amount = executed_price * shares_to_sell
+    fee = trading_fee("sell", gross_amount)
     cost_price = number(position.get("cost_price"))
-    pnl = (price - cost_price) * shares_to_sell
+    pnl = (executed_price - cost_price) * shares_to_sell - fee
     cash = cash_balance(positions, trades)
-    cash_after = cash + price * shares_to_sell
+    cash_after = cash + gross_amount - fee
     next_shares = shares - shares_to_sell
     is_cleared = next_shares <= 0
     sell_state = decision_result or SellDecision(reason, shares_to_sell, "closed" if is_cleared else position_sell_stage(position))
@@ -427,10 +572,10 @@ def sell_position(
         "buy_date": position.get("buy_date") or date.today().isoformat(),
         "sell_date": date.today().isoformat(),
         "cost_price": cost_price,
-        "sell_price": price,
+        "sell_price": executed_price,
         "shares": shares_to_sell,
         "pnl_amount": pnl,
-        "pnl_rate": (price - cost_price) / cost_price * 100 if cost_price > 0 else 0,
+        "pnl_rate": pnl / (cost_price * shares_to_sell) * 100 if cost_price > 0 and shares_to_sell > 0 else 0,
         "buy_memo": position.get("buy_memo", ""),
         "sell_memo": f"自动模拟卖出：{reason}",
         "is_cleared": is_cleared,
@@ -442,10 +587,10 @@ def sell_position(
             f"stock_positions?id=eq.{position['id']}",
             {
                 "shares": 0,
-                "current_price": price,
+                "current_price": executed_price,
                 "market_value": 0,
                 "floating_pnl": pnl,
-                "pnl_rate": (price - cost_price) / cost_price * 100 if cost_price > 0 else 0,
+                "pnl_rate": pnl / (cost_price * shares_to_sell) * 100 if cost_price > 0 and shares_to_sell > 0 else 0,
                 "current_suggestion": f"自动模拟清仓：{reason}",
                 "status": "closed",
                 **sell_state_payload(sell_state),
@@ -457,7 +602,7 @@ def sell_position(
         next_position = update_position_price(
             client,
             {**position, "shares": next_shares},
-            price,
+            executed_price,
             f"自动模拟减仓：{reason}",
         )
         client.request(
@@ -475,13 +620,15 @@ def sell_position(
         decision,
         "sell",
         reason,
-        price,
+        executed_price,
         shares_to_sell,
         cash,
         cash_after,
         shares,
         next_shares,
         pnl,
+        fee_amount=fee,
+        order_slippage_amount=slippage_amount(price, executed_price, shares_to_sell),
     )
     record_signal_execution(client, decision, "auto_executed", f"自动模拟卖出已执行：{reason}", order_id)
     return next_position
@@ -501,6 +648,20 @@ def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDec
         return SellDecision("触发止损", shares, "closed")
     if price > 0 and trailing_stop > 0 and price <= trailing_stop:
         return SellDecision("跌破移动止损", shares, "closed")
+    if price > 0 and is_failed_reseal(decision):
+        return SellDecision("炸板后回封失败，清仓保护利润", shares, "closed", last_profit_taking_price=price)
+    if price > 0 and is_heavy_volume_board_break(decision):
+        sell_shares = partial_sell_shares(shares, 0.5)
+        next_stage = "closed" if sell_shares >= shares else "sold_2r"
+        return SellDecision("放量炸板，减仓保护利润", sell_shares, next_stage, last_profit_taking_price=price)
+    if price > 0 and is_consecutive_limit_up(decision) and is_strong_limit_up(decision):
+        return SellDecision(
+            "连续涨停且封板强，暂不卖出，继续抬高移动止损",
+            0,
+            "trailing_stop",
+            trailing_stop_price=next_trailing_stop(decision, position),
+            execution_status="blocked",
+        )
     if price > 0 and pnl_rate >= HIGH_PROFIT_PROTECTION_RATE and is_strong_limit_up(decision):
         return SellDecision(
             "浮盈超过25%且强势涨停，暂不卖出，抬高移动止损保护利润",

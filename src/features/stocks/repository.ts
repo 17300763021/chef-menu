@@ -316,6 +316,8 @@ function mapPaperTradeOrder(row: Row): PaperTradeOrder {
     price: numberValue(row, 'price'),
     shares: numberValue(row, 'shares'),
     amount: numberValue(row, 'amount'),
+    feeAmount: numberValue(row, 'fee_amount'),
+    slippageAmount: numberValue(row, 'slippage_amount'),
     cashBefore: numberValue(row, 'cash_before'),
     cashAfter: numberValue(row, 'cash_after'),
     realizedPnl: numberValue(row, 'realized_pnl'),
