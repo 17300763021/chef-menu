@@ -161,12 +161,13 @@ def net_trade_result(entry_price: float, exit_price: float, shares: int) -> dict
     }
 
 
-def recent_picks(client: SupabaseRest) -> list[dict[str, Any]]:
-    start = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
+def recent_picks(client: SupabaseRest, end_date: str | None = None) -> list[dict[str, Any]]:
+    end = date.fromisoformat(end_date) if end_date else backtest_end_date()
+    start = (end - timedelta(days=LOOKBACK_DAYS)).isoformat()
     rows = client.request(
         "GET",
         "stock_strong_picks"
-        f"?scan_date=gte.{start}&select=*&order=scan_date.desc,score.desc&limit={PICK_LIMIT}",
+        f"?scan_date=gte.{start}&scan_date=lte.{end.isoformat()}&select=*&order=scan_date.desc,score.desc&limit={PICK_LIMIT}",
     )
     return rows or []
 
@@ -179,17 +180,36 @@ def bought_keys(client: SupabaseRest) -> set[tuple[str, str]]:
     return keys
 
 
+def backtest_end_date() -> date:
+    configured = os.environ.get("STOCK_BACKTEST_END_DATE", "").strip()
+    if configured:
+        return date.fromisoformat(configured)
+    return date.today()
+
+
 def stock_history(code: str, start_date: str, end_date: str) -> Any:
+    if os.environ.get("STOCK_BACKTEST_HISTORY_SOURCE", "").lower() == "cache":
+        return cached_stock_history(code, start_date, end_date)
     ak, _, pd = load_backtest_dependencies()
-    raw = ak.stock_zh_a_hist(
-        symbol=str(code).zfill(6),
-        period="daily",
-        start_date=start_date.replace("-", ""),
-        end_date=end_date.replace("-", ""),
-        adjust="qfq",
-    )
+    cache_frame = None
+    try:
+        raw = ak.stock_zh_a_hist(
+            symbol=str(code).zfill(6),
+            period="daily",
+            start_date=start_date.replace("-", ""),
+            end_date=end_date.replace("-", ""),
+            adjust="qfq",
+        )
+    except Exception:
+        cache_frame = cached_stock_history(code, start_date, end_date)
+        raw = cache_frame
+    if raw.empty:
+        cache_frame = cached_stock_history(code, start_date, end_date)
+        raw = cache_frame
     if raw.empty:
         return raw
+    if cache_frame is not None and not cache_frame.empty:
+        return cache_frame
     columns = list(raw.columns)
     frame = raw.rename(columns={
         columns[0]: "datetime",
@@ -199,6 +219,27 @@ def stock_history(code: str, start_date: str, end_date: str) -> Any:
         columns[4]: "low",
         columns[5]: "volume",
     })
+    frame["datetime"] = pd.to_datetime(frame["datetime"])
+    frame = frame.set_index("datetime")
+    return frame[["open", "high", "low", "close", "volume"]].astype(float)
+
+
+def cached_stock_history(code: str, start_date: str, end_date: str) -> Any:
+    _, _, pd = load_backtest_dependencies()
+    client = get_client()
+    rows = client.request(
+        "GET",
+        "stock_daily_history"
+        f"?code=eq.{str(code).zfill(6)}"
+        "&adjustment=eq.qfq"
+        f"&trade_date=gte.{start_date}"
+        f"&trade_date=lte.{end_date}"
+        "&select=trade_date,open,high,low,close,volume"
+        "&order=trade_date.asc",
+    ) or []
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows).rename(columns={"trade_date": "datetime"})
     frame["datetime"] = pd.to_datetime(frame["datetime"])
     frame = frame.set_index("datetime")
     return frame[["open", "high", "low", "close", "volume"]].astype(float)
@@ -439,6 +480,15 @@ def build_date_splits(start_date: str, end_date: str) -> list[dict[str, str]]:
         raise ValueError("end_date must be on or after start_date")
     total_days = max(1, (end - start).days + 1)
     names = ["in_sample", "validation", "test", "out_of_sample"]
+    if total_days < len(names):
+        splits: list[dict[str, str]] = []
+        for index, name in enumerate(names):
+            if index < total_days:
+                split_date = start + timedelta(days=index)
+                splits.append({"name": name, "start_date": split_date.isoformat(), "end_date": split_date.isoformat()})
+            else:
+                splits.append({"name": name, "start_date": "", "end_date": ""})
+        return splits
     weights = [0.6, 0.2, 0.1, 0.1]
     lengths = [max(1, int(total_days * weight)) for weight in weights]
     while sum(lengths) > total_days:
@@ -463,6 +513,17 @@ def build_date_splits(start_date: str, end_date: str) -> list[dict[str, str]]:
 def split_trade_metrics(trades: list[dict[str, Any]], splits: list[dict[str, str]]) -> dict[str, dict[str, float]]:
     metrics: dict[str, dict[str, float]] = {}
     for split in splits:
+        if not split["start_date"] or not split["end_date"]:
+            metrics[split["name"]] = {
+                "start_date": split["start_date"],
+                "end_date": split["end_date"],
+                "trade_count": 0,
+                "total_return_rate": 0,
+                "max_drawdown_rate": 0,
+                "win_rate": 0,
+                "profit_loss_ratio": 0,
+            }
+            continue
         start = date.fromisoformat(split["start_date"])
         end = date.fromisoformat(split["end_date"])
         split_trades = [
@@ -577,9 +638,10 @@ def insert_results(
     benchmark_rate: float,
     dry_run: bool,
     benchmark_details: dict[str, float] | None = None,
+    report_end_date: str | None = None,
 ) -> dict[str, Any]:
     start_date = min(str(item.get("scan_date")) for item in picks)
-    end_date = date.today().isoformat()
+    end_date = report_end_date or date.today().isoformat()
     metrics = summarize(trades)
     details = benchmark_details or {}
     reconciliation = reconcile_equity_curve(trades, curve)
@@ -667,10 +729,10 @@ def insert_results(
 
 def run(dry_run: bool = False) -> dict[str, Any]:
     client = get_client()
-    picks = recent_picks(client)
+    end = backtest_end_date()
+    picks = recent_picks(client, end.isoformat())
     if not picks:
         return {"picks": 0, "trades": 0, "missed": 0}
-    end = date.today()
     orders = bought_keys(client)
     trades: list[dict[str, Any]] = []
     missed: list[dict[str, Any]] = []
@@ -692,7 +754,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     start_date = min(str(item.get("scan_date")) for item in picks)
     benchmark_details = index_benchmark_returns(start_date, end.isoformat())
     curve = equity_curve(trades, benchmark_rate)
-    return insert_results(client, picks, trades, missed, curve, benchmark_rate, dry_run, benchmark_details)
+    return insert_results(client, picks, trades, missed, curve, benchmark_rate, dry_run, benchmark_details, end.isoformat())
 
 
 def main() -> int:

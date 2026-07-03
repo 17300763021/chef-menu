@@ -15,6 +15,7 @@ import csv
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -84,11 +85,13 @@ def timestamp_from_text(value: str) -> str:
 
 
 class SupabaseRest:
-    def __init__(self, url: str, key: str) -> None:
+    def __init__(self, url: str, key: str, max_attempts: int = 3, retry_delay_seconds: float = 1.0) -> None:
         if not url or not key:
             raise SystemExit("缺少 SUPABASE_SERVICE_ROLE_KEY 或 VITE_SUPABASE_URL。")
         self.base_url = url.rstrip("/") + "/rest/v1"
         self.key = key
+        self.max_attempts = max(1, max_attempts)
+        self.retry_delay_seconds = max(0.0, retry_delay_seconds)
 
     def request(self, method: str, path: str, body: Any | None = None, prefer: str | None = None) -> Any:
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -100,15 +103,22 @@ class SupabaseRest:
         if prefer:
             headers["Prefer"] = prefer
         request = Request(f"{self.base_url}/{path}", data=data, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=30) as response:
-                payload = response.read().decode("utf-8")
-                return json.loads(payload) if payload else None
-        except HTTPError as error:
-            message = error.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"Supabase {method} {path} failed: {error.code} {message}") from error
-        except URLError as error:
-            raise RuntimeError(f"Supabase network failed: {error}") from error
+        last_network_error: URLError | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                with urlopen(request, timeout=30) as response:
+                    payload = response.read().decode("utf-8")
+                    return json.loads(payload) if payload else None
+            except HTTPError as error:
+                message = error.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"Supabase {method} {path} failed: {error.code} {message}") from error
+            except URLError as error:
+                last_network_error = error
+                if attempt >= self.max_attempts:
+                    break
+                if self.retry_delay_seconds:
+                    time.sleep(self.retry_delay_seconds)
+        raise RuntimeError(f"Supabase network failed after {self.max_attempts} attempts: {last_network_error}") from last_network_error
 
     def delete_equals(self, table: str, column: str, value: str) -> None:
         self.request("DELETE", f"{table}?{column}=eq.{quote(value)}", prefer="return=minimal")

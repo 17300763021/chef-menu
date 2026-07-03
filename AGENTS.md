@@ -197,7 +197,7 @@ Remaining work:
 
 ### P3: Professional Backtest Center
 
-Status: In Progress
+Status: Completed
 
 Goal: Upgrade existing backtest/replay scripts into a professional strategy evaluation center.
 
@@ -224,11 +224,11 @@ Known completed work:
 - 2026-07-03: Verified local P3-MVP unit tests, frontend mapping tests, full Python test group, full Vitest suite, production build, and backtest dry-run payload generation. Local dry-run could not produce sample trades because the local Python environment is missing `backtrader`, although the project requirements file already includes it.
 - 2026-07-03: Completed P3 online metrics migration verification and dependency-complete online backtest write check. Verified Supabase professional metrics fields are readable, installed the declared `backtrader` dependency, ran a real backtest write with 34 trades, 34 equity-curve points, 2 missed runners, nonzero fee/slippage on every trade, and verified final value reconciles with trade PnL and the last equity-curve point.
 - 2026-07-03: Added P3 audit layer locally. Implemented deterministic trade-list versus equity-curve reconciliation tests, date split metrics for in-sample/validation/test/out-of-sample periods, deterministic parameter sensitivity cases, CSI300/CSI500 benchmark return hooks with graceful fallback when data is unavailable, a P3 audit-field Supabase migration, and UI/repository mapping for CSI benchmark and reconciliation fields.
+- 2026-07-03: Completed P3 audit-field online closure. Applied the P3 audit-field migration online through the Supabase plugin, verified field write/read with a temporary schema probe and deleted it, created the online `stock_daily_history` cache table, imported 80 symbols and 78,535 cached daily rows, added Supabase REST network retry coverage, added cache-first and fixed-end-date backtest support, and verified online run `a1afb49c-54bb-4599-86d9-7ff29aca7625` wrote one trade, one equity-curve point, four sample split sections, nine sensitivity cases, and reconciled final value to trade PnL.
 
 Remaining work:
 
-- Apply the P3 audit-field migration online.
-- Verify an online run writes CSI benchmark, equity reconciliation, sample split, and sensitivity fields.
+- No P3 blocker remains. Defer broader benchmark data-source hardening and UI drill-down polish until after roadmap progression.
 
 ### P4: Qlib Model Integration
 
