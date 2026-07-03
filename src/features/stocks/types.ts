@@ -107,11 +107,17 @@ export interface BacktestRun {
   initialCash: number
   finalValue: number
   totalReturnRate: number
+  annualReturnRate: number
   benchmarkReturnRate: number
   excessReturnRate: number
   maxDrawdownRate: number
+  sharpeRatio: number
+  calmarRatio: number
   winRate: number
   profitLossRatio: number
+  turnoverRate: number
+  consecutiveLosses: number
+  largestSingleLoss: number
   tradeCount: number
   avgHoldingDays: number
   missedRunnerCount: number
@@ -130,6 +136,8 @@ export interface BacktestTrade {
   shares: number
   pnlAmount: number
   pnlRate: number
+  feeAmount: number
+  slippageAmount: number
   holdingDays: number
   exitReason: string
 }

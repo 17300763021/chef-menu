@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,11 @@ MAX_HOLD_DAYS = int(os.environ.get("STOCK_BACKTEST_MAX_HOLD_DAYS", "10"))
 LOOKBACK_DAYS = int(os.environ.get("STOCK_BACKTEST_LOOKBACK_DAYS", "90"))
 PICK_LIMIT = int(os.environ.get("STOCK_BACKTEST_PICK_LIMIT", "80"))
 MISSED_RUNNER_RATE = float(os.environ.get("STOCK_BACKTEST_MISSED_RUNNER_RATE", "15"))
+SLIPPAGE_RATE = float(os.environ.get("STOCK_BACKTEST_SLIPPAGE_RATE", os.environ.get("STOCK_PAPER_SLIPPAGE_RATE", "0.001")))
+COMMISSION_RATE = float(os.environ.get("STOCK_BACKTEST_COMMISSION_RATE", os.environ.get("STOCK_PAPER_COMMISSION_RATE", "0.0003")))
+MIN_COMMISSION = float(os.environ.get("STOCK_BACKTEST_MIN_COMMISSION", os.environ.get("STOCK_PAPER_MIN_COMMISSION", "5")))
+STAMP_DUTY_RATE = float(os.environ.get("STOCK_BACKTEST_STAMP_DUTY_RATE", os.environ.get("STOCK_PAPER_STAMP_DUTY_RATE", "0.0005")))
+TRANSFER_FEE_RATE = float(os.environ.get("STOCK_BACKTEST_TRANSFER_FEE_RATE", os.environ.get("STOCK_PAPER_TRANSFER_FEE_RATE", "0.00001")))
 DEPS: tuple[Any, Any, Any] | None = None
 
 
@@ -114,6 +120,47 @@ def number(value: Any, fallback: float = 0) -> float:
         return fallback
 
 
+def round_lot(shares: float) -> int:
+    return max(0, int(shares // 100) * 100)
+
+
+def execution_price(side: str, price: float) -> float:
+    if price <= 0:
+        return price
+    direction = 1 if side == "buy" else -1
+    return round(price * (1 + direction * SLIPPAGE_RATE), 4)
+
+
+def trading_fee(side: str, gross_amount: float) -> float:
+    if gross_amount <= 0:
+        return 0
+    commission = max(MIN_COMMISSION, gross_amount * COMMISSION_RATE)
+    stamp_duty = gross_amount * STAMP_DUTY_RATE if side == "sell" else 0
+    transfer_fee = gross_amount * TRANSFER_FEE_RATE
+    return round(commission + stamp_duty + transfer_fee, 2)
+
+
+def net_trade_result(entry_price: float, exit_price: float, shares: int) -> dict[str, float]:
+    entry_executed = execution_price("buy", entry_price)
+    exit_executed = execution_price("sell", exit_price)
+    buy_amount = entry_executed * shares
+    sell_amount = exit_executed * shares
+    buy_fee = trading_fee("buy", buy_amount)
+    sell_fee = trading_fee("sell", sell_amount)
+    fee_amount = buy_fee + sell_fee
+    slippage_cost = abs(entry_executed - entry_price) * shares + abs(exit_executed - exit_price) * shares
+    pnl = sell_amount - sell_fee - buy_amount - buy_fee
+    cost_basis = buy_amount + buy_fee
+    return {
+        "entry_price": entry_executed,
+        "exit_price": exit_executed,
+        "fee_amount": round(fee_amount, 2),
+        "slippage_amount": round(slippage_cost, 2),
+        "pnl_amount": round(pnl, 2),
+        "pnl_rate": pnl / cost_basis * 100 if cost_basis > 0 else 0,
+    }
+
+
 def recent_picks(client: SupabaseRest) -> list[dict[str, Any]]:
     start = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
     rows = client.request(
@@ -185,16 +232,31 @@ def run_single_pick(pick: dict[str, Any], end: date) -> dict[str, Any] | None:
     if not result:
         last_date = history.index[-1].date()
         last_price = float(history.iloc[-1]["close"])
+        net_result = net_trade_result(entry_price, last_price, shares)
         result = {
             "entry_date": pick_date.isoformat(),
             "exit_date": last_date.isoformat(),
-            "entry_price": entry_price,
-            "exit_price": last_price,
+            "entry_price": net_result["entry_price"],
+            "exit_price": net_result["exit_price"],
             "shares": shares,
-            "pnl_amount": (last_price - entry_price) * shares,
-            "pnl_rate": (last_price - entry_price) / entry_price * 100 if entry_price else 0,
+            "pnl_amount": net_result["pnl_amount"],
+            "pnl_rate": net_result["pnl_rate"],
+            "fee_amount": net_result["fee_amount"],
+            "slippage_amount": net_result["slippage_amount"],
             "holding_days": max(0, (last_date - pick_date).days),
             "exit_reason": "end",
+        }
+    else:
+        net_result = net_trade_result(number(result.get("entry_price")), number(result.get("exit_price")), integer_shares := int(number(result.get("shares"))))
+        result = {
+            **result,
+            "entry_price": net_result["entry_price"],
+            "exit_price": net_result["exit_price"],
+            "shares": integer_shares,
+            "pnl_amount": net_result["pnl_amount"],
+            "pnl_rate": net_result["pnl_rate"],
+            "fee_amount": net_result["fee_amount"],
+            "slippage_amount": net_result["slippage_amount"],
         }
     return {
         **result,
@@ -234,30 +296,64 @@ def summarize(trades: list[dict[str, Any]]) -> dict[str, float]:
         return {
             "final_value": INITIAL_CASH,
             "total_return_rate": 0,
+            "annual_return_rate": 0,
             "max_drawdown_rate": 0,
+            "sharpe_ratio": 0,
+            "calmar_ratio": 0,
             "win_rate": 0,
             "profit_loss_ratio": 0,
+            "turnover_rate": 0,
+            "consecutive_losses": 0,
+            "largest_single_loss": 0,
             "avg_holding_days": 0,
         }
     pnl_values = [number(item.get("pnl_amount")) for item in trades]
+    pnl_rates = [number(item.get("pnl_rate")) for item in trades]
     equity = INITIAL_CASH
     peak = INITIAL_CASH
     max_drawdown = 0.0
+    current_loss_streak = 0
+    max_loss_streak = 0
     for pnl in pnl_values:
         equity += pnl
         peak = max(peak, equity)
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
+        if pnl < 0:
+            current_loss_streak += 1
+            max_loss_streak = max(max_loss_streak, current_loss_streak)
+        else:
+            current_loss_streak = 0
     wins = [value for value in pnl_values if value > 0]
     losses = [abs(value) for value in pnl_values if value < 0]
     avg_win = sum(wins) / len(wins) if wins else 0
     avg_loss = sum(losses) / len(losses) if losses else 0
+    sorted_dates = sorted(str(item.get("exit_date", "")) for item in trades if item.get("exit_date"))
+    period_days = 0
+    if len(sorted_dates) >= 2:
+        start = date.fromisoformat(sorted_dates[0])
+        end = date.fromisoformat(sorted_dates[-1])
+        period_days = max(1, (end - start).days)
+    total_return = (equity - INITIAL_CASH) / INITIAL_CASH * 100 if INITIAL_CASH else 0
+    annual_return = ((equity / INITIAL_CASH) ** (365 / period_days) - 1) * 100 if period_days and equity > 0 and INITIAL_CASH > 0 else total_return
+    avg_rate = sum(pnl_rates) / len(pnl_rates) if pnl_rates else 0
+    variance = sum((value - avg_rate) ** 2 for value in pnl_rates) / len(pnl_rates) if pnl_rates else 0
+    volatility = math.sqrt(variance)
+    sharpe = avg_rate / volatility * math.sqrt(252) if volatility > 0 else 0
+    calmar = annual_return / max_drawdown if max_drawdown > 0 else 0
+    traded_amount = sum(number(item.get("entry_price")) * number(item.get("shares")) for item in trades)
     return {
         "final_value": equity,
-        "total_return_rate": (equity - INITIAL_CASH) / INITIAL_CASH * 100 if INITIAL_CASH else 0,
+        "total_return_rate": total_return,
+        "annual_return_rate": annual_return,
         "max_drawdown_rate": max_drawdown,
+        "sharpe_ratio": sharpe,
+        "calmar_ratio": calmar,
         "win_rate": len(wins) / len(trades) * 100,
         "profit_loss_ratio": avg_win / avg_loss if avg_loss else (avg_win if avg_win else 0),
+        "turnover_rate": traded_amount / INITIAL_CASH * 100 if INITIAL_CASH else 0,
+        "consecutive_losses": max_loss_streak,
+        "largest_single_loss": min(pnl_values),
         "avg_holding_days": sum(number(item.get("holding_days")) for item in trades) / len(trades),
     }
 
@@ -328,11 +424,17 @@ def insert_results(
         "initial_cash": INITIAL_CASH,
         "final_value": metrics["final_value"],
         "total_return_rate": metrics["total_return_rate"],
+        "annual_return_rate": metrics["annual_return_rate"],
         "benchmark_return_rate": benchmark_rate,
         "excess_return_rate": excess_return,
         "max_drawdown_rate": metrics["max_drawdown_rate"],
+        "sharpe_ratio": metrics["sharpe_ratio"],
+        "calmar_ratio": metrics["calmar_ratio"],
         "win_rate": metrics["win_rate"],
         "profit_loss_ratio": metrics["profit_loss_ratio"],
+        "turnover_rate": metrics["turnover_rate"],
+        "consecutive_losses": metrics["consecutive_losses"],
+        "largest_single_loss": metrics["largest_single_loss"],
         "trade_count": len(trades),
         "avg_holding_days": metrics["avg_holding_days"],
         "missed_runner_count": len(missed),
@@ -340,10 +442,36 @@ def insert_results(
     }
     if dry_run:
         return {"run": run_payload, "trades": len(trades), "missed": len(missed), "curve": len(curve)}
-    run_rows = client.request("POST", "stock_backtest_runs", run_payload, prefer="return=representation")
+    try:
+        run_rows = client.request("POST", "stock_backtest_runs", run_payload, prefer="return=representation")
+    except RuntimeError as error:
+        optional_columns = {
+            "annual_return_rate",
+            "sharpe_ratio",
+            "calmar_ratio",
+            "turnover_rate",
+            "consecutive_losses",
+            "largest_single_loss",
+        }
+        if not any(column in str(error) for column in optional_columns):
+            raise
+        fallback_payload = {key: value for key, value in run_payload.items() if key not in optional_columns}
+        run_rows = client.request("POST", "stock_backtest_runs", fallback_payload, prefer="return=representation")
     run_id = run_rows[0]["id"]
     if trades:
-        client.insert("stock_backtest_trades", [{**item, "run_id": run_id} for item in trades])
+        trade_rows = [{**item, "run_id": run_id} for item in trades]
+        try:
+            client.insert("stock_backtest_trades", trade_rows)
+        except RuntimeError as error:
+            if "fee_amount" not in str(error) and "slippage_amount" not in str(error):
+                raise
+            client.insert(
+                "stock_backtest_trades",
+                [
+                    {key: value for key, value in item.items() if key not in {"fee_amount", "slippage_amount"}}
+                    for item in trade_rows
+                ],
+            )
     if missed:
         client.insert("stock_missed_runners", [{**item, "run_id": run_id} for item in missed])
     if curve:

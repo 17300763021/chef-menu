@@ -197,7 +197,7 @@ Remaining work:
 
 ### P3: Professional Backtest Center
 
-Status: Pending
+Status: In Progress
 
 Goal: Upgrade existing backtest/replay scripts into a professional strategy evaluation center.
 
@@ -217,6 +217,20 @@ Acceptance checks:
 - Metric tests validate max drawdown and total return.
 - Backtest trade list reconciles with equity curve changes.
 - Report includes benchmark and excess return.
+
+Known completed work:
+
+- 2026-07-03: Added P3-MVP professional backtest metrics foundation. Implemented deterministic tests for net trade costs, maximum drawdown, largest single loss, consecutive losses, turnover, Sharpe, and Calmar; added backtest fee/slippage accounting; added Supabase migration fields for professional run and trade metrics; and exposed the new metrics through repository mapping and the backtest center table.
+- 2026-07-03: Verified local P3-MVP unit tests, frontend mapping tests, full Python test group, full Vitest suite, production build, and backtest dry-run payload generation. Local dry-run could not produce sample trades because the local Python environment is missing `backtrader`, although the project requirements file already includes it.
+
+Remaining work:
+
+- Apply the professional backtest metrics migration online.
+- Verify an online or dependency-complete backtest run writes non-empty trades with the new metrics and trade cost fields.
+- Add deterministic trade-list versus equity-curve reconciliation tests.
+- Add benchmark comparison beyond pick-equal-weight where CSI300/CSI500 data exists.
+- Add in-sample, validation, test, and out-of-sample splits.
+- Add parameter sensitivity tests.
 
 ### P4: Qlib Model Integration
 
