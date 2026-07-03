@@ -109,7 +109,10 @@ export interface BacktestRun {
   totalReturnRate: number
   annualReturnRate: number
   benchmarkReturnRate: number
+  benchmarkCsi300ReturnRate: number
+  benchmarkCsi500ReturnRate: number
   excessReturnRate: number
+  equityReconciled: boolean
   maxDrawdownRate: number
   sharpeRatio: number
   calmarRatio: number
@@ -118,6 +121,8 @@ export interface BacktestRun {
   turnoverRate: number
   consecutiveLosses: number
   largestSingleLoss: number
+  sampleSplitSummary: unknown
+  parameterSensitivitySummary: unknown
   tradeCount: number
   avgHoldingDays: number
   missedRunnerCount: number

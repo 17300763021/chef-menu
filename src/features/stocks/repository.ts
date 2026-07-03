@@ -36,6 +36,19 @@ function numberValue(row: Row, key: string, fallback = 0) {
   return Number(row[key] ?? fallback)
 }
 
+function jsonValue(row: Row, key: string) {
+  const value = row[key]
+  if (!value) return null
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value) as unknown
+    } catch {
+      return value
+    }
+  }
+  return value
+}
+
 function optionalNumber(row: Row, key: string) {
   const value = row[key]
   return value === null || value === undefined ? null : Number(value)
@@ -358,7 +371,10 @@ function mapBacktestRun(row: Row): BacktestRun {
     totalReturnRate: numberValue(row, 'total_return_rate'),
     annualReturnRate: numberValue(row, 'annual_return_rate'),
     benchmarkReturnRate: numberValue(row, 'benchmark_return_rate'),
+    benchmarkCsi300ReturnRate: numberValue(row, 'benchmark_csi300_return_rate'),
+    benchmarkCsi500ReturnRate: numberValue(row, 'benchmark_csi500_return_rate'),
     excessReturnRate: numberValue(row, 'excess_return_rate'),
+    equityReconciled: Boolean(row.equity_reconciled ?? false),
     maxDrawdownRate: numberValue(row, 'max_drawdown_rate'),
     sharpeRatio: numberValue(row, 'sharpe_ratio'),
     calmarRatio: numberValue(row, 'calmar_ratio'),
@@ -367,6 +383,8 @@ function mapBacktestRun(row: Row): BacktestRun {
     turnoverRate: numberValue(row, 'turnover_rate'),
     consecutiveLosses: numberValue(row, 'consecutive_losses'),
     largestSingleLoss: numberValue(row, 'largest_single_loss'),
+    sampleSplitSummary: jsonValue(row, 'sample_split_summary'),
+    parameterSensitivitySummary: jsonValue(row, 'parameter_sensitivity_summary'),
     tradeCount: numberValue(row, 'trade_count'),
     avgHoldingDays: numberValue(row, 'avg_holding_days'),
     missedRunnerCount: numberValue(row, 'missed_runner_count'),

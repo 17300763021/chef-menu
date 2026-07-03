@@ -376,6 +376,139 @@ def benchmark_return(picks: list[dict[str, Any]], end: date) -> float:
     return sum(returns) / len(returns) if returns else 0
 
 
+def benchmark_return_from_history(history: Any) -> float:
+    if history is None:
+        return 0
+    if hasattr(history, "empty") and history.empty:
+        return 0
+    if not hasattr(history, "iloc") and len(history) == 0:
+        return 0
+    try:
+        first = history.iloc[0]
+        last = history.iloc[-1]
+        start_close = number(first["close"])
+        end_close = number(last["close"])
+    except AttributeError:
+        start_close = number(history[0].get("close"))
+        end_close = number(history[-1].get("close"))
+    if start_close <= 0:
+        return 0
+    return (end_close - start_close) / start_close * 100
+
+
+def index_history(symbol: str, start_date: str, end_date: str) -> Any:
+    ak, _, pd = load_backtest_dependencies()
+    compact_start = start_date.replace("-", "")
+    compact_end = end_date.replace("-", "")
+    if hasattr(ak, "index_zh_a_hist"):
+        raw = ak.index_zh_a_hist(symbol=symbol, period="daily", start_date=compact_start, end_date=compact_end)
+    else:
+        raw = ak.stock_zh_index_daily(symbol=symbol)
+        if not raw.empty:
+            date_column = "date" if "date" in raw.columns else raw.columns[0]
+            raw[date_column] = pd.to_datetime(raw[date_column])
+            start = pd.to_datetime(start_date)
+            end = pd.to_datetime(end_date)
+            raw = raw[(raw[date_column] >= start) & (raw[date_column] <= end)]
+    if raw.empty:
+        return raw
+    columns = list(raw.columns)
+    close_column = "close" if "close" in raw.columns else columns[2]
+    return raw.rename(columns={close_column: "close"})
+
+
+def index_benchmark_returns(start_date: str, end_date: str) -> dict[str, float]:
+    benchmarks = {
+        "csi300": "000300",
+        "csi500": "000905",
+    }
+    results: dict[str, float] = {}
+    for name, symbol in benchmarks.items():
+        try:
+            results[name] = benchmark_return_from_history(index_history(symbol, start_date, end_date))
+        except Exception as reason:
+            print(json.dumps({"benchmark_skip": name, "reason": str(reason)}, ensure_ascii=False), flush=True)
+            results[name] = 0
+    return results
+
+
+def build_date_splits(start_date: str, end_date: str) -> list[dict[str, str]]:
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    if end < start:
+        raise ValueError("end_date must be on or after start_date")
+    total_days = max(1, (end - start).days + 1)
+    names = ["in_sample", "validation", "test", "out_of_sample"]
+    weights = [0.6, 0.2, 0.1, 0.1]
+    lengths = [max(1, int(total_days * weight)) for weight in weights]
+    while sum(lengths) > total_days:
+        index = max(range(len(lengths)), key=lambda item: lengths[item])
+        lengths[index] -= 1
+    while sum(lengths) < total_days:
+        lengths[0] += 1
+
+    cursor = start
+    splits: list[dict[str, str]] = []
+    for name, length in zip(names, lengths):
+        split_end = min(end, cursor + timedelta(days=length - 1))
+        splits.append({
+            "name": name,
+            "start_date": cursor.isoformat(),
+            "end_date": split_end.isoformat(),
+        })
+        cursor = split_end + timedelta(days=1)
+    return splits
+
+
+def split_trade_metrics(trades: list[dict[str, Any]], splits: list[dict[str, str]]) -> dict[str, dict[str, float]]:
+    metrics: dict[str, dict[str, float]] = {}
+    for split in splits:
+        start = date.fromisoformat(split["start_date"])
+        end = date.fromisoformat(split["end_date"])
+        split_trades = [
+            trade for trade in trades
+            if trade.get("exit_date") and start <= date.fromisoformat(str(trade["exit_date"])) <= end
+        ]
+        split_summary = summarize(split_trades)
+        metrics[split["name"]] = {
+            "start_date": split["start_date"],
+            "end_date": split["end_date"],
+            "trade_count": len(split_trades),
+            "total_return_rate": split_summary["total_return_rate"],
+            "max_drawdown_rate": split_summary["max_drawdown_rate"],
+            "win_rate": split_summary["win_rate"],
+            "profit_loss_ratio": split_summary["profit_loss_ratio"],
+        }
+    return metrics
+
+
+def parameter_sensitivity_cases() -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for take_profit in (0.08, 0.12, 0.16):
+        for stop_rate in (0.04, 0.06, 0.08):
+            max_hold = 5 if take_profit <= 0.08 else (10 if take_profit <= 0.12 else 15)
+            cases.append({
+                "case_name": f"tp_{take_profit:.2f}_sl_{stop_rate:.2f}_hold_{max_hold}",
+                "take_profit_rate": take_profit,
+                "stop_rate": stop_rate,
+                "max_hold_days": max_hold,
+            })
+    return cases
+
+
+def parameter_sensitivity_summary(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    base_metrics = summarize(trades)
+    summary: list[dict[str, Any]] = []
+    for case in parameter_sensitivity_cases():
+        summary.append({
+            **case,
+            "baseline_trade_count": len(trades),
+            "baseline_total_return_rate": base_metrics["total_return_rate"],
+            "baseline_max_drawdown_rate": base_metrics["max_drawdown_rate"],
+        })
+    return summary
+
+
 def equity_curve(trades: list[dict[str, Any]], benchmark_rate: float) -> list[dict[str, Any]]:
     sorted_trades = sorted(trades, key=lambda item: str(item.get("exit_date", "")))
     if not sorted_trades:
@@ -403,18 +536,56 @@ def equity_curve(trades: list[dict[str, Any]], benchmark_rate: float) -> list[di
     return points
 
 
+def reconcile_equity_curve(trades: list[dict[str, Any]], curve: list[dict[str, Any]]) -> dict[str, Any]:
+    sorted_trades = sorted(trades, key=lambda item: str(item.get("exit_date", "")))
+    mismatches: list[dict[str, Any]] = []
+    equity = INITIAL_CASH
+    for index, trade in enumerate(sorted_trades):
+        equity += number(trade.get("pnl_amount"))
+        if index >= len(curve):
+            mismatches.append({"index": index, "reason": "missing_curve_point", "expected_equity": round(equity, 2)})
+            continue
+        actual = number(curve[index].get("equity_value"))
+        if abs(actual - equity) >= 0.01:
+            mismatches.append({
+                "index": index,
+                "reason": "equity_mismatch",
+                "expected_equity": round(equity, 2),
+                "actual_equity": round(actual, 2),
+            })
+    if len(curve) > len(sorted_trades):
+        for index in range(len(sorted_trades), len(curve)):
+            mismatches.append({"index": index, "reason": "extra_curve_point"})
+    actual_final = number(curve[-1].get("equity_value")) if curve else INITIAL_CASH
+    return {
+        "ok": not mismatches,
+        "trade_count": len(sorted_trades),
+        "curve_count": len(curve),
+        "expected_final_value": round(equity, 2),
+        "actual_final_value": round(actual_final, 2),
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:10],
+    }
+
+
 def insert_results(
-    client: SupabaseRest,
+    client: SupabaseRest | None,
     picks: list[dict[str, Any]],
     trades: list[dict[str, Any]],
     missed: list[dict[str, Any]],
     curve: list[dict[str, Any]],
     benchmark_rate: float,
     dry_run: bool,
+    benchmark_details: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     start_date = min(str(item.get("scan_date")) for item in picks)
     end_date = date.today().isoformat()
     metrics = summarize(trades)
+    details = benchmark_details or {}
+    reconciliation = reconcile_equity_curve(trades, curve)
+    splits = build_date_splits(start_date, end_date)
+    split_summary = split_trade_metrics(trades, splits)
+    sensitivity_summary = parameter_sensitivity_summary(trades)
     excess_return = metrics["total_return_rate"] - benchmark_rate
     run_payload = {
         "strategy_name": "strong_pick_v1_backtrader",
@@ -426,7 +597,10 @@ def insert_results(
         "total_return_rate": metrics["total_return_rate"],
         "annual_return_rate": metrics["annual_return_rate"],
         "benchmark_return_rate": benchmark_rate,
+        "benchmark_csi300_return_rate": details.get("csi300", 0),
+        "benchmark_csi500_return_rate": details.get("csi500", 0),
         "excess_return_rate": excess_return,
+        "equity_reconciled": reconciliation["ok"],
         "max_drawdown_rate": metrics["max_drawdown_rate"],
         "sharpe_ratio": metrics["sharpe_ratio"],
         "calmar_ratio": metrics["calmar_ratio"],
@@ -435,13 +609,20 @@ def insert_results(
         "turnover_rate": metrics["turnover_rate"],
         "consecutive_losses": metrics["consecutive_losses"],
         "largest_single_loss": metrics["largest_single_loss"],
+        "sample_split_summary": split_summary,
+        "parameter_sensitivity_summary": sensitivity_summary,
         "trade_count": len(trades),
         "avg_holding_days": metrics["avg_holding_days"],
         "missed_runner_count": len(missed),
-        "note": f"Backtrader lightweight validation, picks={len(picks)}",
+        "note": (
+            f"Backtrader lightweight validation, picks={len(picks)}, "
+            f"equity_reconciled={reconciliation['ok']}, mismatches={reconciliation['mismatch_count']}"
+        ),
     }
     if dry_run:
         return {"run": run_payload, "trades": len(trades), "missed": len(missed), "curve": len(curve)}
+    if client is None:
+        raise ValueError("client is required when dry_run is false")
     try:
         run_rows = client.request("POST", "stock_backtest_runs", run_payload, prefer="return=representation")
     except RuntimeError as error:
@@ -452,6 +633,11 @@ def insert_results(
             "turnover_rate",
             "consecutive_losses",
             "largest_single_loss",
+            "benchmark_csi300_return_rate",
+            "benchmark_csi500_return_rate",
+            "equity_reconciled",
+            "sample_split_summary",
+            "parameter_sensitivity_summary",
         }
         if not any(column in str(error) for column in optional_columns):
             raise
@@ -503,8 +689,10 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         except Exception as reason:
             print(json.dumps({"skip": pick.get("code"), "reason": str(reason)}, ensure_ascii=False), flush=True)
     benchmark_rate = benchmark_return(picks, end)
+    start_date = min(str(item.get("scan_date")) for item in picks)
+    benchmark_details = index_benchmark_returns(start_date, end.isoformat())
     curve = equity_curve(trades, benchmark_rate)
-    return insert_results(client, picks, trades, missed, curve, benchmark_rate, dry_run)
+    return insert_results(client, picks, trades, missed, curve, benchmark_rate, dry_run, benchmark_details)
 
 
 def main() -> int:

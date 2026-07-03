@@ -222,15 +222,13 @@ Known completed work:
 
 - 2026-07-03: Added P3-MVP professional backtest metrics foundation. Implemented deterministic tests for net trade costs, maximum drawdown, largest single loss, consecutive losses, turnover, Sharpe, and Calmar; added backtest fee/slippage accounting; added Supabase migration fields for professional run and trade metrics; and exposed the new metrics through repository mapping and the backtest center table.
 - 2026-07-03: Verified local P3-MVP unit tests, frontend mapping tests, full Python test group, full Vitest suite, production build, and backtest dry-run payload generation. Local dry-run could not produce sample trades because the local Python environment is missing `backtrader`, although the project requirements file already includes it.
+- 2026-07-03: Completed P3 online metrics migration verification and dependency-complete online backtest write check. Verified Supabase professional metrics fields are readable, installed the declared `backtrader` dependency, ran a real backtest write with 34 trades, 34 equity-curve points, 2 missed runners, nonzero fee/slippage on every trade, and verified final value reconciles with trade PnL and the last equity-curve point.
+- 2026-07-03: Added P3 audit layer locally. Implemented deterministic trade-list versus equity-curve reconciliation tests, date split metrics for in-sample/validation/test/out-of-sample periods, deterministic parameter sensitivity cases, CSI300/CSI500 benchmark return hooks with graceful fallback when data is unavailable, a P3 audit-field Supabase migration, and UI/repository mapping for CSI benchmark and reconciliation fields.
 
 Remaining work:
 
-- Apply the professional backtest metrics migration online.
-- Verify an online or dependency-complete backtest run writes non-empty trades with the new metrics and trade cost fields.
-- Add deterministic trade-list versus equity-curve reconciliation tests.
-- Add benchmark comparison beyond pick-equal-weight where CSI300/CSI500 data exists.
-- Add in-sample, validation, test, and out-of-sample splits.
-- Add parameter sensitivity tests.
+- Apply the P3 audit-field migration online.
+- Verify an online run writes CSI benchmark, equity reconciliation, sample split, and sensitivity fields.
 
 ### P4: Qlib Model Integration
 
