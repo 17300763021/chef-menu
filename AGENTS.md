@@ -163,7 +163,7 @@ Remaining work:
 
 ### P2: A-Share Trading Constraints
 
-Status: In Progress
+Status: Completed
 
 Goal: Make virtual trading closer to real A-share trading.
 
@@ -189,12 +189,11 @@ Acceptance checks:
 Known completed work:
 
 - 2026-07-02: Added P2-MVP simulation trading constraints. Implemented T+1 same-day sell blocking, suspended-stock order blocking, limit-down sell blocking, limit-up buy blocking, board-lot rounding coverage, configurable slippage and fees, blocked/failed virtual order records, fee/slippage order metadata, and UI order columns for cost and blocked/failure reasons.
+- 2026-07-03: Completed P2 online closure check. Verified the online Supabase fee/slippage columns are readable and writable, verified a temporary schema-probe order could write fee/slippage metadata and was deleted, ran the online paper trading engine successfully, and added explicit fixture coverage for limit-up buy blocking.
 
 Remaining work:
 
-- Apply the fee/slippage metadata migration online when Supabase migration tooling is available. The paper trading engine currently falls back to legacy order columns if the online table has not been migrated yet.
-- Add explicit fixture coverage for limit-up buy blocking.
-- Add broader fee schedule review and UI wording polish after the first online run.
+- No P2 blocker remains. Defer broader fee schedule tuning and UI wording polish until after roadmap progression.
 
 ### P3: Professional Backtest Center
 

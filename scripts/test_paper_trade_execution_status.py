@@ -355,6 +355,27 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertEqual(order_payload["status"], "blocked")
         self.assertIn("suspended", order_payload["failure_reason"])
 
+    def test_limit_up_buy_is_blocked_and_recorded_as_order(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {
+            "code": "000001",
+            "name": "Ping An",
+            "current_price": 10,
+            "suggest_buy_price": 10,
+            "can_buy": True,
+            "change_rate": 10.01,
+        }
+
+        result = buy_position(client, decision, [], [])
+
+        self.assertIsNone(result)
+        order_payload = [
+            request for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0][2][0]
+        self.assertEqual(order_payload["status"], "blocked")
+        self.assertIn("limit-up", order_payload["failure_reason"])
+
     def test_sell_fees_and_slippage_reduce_cash_and_realized_pnl(self) -> None:
         client = FakeSupabaseClient()
         decision = {"code": "000001", "name": "Ping An", "current_price": 11}
