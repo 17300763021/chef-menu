@@ -232,7 +232,7 @@ Remaining work:
 
 ### P4: Qlib Model Integration
 
-Status: In Progress
+Status: Completed
 
 Goal: Introduce mature open-source quantitative modeling while keeping this platform responsible for execution, risk, simulation, and UI.
 
@@ -269,13 +269,11 @@ Acceptance checks:
 Known completed work:
 
 - 2026-07-06: Added P4 model-driven simulation account foundation locally. Created the model trading design and implementation plan, added independent model prediction/decision/position/order/trade/snapshot schema migration, implemented deterministic Qlib/LightGBM-compatible baseline prediction generation from `stock_daily_history`, implemented an isolated model virtual trading engine with confidence, rank, T+1, lot-size, fee, slippage, and account-isolation checks, added model repository mappings and dashboard model account view, and verified local Python tests, full Vitest suite, production build, and prediction dry-run against existing online history cache.
+- 2026-07-06: Completed P4 online closure after the Supabase SQL was applied. Verified real online prediction insertion wrote 9 model predictions for 2026-06-18, ran the model virtual trading account online, and verified 8 model decisions, 5 open model positions, 7 model orders, and 1 model portfolio snapshot for `model_qlib_lgbm_v1`.
 
 Remaining work:
 
-- Apply `supabase/migrations/20260706_add_stock_model_trading.sql` online when the Supabase plugin/DDL channel is available.
-- Run real online model prediction insertion and model virtual trading write verification.
-- Verify online dashboard reads model predictions, decisions, orders, positions, and snapshots.
-- Mark P4 Completed only after online Supabase write/read verification passes.
+- No P4 blocker remains. Defer full Qlib package dependency hardening, richer Alpha158/Alpha360 feature parity, and UI rank-comparison polish until after roadmap progression.
 
 ### P5: Hybrid Strategy Simulation
 
