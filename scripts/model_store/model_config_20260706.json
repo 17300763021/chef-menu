@@ -1,0 +1,167 @@
+{
+  "model_version": "20260706",
+  "random_state": 42,
+  "feature_columns": [
+    "ret_1d",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "ret_60d",
+    "vol_5d",
+    "vol_10d",
+    "vol_20d",
+    "max_drawdown_20d",
+    "max_drawdown_60d",
+    "volume_ratio_5v20",
+    "volume_ratio_10v60",
+    "close_position",
+    "upper_shadow_ratio",
+    "lower_shadow_ratio",
+    "close_over_ma5",
+    "close_over_ma10",
+    "close_over_ma20",
+    "close_over_ma60",
+    "ma5_over_ma10",
+    "ma10_over_ma20",
+    "ma20_slope_5d",
+    "ma60_slope_10d",
+    "rsi_6",
+    "rsi_14",
+    "rsi_28",
+    "macd_hist",
+    "macd_signal_line_diff",
+    "limit_board_count",
+    "first_limit_time_rank",
+    "yesterday_limit_up_stocks_avg_ret",
+    "main_net_inflow_ratio",
+    "big_order_buy_ratio",
+    "north_bound_holding_change",
+    "market_limit_up_count",
+    "market_limit_break_rate",
+    "market_advance_decline_ratio",
+    "turnover_rate_5d",
+    "pressure_room_pct",
+    "support_room_pct",
+    "pressure_strength",
+    "support_strength",
+    "box_range_pct"
+  ],
+  "metrics": {
+    "lgb": {
+      "rank_ic": 0.08073261570724596,
+      "icir": 0.3368955383860882
+    },
+    "cat": {
+      "rank_ic": 0.1237126632138291,
+      "icir": 0.7093758788792782
+    },
+    "xgb": {
+      "rank_ic": 0.06517964431433848,
+      "icir": 0.3354147068907914
+    },
+    "stacking": {
+      "rank_ic": 0.08729712233448839,
+      "icir": 0.37232545030130254
+    },
+    "validation": {
+      "rank_ic": 0.09139853285454064,
+      "icir": 0.3424817983409679
+    }
+  },
+  "feature_importance": [
+    {
+      "feature": "max_drawdown_60d",
+      "importance": 1767.0
+    },
+    {
+      "feature": "ma60_slope_10d",
+      "importance": 1651.0
+    },
+    {
+      "feature": "max_drawdown_20d",
+      "importance": 1526.0
+    },
+    {
+      "feature": "volume_ratio_10v60",
+      "importance": 1426.0
+    },
+    {
+      "feature": "vol_20d",
+      "importance": 1248.0
+    },
+    {
+      "feature": "box_range_pct",
+      "importance": 1216.0
+    },
+    {
+      "feature": "vol_10d",
+      "importance": 1185.0
+    },
+    {
+      "feature": "volume_ratio_5v20",
+      "importance": 1125.0
+    },
+    {
+      "feature": "macd_hist",
+      "importance": 1086.0
+    },
+    {
+      "feature": "vol_5d",
+      "importance": 1071.0
+    },
+    {
+      "feature": "rsi_28",
+      "importance": 1025.0
+    },
+    {
+      "feature": "ret_60d",
+      "importance": 944.0
+    },
+    {
+      "feature": "ma20_slope_5d",
+      "importance": 912.0
+    },
+    {
+      "feature": "ma5_over_ma10",
+      "importance": 886.0
+    },
+    {
+      "feature": "ma10_over_ma20",
+      "importance": 880.0
+    },
+    {
+      "feature": "lower_shadow_ratio",
+      "importance": 877.0
+    },
+    {
+      "feature": "rsi_14",
+      "importance": 874.0
+    },
+    {
+      "feature": "close_position",
+      "importance": 830.0
+    },
+    {
+      "feature": "upper_shadow_ratio",
+      "importance": 827.0
+    },
+    {
+      "feature": "close_over_ma5",
+      "importance": 803.0
+    }
+  ],
+  "split_dates": {
+    "train_start_date": "2024-08-21",
+    "train_end_date": "2026-02-27",
+    "validation_start_date": "2026-03-02",
+    "validation_end_date": "2026-04-30",
+    "test_start_date": "2026-05-06",
+    "test_end_date": "2026-06-11"
+  },
+  "model_files": {
+    "lgb": "model_lgb_20260706.pkl",
+    "cat": "model_cat_20260706.pkl",
+    "xgb": "model_xgb_20260706.pkl",
+    "meta": "model_meta_20260706.pkl"
+  }
+}

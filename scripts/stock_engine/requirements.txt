@@ -5,3 +5,8 @@ openpyxl
 matplotlib
 requests
 backtrader
+lightgbm
+catboost
+xgboost
+scikit-learn
+joblib

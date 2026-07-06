@@ -8,14 +8,37 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import joblib
+import numpy as np
+
+from model_trainer import FEATURE_COLUMNS, extract_features_for_code
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_STORE_DIR = SCRIPT_DIR / "model_store"
 MODEL_NAME = os.environ.get("STOCK_MODEL_NAME", "qlib_lgbm_baseline")
-MODEL_VERSION = os.environ.get("STOCK_MODEL_VERSION", "v1")
+
+
+def configured_model_version() -> str:
+    configured = os.environ.get("STOCK_MODEL_VERSION", "").strip()
+    if configured:
+        return configured
+    configs = sorted(MODEL_STORE_DIR.glob("model_config_*.json"))
+    if not configs:
+        return "v1"
+    try:
+        config = json.loads(configs[-1].read_text(encoding="utf-8"))
+        return str(config.get("model_version") or "v1")
+    except (OSError, ValueError, TypeError):
+        return "v1"
+
+
+MODEL_VERSION = configured_model_version()
 FEATURE_SET = os.environ.get("STOCK_MODEL_FEATURE_SET", "alpha158_lite")
 LOOKBACK_DAYS = int(os.environ.get("STOCK_MODEL_LOOKBACK_DAYS", "90"))
 MIN_HISTORY_ROWS = int(os.environ.get("STOCK_MODEL_MIN_HISTORY_ROWS", "30"))
@@ -134,6 +157,34 @@ def volume_ratio(volumes: list[float]) -> float:
     return recent_avg / base_avg if base_avg > 0 else 1
 
 
+def model_store_path(model_store_dir: str | Path | None = None) -> Path:
+    if model_store_dir is None:
+        return MODEL_STORE_DIR
+    path = Path(model_store_dir)
+    return path if path.is_absolute() else Path(__file__).resolve().parent / path
+
+
+def load_latest_model(model_store_dir: str | Path | None = None) -> dict[str, Any] | None:
+    store = model_store_path(model_store_dir)
+    configs = sorted(store.glob("model_config_*.json"))
+    if not configs:
+        return None
+    config_path = configs[-1]
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    files = config.get("model_files") or {}
+    try:
+        return {
+            "lgb": joblib.load(store / files.get("lgb", f"model_lgb_{config['model_version']}.pkl")),
+            "cat": joblib.load(store / files.get("cat", f"model_cat_{config['model_version']}.pkl")),
+            "xgb": joblib.load(store / files.get("xgb", f"model_xgb_{config['model_version']}.pkl")),
+            "meta": joblib.load(store / files.get("meta", f"model_meta_{config['model_version']}.pkl")),
+            "config": config,
+            "val_ic": number((config.get("metrics") or {}).get("validation", {}).get("rank_ic"), 0.1),
+        }
+    except (FileNotFoundError, KeyError, ValueError, OSError):
+        return None
+
+
 def split_window(dates: list[str]) -> SplitWindow:
     ordered = sorted(set(dates))
     if not ordered:
@@ -152,8 +203,8 @@ def split_window(dates: list[str]) -> SplitWindow:
     )
 
 
-def build_prediction(code: str, history: list[dict[str, Any]], rank_seed: int = 0) -> dict[str, Any] | None:
-    usable = sorted(history, key=lambda row: str(row.get("trade_date", "")))
+def fallback_prediction(code: str, usable: list[dict[str, Any]], rank_seed: int = 0) -> dict[str, Any] | None:
+    usable = sorted(usable, key=lambda row: str(row.get("trade_date", "")))
     if len(usable) < MIN_HISTORY_ROWS:
         return None
     closes = [number(row.get("close")) for row in usable]
@@ -214,13 +265,82 @@ def build_prediction(code: str, history: list[dict[str, Any]], rank_seed: int = 
             "range_pressure_20d": round(range_pressure, 4),
             "range_support_20d": round(range_support, 4),
             "history_rows": len(usable),
+            "prediction_source": "fallback_linear",
         },
+    }
+
+
+def build_prediction(
+    code: str,
+    history: list[dict[str, Any]],
+    rank_seed: int = 0,
+    model_store_dir: str | Path | None = None,
+) -> dict[str, Any] | None:
+    usable = sorted(history, key=lambda row: str(row.get("trade_date", "")))
+    if len(usable) < MIN_HISTORY_ROWS:
+        return None
+    model = load_latest_model(model_store_dir)
+    if model is None:
+        return fallback_prediction(code, usable, rank_seed)
+
+    features = extract_features_for_code(code, usable)
+    if features.empty:
+        return None
+    config = model["config"]
+    feature_columns = config.get("feature_columns") or FEATURE_COLUMNS
+    feature_frame = features.reindex(columns=feature_columns)
+    lgb_score = model["lgb"].predict(feature_frame)
+    cat_score = model["cat"].predict(feature_frame)
+    xgb_score = model["xgb"].predict(feature_frame)
+    meta_input = np.column_stack([lgb_score, cat_score, xgb_score])
+    raw_return = float(model["meta"].predict(meta_input)[0])
+    score = max(0.0, min(100.0, 50 + raw_return * 100))
+    confidence = max(0.1, min(0.95, abs(number(model.get("val_ic"), 0.1)) * 3))
+    dates = [str(row.get("trade_date")) for row in usable]
+    closes = [number(row.get("close")) for row in usable]
+    latest = usable[-1]
+    window = split_window(dates)
+    payload = {
+        column: (None if math.isnan(number(features.iloc[0].get(column), math.nan)) else round(number(features.iloc[0].get(column)), 6))
+        for column in feature_columns
+    }
+    payload.update({
+        "return_5d": payload.get("ret_5d"),
+        "return_20d": payload.get("ret_20d"),
+        "return_60d": payload.get("ret_60d"),
+        "volatility_20d": payload.get("vol_20d"),
+        "max_drawdown_30d": payload.get("max_drawdown_20d"),
+        "history_rows": len(usable),
+        "prediction_source": "stacking_model",
+        "model_version": config.get("model_version", MODEL_VERSION),
+        "stacking_rank_ic": round(number((config.get("metrics") or {}).get("stacking", {}).get("rank_ic")), 6),
+    })
+    return {
+        "prediction_date": latest["trade_date"],
+        "code": code,
+        "name": str(latest.get("name") or ""),
+        "model_name": MODEL_NAME,
+        "model_version": str(config.get("model_version") or MODEL_VERSION),
+        "feature_set": FEATURE_SET,
+        "score": round(score, 4),
+        "rank": 0,
+        "predicted_return": round(raw_return * 100, 4),
+        "confidence": round(confidence, 4),
+        "close_price": round(closes[-1], 4),
+        "feature_window_start": dates[0],
+        "feature_window_end": dates[-1],
+        **window.__dict__,
+        "feature_payload": payload,
     }
 
 
 def build_predictions(rows: list[dict[str, Any]], limit: int = SYMBOL_LIMIT) -> list[dict[str, Any]]:
     predictions: list[dict[str, Any]] = []
+    latest_date = max((str(row.get("trade_date", "")) for row in rows), default="")
     for index, (code, history) in enumerate(group_by_code(rows).items()):
+        history_latest_date = max((str(row.get("trade_date", "")) for row in history), default="")
+        if latest_date and history_latest_date != latest_date:
+            continue
         prediction = build_prediction(code, history, index)
         if prediction:
             predictions.append(prediction)
