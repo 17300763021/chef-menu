@@ -565,4 +565,140 @@ describe('stock repository', () => {
       drawdownRate: 0,
     }])
   })
+
+  it('loads model predictions, decisions, positions, orders, and snapshots', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_model_predictions: [{
+        id: 'pred-1',
+        prediction_date: '2026-07-06',
+        code: '000001',
+        name: '骞冲畨閾惰',
+        model_name: 'qlib_lgbm_baseline',
+        model_version: 'v1',
+        feature_set: 'alpha158_lite',
+        score: 72.5,
+        rank: 1,
+        predicted_return: 2.8,
+        confidence: 0.68,
+        close_price: 10.8,
+        feature_window_start: '2026-04-01',
+        feature_window_end: '2026-07-06',
+      }],
+      stock_model_decisions: [{
+        id: 'decision-1',
+        decision_time: '2026-07-06T07:00:00Z',
+        decision_date: '2026-07-06',
+        strategy_account: 'model_qlib_lgbm_v1',
+        code: '000001',
+        name: '骞冲畨閾惰',
+        model_name: 'qlib_lgbm_baseline',
+        model_version: 'v1',
+        action: 'buy',
+        reason: 'top-ranked positive model prediction',
+        risk_gate_status: 'passed',
+        risk_gate_reason: '',
+        target_weight: 0.08,
+        planned_shares: 1000,
+        status: 'handled',
+      }],
+      stock_model_positions: [{
+        id: 'model-pos-1',
+        strategy_account: 'model_qlib_lgbm_v1',
+        code: '000001',
+        name: '骞冲畨閾惰',
+        cost_price: 10.8,
+        shares: 1000,
+        current_price: 11,
+        market_value: 11000,
+        floating_pnl: 200,
+        pnl_rate: 1.85,
+        buy_date: '2026-07-06',
+        current_suggestion: 'model virtual buy',
+        status: 'open',
+        model_name: 'qlib_lgbm_baseline',
+        model_version: 'v1',
+      }],
+      stock_model_orders: [{
+        id: 'model-order-1',
+        order_time: '2026-07-06T07:01:00Z',
+        order_date: '2026-07-06',
+        strategy_account: 'model_qlib_lgbm_v1',
+        code: '000001',
+        name: '骞冲畨閾惰',
+        side: 'buy',
+        reason: 'top-ranked positive model prediction',
+        price: 10.81,
+        shares: 1000,
+        amount: 10810,
+        fee_amount: 5,
+        slippage_amount: 10,
+        cash_before: 1000000,
+        cash_after: 989185,
+        realized_pnl: 0,
+        status: 'filled',
+        failure_reason: '',
+        model_name: 'qlib_lgbm_baseline',
+        model_version: 'v1',
+      }],
+      stock_model_portfolio_snapshots: [{
+        id: 'model-snap-1',
+        snapshot_time: '2026-07-06T07:02:00Z',
+        snapshot_date: '2026-07-06',
+        strategy_account: 'model_qlib_lgbm_v1',
+        cash: 989185,
+        holding_market_value: 10810,
+        total_assets: 999995,
+        realized_pnl: 0,
+        floating_pnl: -5,
+        total_pnl: -5,
+        total_return_rate: -0.0005,
+        max_drawdown_rate: 0.0005,
+        consecutive_losses: 0,
+        position_count: 1,
+        trade_count: 1,
+        model_name: 'qlib_lgbm_baseline',
+        model_version: 'v1',
+        note: 'simulation only',
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+          }),
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getModelPredictions()).resolves.toMatchObject([{
+      id: 'pred-1',
+      modelName: 'qlib_lgbm_baseline',
+      rank: 1,
+      confidence: 0.68,
+    }])
+    await expect(repository.getModelDecisions()).resolves.toMatchObject([{
+      id: 'decision-1',
+      strategyAccount: 'model_qlib_lgbm_v1',
+      action: 'buy',
+      riskGateStatus: 'passed',
+    }])
+    await expect(repository.getModelPositions()).resolves.toMatchObject([{
+      id: 'model-pos-1',
+      strategyAccount: 'model_qlib_lgbm_v1',
+      shares: 1000,
+    }])
+    await expect(repository.getModelOrders()).resolves.toMatchObject([{
+      id: 'model-order-1',
+      strategyAccount: 'model_qlib_lgbm_v1',
+      modelVersion: 'v1',
+    }])
+    await expect(repository.getModelPortfolioSnapshots()).resolves.toMatchObject([{
+      id: 'model-snap-1',
+      maxDrawdownRate: 0.0005,
+      consecutiveLosses: 0,
+    }])
+  })
 })

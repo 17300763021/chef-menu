@@ -268,6 +268,73 @@ export interface PortfolioSnapshot {
   note: string
 }
 
+export interface ModelPrediction {
+  id: string
+  predictionDate: string
+  code: string
+  name: string
+  modelName: string
+  modelVersion: string
+  featureSet: string
+  score: number
+  rank: number
+  predictedReturn: number
+  confidence: number
+  closePrice: number
+  featureWindowStart: string
+  featureWindowEnd: string
+}
+
+export interface ModelDecision {
+  id: string
+  decisionTime: string
+  decisionDate: string
+  strategyAccount: string
+  code: string
+  name: string
+  modelName: string
+  modelVersion: string
+  action: string
+  reason: string
+  riskGateStatus: string
+  riskGateReason: string
+  targetWeight: number
+  plannedShares: number
+  status: string
+}
+
+export interface ModelPosition {
+  id: string
+  strategyAccount: string
+  code: string
+  name: string
+  costPrice: number
+  shares: number
+  currentPrice: number
+  marketValue: number
+  floatingPnl: number
+  pnlRate: number
+  buyDate: string
+  currentSuggestion: string
+  status: string
+  modelName: string
+  modelVersion: string
+}
+
+export interface ModelOrder extends PaperTradeOrder {
+  strategyAccount: string
+  modelName: string
+  modelVersion: string
+}
+
+export interface ModelPortfolioSnapshot extends PortfolioSnapshot {
+  strategyAccount: string
+  maxDrawdownRate: number
+  consecutiveLosses: number
+  modelName: string
+  modelVersion: string
+}
+
 export interface TaskRecord {
   id: string
   type: string

@@ -10,6 +10,11 @@ import type {
   BacktestTrade,
   FineStock,
   HoldingStock,
+  ModelDecision,
+  ModelOrder,
+  ModelPortfolioSnapshot,
+  ModelPosition,
+  ModelPrediction,
   MissedRunner,
   OverviewStats,
   PaperTradeOrder,
@@ -23,8 +28,8 @@ import type {
 } from './types'
 import './stocks.css'
 
-type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner | BacktestEquityPoint
-type TabId = 'auto' | 'holdings' | 'backtest' | 'tasks' | 'account' | 'signals' | 'live' | 'rough' | 'fine' | 'history' | 'trades'
+type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner | BacktestEquityPoint | ModelPrediction | ModelDecision | ModelPosition | ModelOrder | ModelPortfolioSnapshot
+type TabId = 'auto' | 'model' | 'holdings' | 'backtest' | 'tasks' | 'account' | 'signals' | 'live' | 'rough' | 'fine' | 'history' | 'trades'
 
 interface Column<T> {
   header: string
@@ -175,8 +180,14 @@ export default function StockDashboard() {
   const [backtestTrades, setBacktestTrades] = useState<BacktestTrade[]>([])
   const [missedRunners, setMissedRunners] = useState<MissedRunner[]>([])
   const [backtestCurve, setBacktestCurve] = useState<BacktestEquityPoint[]>([])
+  const [modelPredictions, setModelPredictions] = useState<ModelPrediction[]>([])
+  const [modelDecisions, setModelDecisions] = useState<ModelDecision[]>([])
+  const [modelPositions, setModelPositions] = useState<ModelPosition[]>([])
+  const [modelOrders, setModelOrders] = useState<ModelOrder[]>([])
+  const [modelSnapshots, setModelSnapshots] = useState<ModelPortfolioSnapshot[]>([])
   const accountSummary = useMemo(() => buildAccountSummary(holdings, trades), [holdings, trades])
   const latestSnapshot = portfolioSnapshots[0]
+  const latestModelSnapshot = modelSnapshots[0]
   const latestBacktest = backtestRuns[0]
   const today = shanghaiDateValue()
   const todayHoldingPnlDetails = useMemo(() => dailyHoldingPnlDetails(holdings, realtime), [holdings, realtime])
@@ -208,7 +219,7 @@ export default function StockDashboard() {
   }, [executionStock, holdings])
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -224,6 +235,11 @@ export default function StockDashboard() {
       stockRepository.getBacktestTrades(),
       stockRepository.getMissedRunners(),
       stockRepository.getBacktestEquityCurve(),
+      stockRepository.getModelPredictions(),
+      stockRepository.getModelDecisions(),
+      stockRepository.getModelPositions(),
+      stockRepository.getModelOrders(),
+      stockRepository.getModelPortfolioSnapshots(),
     ])
     setOverview(stats)
     setRoughStocks(rough)
@@ -240,13 +256,18 @@ export default function StockDashboard() {
     setBacktestTrades(btTrades)
     setMissedRunners(missed)
     setBacktestCurve(curve)
+    setModelPredictions(modelPreds)
+    setModelDecisions(modelDecisionRows)
+    setModelPositions(modelPositionRows)
+    setModelOrders(modelOrderRows)
+    setModelSnapshots(modelSnapshotRows)
   }
 
   useEffect(() => {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -262,6 +283,11 @@ export default function StockDashboard() {
         stockRepository.getBacktestTrades(),
         stockRepository.getMissedRunners(),
         stockRepository.getBacktestEquityCurve(),
+        stockRepository.getModelPredictions(),
+        stockRepository.getModelDecisions(),
+        stockRepository.getModelPositions(),
+        stockRepository.getModelOrders(),
+        stockRepository.getModelPortfolioSnapshots(),
       ])
       if (!mounted) return
       setOverview(stats)
@@ -279,6 +305,11 @@ export default function StockDashboard() {
       setBacktestTrades(btTrades)
       setMissedRunners(missed)
       setBacktestCurve(curve)
+      setModelPredictions(modelPreds)
+      setModelDecisions(modelDecisionRows)
+      setModelPositions(modelPositionRows)
+      setModelOrders(modelOrderRows)
+      setModelSnapshots(modelSnapshotRows)
       setLoading(false)
     }
     void load()
@@ -297,6 +328,7 @@ export default function StockDashboard() {
 
   const tabs = useMemo(() => [
     { id: 'auto' as const, label: '自动模拟盘' },
+    { id: 'model' as const, label: '模型模拟盘' },
     { id: 'holdings' as const, label: '持仓执行' },
     { id: 'backtest' as const, label: '回测中心' },
     { id: 'tasks' as const, label: '任务中心' },
@@ -479,6 +511,56 @@ export default function StockDashboard() {
     { header: '收益率', cell: (row) => <ColorNumber value={row.totalReturnRate} suffix="%" />, align: 'right' },
     { header: '持仓数', cell: (row) => row.positionCount, align: 'right' },
     { header: '成交数', cell: (row) => row.tradeCount, align: 'right' },
+  ]
+
+  const modelPredictionColumns: Column<ModelPrediction>[] = [
+    { header: '日期', cell: (row) => row.predictionDate },
+    { header: '排名', cell: (row) => row.rank, align: 'right' },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '模型分', cell: (row) => row.score.toFixed(2), align: 'right' },
+    { header: '预测收益', cell: (row) => <ColorNumber value={row.predictedReturn} suffix="%" />, align: 'right' },
+    { header: '置信度', cell: (row) => `${(row.confidence * 100).toFixed(0)}%`, align: 'right' },
+    { header: '收盘价', cell: (row) => formatPrice(row.closePrice), align: 'right' },
+    { header: '模型版本', cell: (row) => `${row.modelName}/${row.modelVersion}` },
+  ]
+
+  const modelDecisionColumns: Column<ModelDecision>[] = [
+    { header: '时间', cell: (row) => row.decisionTime },
+    { header: '动作', cell: (row) => <StatusTag status={row.action} /> },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '原因', cell: (row) => row.reason },
+    { header: '风控', cell: (row) => row.riskGateStatus },
+    { header: '风控说明', cell: (row) => row.riskGateReason || '-' },
+    { header: '目标仓位', cell: (row) => `${(row.targetWeight * 100).toFixed(1)}%`, align: 'right' },
+    { header: '计划股数', cell: (row) => row.plannedShares, align: 'right' },
+  ]
+
+  const modelPositionColumns: Column<ModelPosition>[] = [
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '成本', cell: (row) => formatPrice(row.costPrice), align: 'right' },
+    { header: '现价', cell: (row) => formatPrice(row.currentPrice), align: 'right' },
+    { header: '股数', cell: (row) => row.shares, align: 'right' },
+    { header: '市值', cell: (row) => formatMoney(row.marketValue), align: 'right' },
+    { header: '浮盈', cell: (row) => <ColorNumber value={row.floatingPnl} />, align: 'right' },
+    { header: '收益率', cell: (row) => <ColorNumber value={row.pnlRate} suffix="%" />, align: 'right' },
+    { header: '模型版本', cell: (row) => `${row.modelName}/${row.modelVersion}` },
+  ]
+
+  const modelOrderColumns: Column<ModelOrder>[] = [
+    { header: '时间', cell: (row) => row.orderTime },
+    { header: '方向', cell: (row) => <StatusTag status={row.side === 'buy' ? '买入' : '卖出'} /> },
+    { header: '代码', cell: (row) => row.code },
+    { header: '名称', cell: (row) => row.name },
+    { header: '价格', cell: (row) => formatPrice(row.price), align: 'right' },
+    { header: '股数', cell: (row) => row.shares, align: 'right' },
+    { header: '金额', cell: (row) => formatMoney(row.amount), align: 'right' },
+    { header: '费用', cell: (row) => formatMoney(row.feeAmount), align: 'right' },
+    { header: '状态', cell: (row) => <StatusTag status={row.status || 'filled'} /> },
+    { header: '原因', cell: (row) => row.reason },
+    { header: '阻断', cell: (row) => row.failureReason || '-' },
   ]
 
   const backtestRunColumns: Column<BacktestRun>[] = [
@@ -993,6 +1075,60 @@ export default function StockDashboard() {
               <section>
                 <h3>自动交易流水</h3>
                 <DataTable columns={paperOrderColumns} data={paperOrders} onRowClick={setSelectedStock} />
+              </section>
+            </div>
+          )}
+          {activeTab === 'model' && (
+            <div className="stock-section-stack">
+              <div className="stock-panel-heading">
+                <div>
+                  <h2>模型模拟盘</h2>
+                  <p>Qlib/LightGBM 基线模型只在虚拟账户里生成交易决策，不接券商，不下真实订单。</p>
+                </div>
+              </div>
+              {latestModelSnapshot && (
+                <div className="stock-account-overview">
+                  <section>
+                    <span>模型总资产</span>
+                    <strong>{formatMoney(latestModelSnapshot.totalAssets)}</strong>
+                  </section>
+                  <section>
+                    <span>模型现金</span>
+                    <strong>{formatMoney(latestModelSnapshot.cash)}</strong>
+                  </section>
+                  <section>
+                    <span>模型盈亏</span>
+                    <strong><ColorNumber value={latestModelSnapshot.totalPnl} /></strong>
+                  </section>
+                  <section>
+                    <span>模型收益率</span>
+                    <strong><ColorNumber value={latestModelSnapshot.totalReturnRate} suffix="%" /></strong>
+                  </section>
+                  <section>
+                    <span>模型回撤</span>
+                    <strong>{latestModelSnapshot.maxDrawdownRate.toFixed(2)}%</strong>
+                  </section>
+                  <section>
+                    <span>连续亏损</span>
+                    <strong>{latestModelSnapshot.consecutiveLosses}</strong>
+                  </section>
+                </div>
+              )}
+              <section>
+                <h3>模型持仓</h3>
+                <DataTable columns={modelPositionColumns} data={modelPositions} onRowClick={setSelectedStock} />
+              </section>
+              <section>
+                <h3>模型虚拟订单</h3>
+                <DataTable columns={modelOrderColumns} data={modelOrders} onRowClick={setSelectedStock} />
+              </section>
+              <section>
+                <h3>模型预测排名</h3>
+                <DataTable columns={modelPredictionColumns} data={modelPredictions} onRowClick={setSelectedStock} />
+              </section>
+              <section>
+                <h3>模型决策审计</h3>
+                <DataTable columns={modelDecisionColumns} data={modelDecisions} onRowClick={setSelectedStock} />
               </section>
             </div>
           )}

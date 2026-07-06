@@ -9,6 +9,11 @@ import type {
   ConfirmSignalBuyInput,
   FineStock,
   HoldingStock,
+  ModelDecision,
+  ModelOrder,
+  ModelPortfolioSnapshot,
+  ModelPosition,
+  ModelPrediction,
   MissedRunner,
   OverviewStats,
   PaperTradeOrder,
@@ -358,6 +363,85 @@ function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
   }
 }
 
+function mapModelPrediction(row: Row): ModelPrediction {
+  return {
+    id: text(row, 'id'),
+    predictionDate: text(row, 'prediction_date'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    modelName: text(row, 'model_name'),
+    modelVersion: text(row, 'model_version'),
+    featureSet: text(row, 'feature_set'),
+    score: numberValue(row, 'score'),
+    rank: numberValue(row, 'rank'),
+    predictedReturn: numberValue(row, 'predicted_return'),
+    confidence: numberValue(row, 'confidence'),
+    closePrice: numberValue(row, 'close_price'),
+    featureWindowStart: text(row, 'feature_window_start'),
+    featureWindowEnd: text(row, 'feature_window_end'),
+  }
+}
+
+function mapModelDecision(row: Row): ModelDecision {
+  return {
+    id: text(row, 'id'),
+    decisionTime: formatDateTime(row.decision_time),
+    decisionDate: text(row, 'decision_date'),
+    strategyAccount: text(row, 'strategy_account'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    modelName: text(row, 'model_name'),
+    modelVersion: text(row, 'model_version'),
+    action: text(row, 'action'),
+    reason: text(row, 'reason'),
+    riskGateStatus: text(row, 'risk_gate_status'),
+    riskGateReason: text(row, 'risk_gate_reason'),
+    targetWeight: numberValue(row, 'target_weight'),
+    plannedShares: numberValue(row, 'planned_shares'),
+    status: text(row, 'status'),
+  }
+}
+
+function mapModelPosition(row: Row): ModelPosition {
+  return {
+    id: text(row, 'id'),
+    strategyAccount: text(row, 'strategy_account'),
+    code: text(row, 'code'),
+    name: text(row, 'name'),
+    costPrice: numberValue(row, 'cost_price'),
+    shares: numberValue(row, 'shares'),
+    currentPrice: numberValue(row, 'current_price'),
+    marketValue: numberValue(row, 'market_value'),
+    floatingPnl: numberValue(row, 'floating_pnl'),
+    pnlRate: numberValue(row, 'pnl_rate'),
+    buyDate: text(row, 'buy_date'),
+    currentSuggestion: text(row, 'current_suggestion'),
+    status: text(row, 'status'),
+    modelName: text(row, 'model_name'),
+    modelVersion: text(row, 'model_version'),
+  }
+}
+
+function mapModelOrder(row: Row): ModelOrder {
+  return {
+    ...mapPaperTradeOrder(row),
+    strategyAccount: text(row, 'strategy_account'),
+    modelName: text(row, 'model_name'),
+    modelVersion: text(row, 'model_version'),
+  }
+}
+
+function mapModelPortfolioSnapshot(row: Row): ModelPortfolioSnapshot {
+  return {
+    ...mapPortfolioSnapshot(row),
+    strategyAccount: text(row, 'strategy_account'),
+    maxDrawdownRate: numberValue(row, 'max_drawdown_rate'),
+    consecutiveLosses: numberValue(row, 'consecutive_losses'),
+    modelName: text(row, 'model_name'),
+    modelVersion: text(row, 'model_version'),
+  }
+}
+
 function mapBacktestRun(row: Row): BacktestRun {
   return {
     id: text(row, 'id'),
@@ -485,6 +569,11 @@ export interface StockRepository {
   getMissedRunners(): Promise<MissedRunner[]>
   getBacktestEquityCurve(): Promise<BacktestEquityPoint[]>
   getSignalEvents(): Promise<SignalEvent[]>
+  getModelPredictions(): Promise<ModelPrediction[]>
+  getModelDecisions(): Promise<ModelDecision[]>
+  getModelPositions(): Promise<ModelPosition[]>
+  getModelOrders(): Promise<ModelOrder[]>
+  getModelPortfolioSnapshots(): Promise<ModelPortfolioSnapshot[]>
   getHistoricalFineStocks(): Promise<FineStock[]>
   addHolding(input: AddHoldingInput): Promise<HoldingStock>
   saveTrade(input: SaveTradeInput): Promise<SaveTradeResult>
@@ -594,6 +683,26 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       const rows = await selectRows('stock_signal_events', 'signal_time')
       if (!client) return []
       return (rows ?? []).map(mapSignalEvent)
+    },
+    async getModelPredictions() {
+      const rows = await selectRows('stock_model_predictions', 'prediction_date')
+      return (rows ?? []).map(mapModelPrediction)
+    },
+    async getModelDecisions() {
+      const rows = await selectRows('stock_model_decisions', 'decision_time')
+      return (rows ?? []).map(mapModelDecision)
+    },
+    async getModelPositions() {
+      const rows = await selectRows('stock_model_positions', 'updated_at', { status: 'open' })
+      return (rows ?? []).map(mapModelPosition)
+    },
+    async getModelOrders() {
+      const rows = await selectRows('stock_model_orders', 'order_time')
+      return (rows ?? []).map(mapModelOrder)
+    },
+    async getModelPortfolioSnapshots() {
+      const rows = await selectRows('stock_model_portfolio_snapshots', 'snapshot_time')
+      return (rows ?? []).map(mapModelPortfolioSnapshot)
     },
     async getHistoricalFineStocks() {
       const rows = await selectRows('stock_strong_picks', 'scan_date')
