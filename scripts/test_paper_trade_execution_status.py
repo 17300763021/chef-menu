@@ -16,6 +16,7 @@ from paper_trade_engine import (
     decision_signal_strength,
     enrich_decisions_with_model_predictions,
     insert_snapshot,
+    is_limit_down,
     record_skipped_sell_decision,
     run,
     sell_decision,
@@ -155,6 +156,43 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
             if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
         ][0]
         self.assertLessEqual(order_payload["amount"], 25000)
+
+    def test_buy_position_writes_entry_stop_loss_to_open_position(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {
+            "code": "000001",
+            "name": "Ping An",
+            "current_price": 10,
+            "suggest_buy_price": 10,
+            "stop_loss": 9.2,
+            "can_buy": True,
+            "multi_factor_score": 100,
+        }
+
+        result = buy_position(client, decision, [], [], market_regime="强牛市")
+
+        self.assertIsNotNone(result)
+        position_payload = [
+            request[2]
+            for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_positions"
+        ][0]
+        self.assertEqual(position_payload["entry_stop_loss"], 9.2)
+
+    def test_is_limit_down_only_uses_numeric_change_rate(self) -> None:
+        decision_with_risk_text = {
+            "change_rate": -5.0,
+            "final_action": "亏损超5%建议止损/减仓，注意避免跌停风险",
+            "status": "止损/风控",
+            "sell_reason": "当前浮亏约 -42.18%",
+        }
+        self.assertFalse(is_limit_down(decision_with_risk_text))
+
+        decision_real_limit_down = {
+            "change_rate": -10.02,
+            "final_action": "跌停卖出受阻",
+        }
+        self.assertTrue(is_limit_down(decision_real_limit_down))
 
     def test_sector_filter_blocks_bottom_sector_buy_candidate(self) -> None:
         calls: list[str] = []
@@ -440,9 +478,113 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
             {"shares": 1000, "cost_price": 10, "sell_stage": "none"},
         )
 
-        self.assertEqual(result.reason, "触发止损")
+        self.assertEqual(result.reason, "触发日内紧急止损")
         self.assertEqual(result.shares, 1000)
         self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_sell_decision_uses_entry_stop_loss(self) -> None:
+        position = {
+            "code": "000001",
+            "shares": 5000,
+            "cost_price": 13.0,
+            "entry_stop_loss": 12.0,
+            "sell_stage": "none",
+            "trailing_stop_price": 0,
+        }
+        decision = {
+            "current_price": 9.0,
+            "stop_loss": 8.5,
+            "target_price_1": 15.0,
+        }
+
+        result = sell_decision(decision, position)
+
+        self.assertIn("原始止损", result.reason)
+        self.assertEqual(result.shares, 5000)
+        self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_sell_decision_backfills_legacy_entry_stop_from_cost(self) -> None:
+        position = {
+            "code": "000001",
+            "shares": 5000,
+            "cost_price": 13.0,
+            "entry_stop_loss": 0,
+            "sell_stage": "none",
+            "trailing_stop_price": 0,
+        }
+        decision = {
+            "current_price": 12.0,
+            "stop_loss": 11.28,
+            "target_price_1": 15.0,
+        }
+
+        result = sell_decision(decision, position)
+
+        self.assertIn("原始止损", result.reason)
+        self.assertEqual(result.shares, 5000)
+        self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_sell_decision_uses_dynamic_stop_only_when_tighter_than_entry_stop(self) -> None:
+        position = {
+            "code": "000001",
+            "shares": 5000,
+            "cost_price": 13.0,
+            "entry_stop_loss": 12.0,
+            "sell_stage": "none",
+            "trailing_stop_price": 0,
+        }
+        decision = {
+            "current_price": 12.2,
+            "stop_loss": 12.5,
+            "target_price_1": 15.0,
+        }
+
+        result = sell_decision(decision, position)
+
+        self.assertIn("日内紧急止损", result.reason)
+        self.assertEqual(result.shares, 5000)
+        self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_orphan_position_triggers_entry_stop_loss_self_rescue(self) -> None:
+        client = FakeSupabaseClient()
+        positions = [{
+            "id": "pos-1",
+            "code": "000001",
+            "name": "Ping An",
+            "shares": 1000,
+            "cost_price": 13,
+            "current_price": 9,
+            "entry_stop_loss": 12,
+            "buy_date": "2026-06-25",
+            "sell_stage": "none",
+        }]
+        calls: list[str] = []
+
+        def fake_sell_position(*args, **kwargs):
+            calls.append(args[5])
+            return None
+
+        restore = self.patch_engine(
+            get_client=lambda: client,
+            classify_market_regime=lambda active_client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda active_client: [],
+            latest_model_predictions=lambda active_client: {},
+            open_positions=lambda active_client: positions,
+            trade_history=lambda active_client: [],
+            portfolio_snapshots=lambda active_client: [],
+            today_orders=lambda active_client: [],
+            sector_momentum_ranking=lambda active_client, lookback_days=20: {},
+            sell_position=fake_sell_position,
+            insert_snapshot=lambda active_client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, ["僵尸仓触发原始止损（无实时决策，自救清仓）"])
+        self.assertEqual(result["orders"], 1)
+        self.assertEqual(result["positions"], 0)
 
     def test_first_r_sell_decision_sells_half_lot(self) -> None:
         result = sell_decision(
@@ -724,7 +866,7 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
             "current_price": 10,
             "suggest_buy_price": 10,
             "can_buy": True,
-            "status": "suspended",
+            "operation_type": "suspended",
         }
 
         result = buy_position(client, decision, [], [])

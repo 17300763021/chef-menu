@@ -156,6 +156,7 @@ Known completed work:
 - 2026-06-29: Added P1-MVP automatic sell lifecycle for simulation paper trading. Implemented sell stage tracking fields, stop-loss clear, 1R partial sell, 2R normal-stock profit-taking, strong limit-up skip with raised trailing stop, trailing-stop clear, linked signal status writes, and deterministic Python fixtures.
 - 2026-06-30: Added P1 profit-protection sell layer for simulation paper trading. Implemented 10% profit near-pressure reduction, 15% profit heavy-volume stagnation clear, 25% high-profit ordinary holding protection sell, 25% high-profit strong-limit-up skip with raised trailing stop, and order-history fixture coverage so automatic protection sells appear in execution records.
 - 2026-07-02: Added P1 board-break protection layer for simulation paper trading. Implemented consecutive limit-up board-strength skip with raised trailing stop, heavy-volume board-break reduction, failed re-seal clear, and deterministic Python fixture coverage for each trigger.
+- 2026-07-09: Fixed the stop-loss failure bug. Added `entry_stop_loss` to positions, wrote the original stop loss at buy time, backfilled legacy open positions from cost price, changed `sell_decision` to use the position's original stop loss instead of a looser dynamic stop, removed text matching from `is_limit_down`, and added self-rescue stop-loss handling for open positions with no `live_decision`.
 
 Remaining work:
 

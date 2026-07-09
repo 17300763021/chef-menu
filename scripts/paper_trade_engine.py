@@ -23,6 +23,7 @@ MAX_SINGLE_POSITION_RATE = float(os.environ.get("STOCK_PAPER_MAX_SINGLE_RATE", "
 CASH_RESERVE_RATE = float(os.environ.get("STOCK_PAPER_CASH_RESERVE_RATE", "0.25"))
 RISK_RATE = float(os.environ.get("STOCK_PAPER_RISK_RATE", "0.01"))
 TRAILING_STOP_RATE = float(os.environ.get("STOCK_PAPER_TRAILING_STOP_RATE", "0.93"))
+LEGACY_ENTRY_STOP_RATE = float(os.environ.get("STOCK_PAPER_LEGACY_ENTRY_STOP_RATE", "0.94"))
 PRESSURE_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_PRESSURE_PROFIT_RATE", "10"))
 STAGNATION_PROFIT_RATE = float(os.environ.get("STOCK_PAPER_STAGNATION_PROFIT_RATE", "15"))
 HIGH_PROFIT_PROTECTION_RATE = float(os.environ.get("STOCK_PAPER_HIGH_PROFIT_RATE", "25"))
@@ -94,18 +95,28 @@ def target_2r(position: dict[str, Any], target_1r: float) -> float:
     return cost_price + 2 * (target_1r - cost_price)
 
 
+def entry_stop_loss(position: dict[str, Any]) -> float:
+    explicit_stop = number(position.get("entry_stop_loss"))
+    if explicit_stop > 0:
+        return explicit_stop
+    cost_price = number(position.get("cost_price"))
+    return round(cost_price * LEGACY_ENTRY_STOP_RATE, 3) if cost_price > 0 else 0
+
+
 def is_strong_limit_up(decision: dict[str, Any]) -> bool:
-    text_value = " ".join(str(decision.get(key, "")) for key in ("status", "final_action", "sell_reason"))
-    return number(decision.get("change_rate")) >= 9.7 or "涨停" in text_value or "limit-up" in text_value.lower()
+    """Only use numeric change rate to identify limit-up state."""
+    return number(decision.get("change_rate")) >= 9.7
 
 
 def is_limit_down(decision: dict[str, Any]) -> bool:
-    text_value = decision_text(decision)
-    return number(decision.get("change_rate")) <= -9.7 or "跌停" in text_value or "limit-down" in text_value.lower()
+    """Only use numeric change rate to identify limit-down state."""
+    return number(decision.get("change_rate")) <= -9.7
 
 
 def is_suspended(decision: dict[str, Any]) -> bool:
-    return has_any_text(decision_text(decision), ("停牌", "suspended", "halted"))
+    """Only inspect operation_type for explicit suspension markers."""
+    op = str(decision.get("operation_type", ""))
+    return "停牌" in op or "suspended" in op.lower()
 
 
 def execution_price(side: str, price: float) -> float:
@@ -759,6 +770,7 @@ def buy_position(
         "current_suggestion": f"自动模拟买入：{decision.get('final_action', '')}",
         "buy_memo": "自动模拟交易引擎",
         "status": "open",
+        "entry_stop_loss": stop_loss,
     }
     rows = client.request("POST", "stock_positions", payload, prefer="return=representation")
     cash_after = cash - market - fee
@@ -901,6 +913,7 @@ def sell_position(
 def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDecision:
     price = number(decision.get("current_price"))
     stop_loss = number(decision.get("stop_loss"))
+    entry_stop = entry_stop_loss(position)
     target_1r = number(decision.get("target_price_1"))
     target_2 = target_2r(position, target_1r)
     shares = integer(position.get("shares"))
@@ -908,7 +921,11 @@ def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDec
     trailing_stop = number(position.get("trailing_stop_price"))
     pnl_rate = profit_rate(price, position)
 
-    if price > 0 and stop_loss > 0 and price <= stop_loss:
+    if price > 0 and entry_stop > 0 and price <= entry_stop:
+        return SellDecision("触发原始止损（买入时设定）", shares, "closed")
+    if price > 0 and stop_loss > 0 and price <= stop_loss and (entry_stop <= 0 or stop_loss > entry_stop):
+        if entry_stop > 0:
+            return SellDecision("触发日内紧急止损", shares, "closed")
         return SellDecision("触发止损", shares, "closed")
     if price > 0 and trailing_stop > 0 and price <= trailing_stop:
         return SellDecision("跌破移动止损", shares, "closed")
@@ -1056,6 +1073,30 @@ def run(dry_run: bool = False) -> dict[str, int]:
         code = str(position.get("code", "")).zfill(6)
         decision = decisions_by_code.get(code)
         if not decision:
+            orphan_stop = entry_stop_loss(position)
+            orphan_price = number(position.get("current_price"))
+            orphan_shares = integer(position.get("shares"))
+            if orphan_stop > 0 and orphan_price > 0 and orphan_price <= orphan_stop and orphan_shares > 0:
+                if not dry_run:
+                    reason_text = "僵尸仓触发原始止损（无实时决策，自救清仓）"
+                    sell_position(
+                        client,
+                        {
+                            "code": code,
+                            "name": position.get("name", ""),
+                            "current_price": orphan_price,
+                            "suggest_sell_price": orphan_price,
+                            "decision_date": date.today().isoformat(),
+                        },
+                        position,
+                        positions,
+                        trades,
+                        reason_text,
+                        orphan_shares,
+                    )
+                    trade_count += 1
+                    trades = trade_history(client)
+                    position_by_code.pop(code, None)
             continue
         updated = update_position_price(
             client,
