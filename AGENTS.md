@@ -231,6 +231,22 @@ Remaining work:
 
 - No P3 blocker remains. Defer broader benchmark data-source hardening and UI drill-down polish until after roadmap progression.
 
+### Backtest And Paper Trading Engine Rule Alignment
+
+Status: Completed (2026-07-09)
+
+Changes:
+
+- Paper trading engine added `MAX_HOLD_DAYS` time stop: positions held at least 10 days and still losing are forced to close.
+- Backtest engine now routes exit decisions through the paper trading sell-rule logic and shared risk constants.
+- Added `scripts/test_engine_reconciliation.py` to verify stop-loss, time-stop, and original-entry-stop behavior across engines.
+- Backtest and paper trading continue to use aligned fee and slippage rates.
+
+Remaining differences (by design):
+
+- Backtest uses intraday `low`/`high` to simulate whether a bar touched a stop or target; paper trading uses the latest live/current price. This is a data granularity difference, not a rule difference.
+- Backtest data source remains `stock_strong_picks`; paper trading data source remains `stock_live_decisions`. Backtest replays historical scanner output, while paper trading responds to live decisions.
+
 ### P4: Qlib Model Integration
 
 Status: Completed

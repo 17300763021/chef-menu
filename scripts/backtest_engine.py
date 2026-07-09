@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,117 @@ MIN_COMMISSION = float(os.environ.get("STOCK_BACKTEST_MIN_COMMISSION", os.enviro
 STAMP_DUTY_RATE = float(os.environ.get("STOCK_BACKTEST_STAMP_DUTY_RATE", os.environ.get("STOCK_PAPER_STAMP_DUTY_RATE", "0.0005")))
 TRANSFER_FEE_RATE = float(os.environ.get("STOCK_BACKTEST_TRANSFER_FEE_RATE", os.environ.get("STOCK_PAPER_TRANSFER_FEE_RATE", "0.00001")))
 DEPS: tuple[Any, Any, Any] | None = None
+
+
+@dataclass(frozen=True)
+class BacktestExitDecision:
+    reason: str
+    paper_reason: str
+
+
+def _paper_trade_helpers() -> dict[str, Any]:
+    import sys
+
+    scripts_dir = Path(__file__).resolve().parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from paper_trade_engine import (
+        HIGH_PROFIT_PROTECTION_RATE,
+        MAX_HOLD_DAYS as PAPER_MAX_HOLD_DAYS,
+        PRESSURE_PROFIT_RATE,
+        STAGNATION_PROFIT_RATE,
+        sell_decision,
+    )
+
+    return {
+        "HIGH_PROFIT_PROTECTION_RATE": HIGH_PROFIT_PROTECTION_RATE,
+        "PAPER_MAX_HOLD_DAYS": PAPER_MAX_HOLD_DAYS,
+        "PRESSURE_PROFIT_RATE": PRESSURE_PROFIT_RATE,
+        "STAGNATION_PROFIT_RATE": STAGNATION_PROFIT_RATE,
+        "sell_decision": sell_decision,
+    }
+
+
+def backtest_exit_decision(
+    *,
+    entry_price: float,
+    shares: int,
+    stop_price: float,
+    target_price: float,
+    close: float,
+    low: float,
+    high: float,
+    holding_days: int,
+    entry_date: date,
+    current_date: date,
+) -> BacktestExitDecision | None:
+    helpers = _paper_trade_helpers()
+    sell_decision = helpers["sell_decision"]
+    pnl_rate = (close / entry_price - 1) * 100 if entry_price > 0 else 0
+    stop = stop_price if stop_price > 0 else entry_price * (1 - DEFAULT_STOP_RATE)
+    target = target_price if target_price > 0 else entry_price * (1 + TAKE_PROFIT_RATE)
+
+    position = {
+        "code": "",
+        "cost_price": entry_price,
+        "shares": shares,
+        "entry_stop_loss": stop,
+        "sell_stage": "none",
+        "trailing_stop_price": 0,
+        "buy_date": date.today().isoformat(),
+    }
+
+    if low <= stop:
+        decision = {
+            "current_price": stop,
+            "stop_loss": stop,
+            "target_price_1": target,
+            "change_rate": 0,
+        }
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("stop_loss", result.reason)
+
+    if holding_days >= helpers["PAPER_MAX_HOLD_DAYS"] and pnl_rate < 0:
+        decision = {
+            "current_price": close,
+            "stop_loss": stop,
+            "target_price_1": target,
+            "change_rate": 0,
+        }
+        position = {**position, "buy_date": (current_date - timedelta(days=holding_days)).isoformat()}
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("max_hold", result.reason)
+
+    high_pnl_rate = (high / entry_price - 1) * 100 if entry_price > 0 else 0
+    if high_pnl_rate >= helpers["HIGH_PROFIT_PROTECTION_RATE"]:
+        decision = {"current_price": high, "stop_loss": stop, "target_price_1": target, "change_rate": 0}
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("take_profit_high", result.reason)
+    if high_pnl_rate >= helpers["STAGNATION_PROFIT_RATE"]:
+        decision = {
+            "current_price": high,
+            "stop_loss": stop,
+            "target_price_1": target,
+            "change_rate": 0,
+            "risk": "放量滞涨",
+        }
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("take_profit_stagnation", result.reason)
+    if high_pnl_rate >= helpers["PRESSURE_PROFIT_RATE"] and high < entry_price * 1.15:
+        decision = {
+            "current_price": high,
+            "stop_loss": stop,
+            "target_price_1": target,
+            "change_rate": 0,
+            "final_action": "临近压力，先减仓保护",
+        }
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("take_profit_pressure", result.reason)
+    if high >= target:
+        decision = {"current_price": target, "stop_loss": stop, "target_price_1": target, "change_rate": 0}
+        result = sell_decision(decision, position)
+        return BacktestExitDecision("take_profit", result.reason)
+    return None
 
 
 def load_backtest_dependencies() -> tuple[Any, Any, Any]:
@@ -54,6 +166,7 @@ def make_pick_strategy(bt: Any) -> type:
 
         def __init__(self) -> None:
             self.entry_bar: int | None = None
+            self.entry_date: date | None = None
             self.entry_price = 0.0
             self.exit_reason = "end"
             self.trade_result: dict[str, Any] | None = None
@@ -65,25 +178,33 @@ def make_pick_strategy(bt: Any) -> type:
                 if shares > 0:
                     self.buy(size=shares)
                     self.entry_bar = len(self)
+                    self.entry_date = current_date
                     self.entry_price = float(self.data.close[0])
                 return
 
-            if not self.position or self.entry_bar is None:
+            if not self.position or self.entry_bar is None or self.entry_date is None:
                 return
 
             holding_days = len(self) - self.entry_bar
+            close = float(self.data.close[0])
             low = float(self.data.low[0])
             high = float(self.data.high[0])
             target = self.entry_price * (1 + float(self.p.target_rate))
             stop = float(self.p.stop_price) or self.entry_price * (1 - DEFAULT_STOP_RATE)
-            if low <= stop:
-                self.exit_reason = "stop_loss"
-                self.close()
-            elif high >= target:
-                self.exit_reason = "take_profit"
-                self.close()
-            elif holding_days >= int(self.p.max_hold_days):
-                self.exit_reason = "max_hold"
+            exit_decision = backtest_exit_decision(
+                entry_price=self.entry_price,
+                shares=abs(int(self.position.size)),
+                stop_price=stop,
+                target_price=target,
+                close=close,
+                low=low,
+                high=high,
+                holding_days=holding_days,
+                entry_date=self.entry_date,
+                current_date=current_date,
+            )
+            if exit_decision:
+                self.exit_reason = exit_decision.reason
                 self.close()
 
         def notify_trade(self, trade: Any) -> None:
@@ -257,6 +378,7 @@ def run_single_pick(pick: dict[str, Any], end: date) -> dict[str, Any] | None:
     shares = max(0, int((INITIAL_CASH * POSITION_RATE / entry_price) // 100) * 100)
     if shares <= 0:
         return None
+    stop_price = number(pick.get("stop_loss")) or entry_price * (1 - DEFAULT_STOP_RATE)
 
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.broker.setcash(INITIAL_CASH)
@@ -265,7 +387,7 @@ def run_single_pick(pick: dict[str, Any], end: date) -> dict[str, Any] | None:
         pick_strategy,
         entry_date=pick_date,
         shares=shares,
-        stop_price=number(pick.get("stop_loss")),
+        stop_price=stop_price,
     )
     strategies = cerebro.run()
     strategy = strategies[0]

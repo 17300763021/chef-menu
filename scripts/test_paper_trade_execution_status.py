@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 import sys
 import unittest
@@ -502,6 +502,48 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         self.assertIn("原始止损", result.reason)
         self.assertEqual(result.shares, 5000)
         self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_time_stop_clears_old_losing_position(self) -> None:
+        position = {
+            "code": "000001",
+            "shares": 5000,
+            "cost_price": 10.0,
+            "entry_stop_loss": 9.4,
+            "sell_stage": "none",
+            "trailing_stop_price": 0,
+            "buy_date": (date.today() - timedelta(days=11)).isoformat(),
+        }
+        decision = {
+            "current_price": 9.8,
+            "stop_loss": 9.4,
+            "target_price_1": 12.0,
+        }
+
+        result = sell_decision(decision, position)
+
+        self.assertIn("时间止损", result.reason)
+        self.assertEqual(result.shares, 5000)
+        self.assertEqual(result.next_sell_stage, "closed")
+
+    def test_time_stop_keeps_old_profitable_position(self) -> None:
+        position = {
+            "code": "000001",
+            "shares": 5000,
+            "cost_price": 10.0,
+            "entry_stop_loss": 9.4,
+            "sell_stage": "none",
+            "trailing_stop_price": 0,
+            "buy_date": (date.today() - timedelta(days=11)).isoformat(),
+        }
+        decision = {
+            "current_price": 10.8,
+            "stop_loss": 9.4,
+            "target_price_1": 12.0,
+        }
+
+        result = sell_decision(decision, position)
+
+        self.assertNotIn("时间止损", result.reason)
 
     def test_sell_decision_backfills_legacy_entry_stop_from_cost(self) -> None:
         position = {

@@ -18,6 +18,7 @@ from sync_stock_data import SupabaseRest, env_value, read_env_file
 
 INITIAL_CAPITAL = float(os.environ.get("STOCK_PAPER_INITIAL_CAPITAL", "1000000"))
 MAX_HOLDINGS = int(os.environ.get("STOCK_PAPER_MAX_HOLDINGS", "6"))
+MAX_HOLD_DAYS = int(os.environ.get("STOCK_PAPER_MAX_HOLD_DAYS", "10"))
 INITIAL_POSITION_RATE = float(os.environ.get("STOCK_PAPER_INITIAL_RATE", "0.08"))
 MAX_SINGLE_POSITION_RATE = float(os.environ.get("STOCK_PAPER_MAX_SINGLE_RATE", "0.15"))
 CASH_RESERVE_RATE = float(os.environ.get("STOCK_PAPER_CASH_RESERVE_RATE", "0.25"))
@@ -157,6 +158,17 @@ def profit_rate(price: float, position: dict[str, Any]) -> float:
     if price <= 0 or cost_price <= 0:
         return 0
     return (price - cost_price) / cost_price * 100
+
+
+def holding_days(position: dict[str, Any], today: date | None = None) -> int:
+    buy_date_text = str(position.get("buy_date") or "")
+    if not buy_date_text:
+        return 0
+    try:
+        buy_date = date.fromisoformat(buy_date_text)
+    except ValueError:
+        return 0
+    return max(0, ((today or date.today()) - buy_date).days)
 
 
 def decision_text(decision: dict[str, Any]) -> str:
@@ -920,7 +932,10 @@ def sell_decision(decision: dict[str, Any], position: dict[str, Any]) -> SellDec
     stage = position_sell_stage(position)
     trailing_stop = number(position.get("trailing_stop_price"))
     pnl_rate = profit_rate(price, position)
+    days_held = holding_days(position)
 
+    if days_held >= MAX_HOLD_DAYS and pnl_rate < 0:
+        return SellDecision(f"触发时间止损（持有{days_held}天，浮亏{pnl_rate:.1f}%）", shares, "closed")
     if price > 0 and entry_stop > 0 and price <= entry_stop:
         return SellDecision("触发原始止损（买入时设定）", shares, "closed")
     if price > 0 and stop_loss > 0 and price <= stop_loss and (entry_stop <= 0 or stop_loss > entry_stop):
