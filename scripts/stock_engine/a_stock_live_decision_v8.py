@@ -43,7 +43,7 @@ from datetime import datetime
 import pandas as pd
 
 from a_stock_trade_common_v7 import (
-    get_hist, get_realtime_one, get_minute, score_stock, decision_from_realtime,
+    get_hist, get_realtime_one, get_minute, score_stock, multi_factor_score, decision_from_realtime,
     get_market_context, get_sector_context, normalize_code, fmt, safe_float
 )
 
@@ -68,7 +68,11 @@ def read_csv_smart(path: str) -> pd.DataFrame:
 
 def make_candidate_from_code(code: str, name: str = "") -> dict:
     hist, source = get_hist(code, days=360)
-    r = score_stock(hist)
+    try:
+        r = multi_factor_score(hist, code=normalize_code(code))
+    except Exception:
+        r = score_stock(hist)
+    factor_scores = r.get("factor_scores", {}) or {}
     return {
         "代码": normalize_code(code),
         "名称": name,
@@ -92,6 +96,12 @@ def make_candidate_from_code(code: str, name: str = "") -> dict:
         "关键位说明": r.get("zone_note"),
         "入选理由": "；".join(r["reasons"]),
         "主要风险": "；".join(r["risks"]),
+        "factor_scores": factor_scores,
+        "因子趋势": factor_scores.get("trend", ""),
+        "因子动量": factor_scores.get("momentum", ""),
+        "因子量价": factor_scores.get("volume", ""),
+        "因子资金": factor_scores.get("flow", ""),
+        "因子质量": factor_scores.get("quality", ""),
         "数据源": source,
     }
 
@@ -283,6 +293,11 @@ def get_live_decision(
     buy_action = buy_d.get("买入建议", "不建议买")
     pass_count = buy_d.get("通过数", 0)
     check_total = buy_d.get("检查总数", 0)
+    factor_trend = safe_float(buy_d.get("因子趋势"), float("nan"))
+    factor_momentum = safe_float(buy_d.get("因子动量"), float("nan"))
+    factor_volume = safe_float(buy_d.get("因子量价"), float("nan"))
+    factor_flow = safe_float(buy_d.get("因子资金"), float("nan"))
+    factor_quality = safe_float(buy_d.get("因子质量"), float("nan"))
 
     if is_holding:
         if "止损" in sell_action or "减仓" in sell_action:
@@ -432,6 +447,11 @@ def get_live_decision(
         "数据缺口": data_gap,
         "昨晚信号": buy_d.get("昨晚信号", ""),
         "买入判断": buy_action,
+        "因子趋势": factor_trend,
+        "因子动量": factor_momentum,
+        "因子量价": factor_volume,
+        "因子资金": factor_flow,
+        "因子质量": factor_quality,
         "压力状态": pressure_state,
         "位阶状态": level_state,
         "当前有效支撑": support,
@@ -519,6 +539,8 @@ def print_decision(d: dict, show_checks: bool = False):
     print(f"建议卖出价：{d.get('建议卖出价', '-')}")
     print(f"最终动作：{d['最终动作']}")
     print(f"买入判断：{d['买入判断']}")
+    if any(not math.isnan(safe_float(d.get(k), float("nan"))) for k in ["因子趋势", "因子动量", "因子量价", "因子资金", "因子质量"]):
+        print(f"因子：趋势 {fmt(d.get('因子趋势'))} | 动量 {fmt(d.get('因子动量'))} | 量价 {fmt(d.get('因子量价'))} | 资金 {fmt(d.get('因子资金'))} | 质量 {fmt(d.get('因子质量'))}")
     if d.get("市场环境"):
         print(f"大盘环境：{d.get('市场环境')} | {d.get('市场建议', '')}")
     if d.get("数据质量分") != "":
@@ -721,6 +743,11 @@ def save_results(rows: list[dict]):
         "账户风险预算": round_or_blank(r.get("账户风险预算"), 2),
         "仓位计算": r.get("仓位计算", ""),
         "买入判断": r["买入判断"],
+        "因子趋势": round_or_blank(r.get("因子趋势"), 2),
+        "因子动量": round_or_blank(r.get("因子动量"), 2),
+        "因子量价": round_or_blank(r.get("因子量价"), 2),
+        "因子资金": round_or_blank(r.get("因子资金"), 2),
+        "因子质量": round_or_blank(r.get("因子质量"), 2),
         "最终动作": r["最终动作"],
         "市场环境": r.get("市场环境", ""),
         "市场建议": r.get("市场建议", ""),

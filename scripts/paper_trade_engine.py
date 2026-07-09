@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from market_regime import classify_market_regime
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
 
@@ -29,9 +31,21 @@ COMMISSION_RATE = float(os.environ.get("STOCK_PAPER_COMMISSION_RATE", "0.0003"))
 MIN_COMMISSION = float(os.environ.get("STOCK_PAPER_MIN_COMMISSION", "5"))
 STAMP_DUTY_RATE = float(os.environ.get("STOCK_PAPER_STAMP_DUTY_RATE", "0.0005"))
 TRANSFER_FEE_RATE = float(os.environ.get("STOCK_PAPER_TRANSFER_FEE_RATE", "0.00001"))
+REGIME_MAX_HOLDINGS = {
+    "强牛市": 8,
+    "弱牛市": 6,
+    "震荡市": 4,
+    "熊市": 2,
+    "防御": 1,
+}
 
 
 ROOT = Path(__file__).resolve().parents[1]
+STOCK_ENGINE = ROOT / "scripts" / "stock_engine"
+if str(STOCK_ENGINE) not in sys.path:
+    sys.path.insert(0, str(STOCK_ENGINE))
+
+from a_stock_trade_common_v7 import sector_momentum_ranking  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -216,6 +230,57 @@ def latest_live_decisions(client: SupabaseRest) -> list[dict[str, Any]]:
     return rows or []
 
 
+def latest_model_predictions(client: SupabaseRest) -> dict[str, dict[str, Any]]:
+    latest = client.request(
+        "GET",
+        "stock_model_predictions?select=prediction_date&order=prediction_date.desc&limit=1",
+    ) or []
+    if not latest:
+        return {}
+    prediction_date = str(latest[0].get("prediction_date") or "")
+    rows = client.request(
+        "GET",
+        f"stock_model_predictions?prediction_date=eq.{quote(prediction_date)}&select=code,score,rank,predicted_return,confidence",
+    ) or []
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row.get("code", "")).zfill(6)
+        if code:
+            out[code] = row
+    return out
+
+
+def normalized_model_rank(rank: float) -> float:
+    if rank <= 0:
+        return 0
+    return max(0, min(100, 101 - rank))
+
+
+def enrich_decisions_with_model_predictions(
+    decisions: list[dict[str, Any]],
+    predictions: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    enriched = []
+    for decision in decisions:
+        item = dict(decision)
+        code = str(item.get("code", "")).zfill(6)
+        prediction = predictions.get(code, {})
+        model_score = number(prediction.get("score"))
+        model_rank = integer(prediction.get("rank"))
+        multi_factor_score = number(
+            item.get("multi_factor_score")
+            or item.get("score")
+            or item.get("ranking_score")
+            or item.get("factor_score")
+        )
+        item["model_score"] = model_score
+        item["model_rank"] = model_rank
+        item["multi_factor_score"] = multi_factor_score
+        item["combined_score"] = normalized_model_rank(model_rank) * 0.4 + multi_factor_score * 0.6
+        enriched.append(item)
+    return enriched
+
+
 def open_positions(client: SupabaseRest) -> list[dict[str, Any]]:
     rows = client.request(
         "GET",
@@ -233,6 +298,14 @@ def today_orders(client: SupabaseRest) -> list[dict[str, Any]]:
     rows = client.request(
         "GET",
         f"stock_auto_trade_orders?order_date=eq.{date.today().isoformat()}&select=*",
+    )
+    return rows or []
+
+
+def portfolio_snapshots(client: SupabaseRest) -> list[dict[str, Any]]:
+    rows = client.request(
+        "GET",
+        "stock_portfolio_snapshots?select=total_assets,snapshot_date,snapshot_time&order=snapshot_date.desc&limit=120",
     )
     return rows or []
 
@@ -257,6 +330,80 @@ def cash_balance(positions: list[dict[str, Any]], trades: list[dict[str, Any]]) 
     return INITIAL_CAPITAL + realized_pnl(trades) - cost_basis(positions)
 
 
+def account_drawdown_pct(snapshots: list[dict[str, Any]], current_total_assets: float) -> float:
+    values = [number(item.get("total_assets")) for item in snapshots]
+    values = [value for value in values if value > 0]
+    if current_total_assets <= 0 or not values:
+        return 0
+    peak = max(max(values), current_total_assets)
+    return max(0, (peak - current_total_assets) / peak * 100) if peak > 0 else 0
+
+
+def consecutive_loss_count(trades: list[dict[str, Any]]) -> int:
+    ordered = sorted(
+        trades,
+        key=lambda item: str(item.get("sell_date") or item.get("trade_date") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    losses = 0
+    for trade in ordered:
+        pnl = number(trade.get("pnl_amount") or trade.get("realized_pnl"))
+        if pnl < 0:
+            losses += 1
+            continue
+        if pnl > 0:
+            break
+    return losses
+
+
+def decision_signal_strength(decision: dict[str, Any]) -> float:
+    score = number(
+        decision.get("multi_factor_score")
+        or decision.get("combined_score")
+        or decision.get("score"),
+        100,
+    )
+    return max(0, min(1, score / 100))
+
+
+def adaptive_position_size(
+    base_amount: float,
+    signal_strength: float,
+    market_regime: str,
+    account_drawdown_pct: float,
+    consecutive_losses: int,
+    stock_volatility_pct: float,
+) -> float:
+    amount = max(0, base_amount)
+    if signal_strength > 0:
+        amount *= max(0.5, min(signal_strength, 1.0))
+
+    regime_position_cap = {
+        "强牛市": 0.80,
+        "弱牛市": 0.60,
+        "震荡市": 0.40,
+        "熊市": 0.20,
+        "防御": 0.10,
+    }
+    cap = regime_position_cap.get(market_regime, 0.40)
+    amount = min(amount, base_amount * cap)
+
+    if account_drawdown_pct > 10:
+        amount *= 0.5
+    elif account_drawdown_pct > 5:
+        amount *= 0.7
+
+    if consecutive_losses >= 5:
+        amount *= 0.25
+    elif consecutive_losses >= 3:
+        amount *= 0.5
+
+    if stock_volatility_pct > 60:
+        amount *= 0.7
+
+    return round(max(amount, base_amount * 0.25), 2)
+
+
 def latest_by_code(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for item in decisions:
@@ -264,6 +411,106 @@ def latest_by_code(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         if code and code not in result:
             result[code] = item
     return result
+
+
+def decision_momentum_score(decision: dict[str, Any]) -> float:
+    factor_scores = decision.get("factor_scores")
+    if isinstance(factor_scores, dict):
+        value = number(factor_scores.get("momentum"), -1)
+        if value >= 0:
+            return value
+    return number(
+        decision.get("factor_momentum")
+        or decision.get("因子动量")
+        or decision.get("momentum_score"),
+        0,
+    )
+
+
+def extract_sector_name(item: dict[str, Any]) -> str:
+    for key in (
+        "shenwan_industry_l1",
+        "industry",
+        "sector",
+        "所属板块",
+        "行业",
+        "板块",
+    ):
+        value = str(item.get(key) or "").strip()
+        if value and value.lower() not in {"none", "nan"}:
+            return value
+    return ""
+
+
+def fetch_sector_name(client: SupabaseRest, code: str) -> str:
+    rows = client.request(
+        "GET",
+        f"stock_sector_mapping?code=eq.{quote(code)}&select=shenwan_industry_l1&limit=1",
+    ) or []
+    if not rows:
+        return ""
+    return str(rows[0].get("shenwan_industry_l1") or "").strip()
+
+
+def sector_name_for_item(client: SupabaseRest, item: dict[str, Any]) -> str:
+    sector = extract_sector_name(item)
+    if sector:
+        return sector
+    code = str(item.get("code", "")).zfill(6)
+    return fetch_sector_name(client, code) if code else ""
+
+
+def sector_rank_for_name(sector_name: str, sector_ranks: dict[str, dict[str, Any]]) -> int:
+    if not sector_name or not sector_ranks:
+        return 0
+    ranking = sector_ranks.get(sector_name)
+    if not ranking:
+        for name, value in sector_ranks.items():
+            if sector_name in name or name in sector_name:
+                ranking = value
+                break
+    return integer((ranking or {}).get("rank"))
+
+
+def sector_skip_reason(decision: dict[str, Any], sector_rank: int) -> str:
+    if sector_rank <= 0:
+        return ""
+    if sector_rank > 15:
+        return "板块排名靠后"
+    if sector_rank > 10 and decision_momentum_score(decision) < 60:
+        return "板块排名靠后，个股动量不足"
+    return ""
+
+
+def mark_weak_sector_observations(
+    client: SupabaseRest,
+    positions: list[dict[str, Any]],
+    sector_ranks: dict[str, dict[str, Any]],
+    dry_run: bool,
+) -> None:
+    if not sector_ranks:
+        return
+    for position in positions:
+        sector = sector_name_for_item(client, position)
+        rank = sector_rank_for_name(sector, sector_ranks)
+        if rank <= 20:
+            continue
+        message = f"减仓观察：板块排名靠后（{sector} #{rank}）"
+        print(f"[SectorRank] {position.get('code', '')} {message}", flush=True)
+        if dry_run:
+            continue
+        position_id = position.get("id")
+        if not position_id:
+            continue
+        client.request(
+            "PATCH",
+            f"stock_positions?id=eq.{quote(str(position_id))}",
+            {
+                "current_suggestion": message,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="return=minimal",
+        )
 
 
 def signal_event_id(client: SupabaseRest, decision: dict[str, Any]) -> str:
@@ -397,17 +644,21 @@ def insert_order(
         "failure_reason": failure_reason,
         "fee_amount": fee_amount,
         "slippage_amount": order_slippage_amount,
+        "model_score": number(decision.get("model_score")),
+        "model_rank": integer(decision.get("model_rank")),
+        "multi_factor_score": number(decision.get("multi_factor_score")),
         "source_decision_date": decision.get("decision_date"),
         "source_update_time": decision.get("update_time", ""),
     }
     try:
         rows = client.request("POST", "stock_auto_trade_orders", [payload], prefer="return=representation")
     except RuntimeError as error:
-        if "fee_amount" not in str(error) and "slippage_amount" not in str(error):
+        optional_fields = ("fee_amount", "slippage_amount")
+        if not any(field in str(error) for field in optional_fields):
             raise
         fallback_payload = dict(payload)
-        fallback_payload.pop("fee_amount", None)
-        fallback_payload.pop("slippage_amount", None)
+        for field in optional_fields:
+            fallback_payload.pop(field, None)
         rows = client.request("POST", "stock_auto_trade_orders", [fallback_payload], prefer="return=representation")
     return str(rows[0].get("id", "")) if rows else ""
 
@@ -444,6 +695,11 @@ def buy_position(
     decision: dict[str, Any],
     positions: list[dict[str, Any]],
     trades: list[dict[str, Any]],
+    max_holdings: int = MAX_HOLDINGS,
+    market_regime: str = "震荡市",
+    account_drawdown: float = 0,
+    consecutive_losses: int = 0,
+    stock_volatility_pct: float = 40,
 ) -> dict[str, Any] | None:
     price = number(decision.get("suggest_buy_price")) or number(decision.get("current_price"))
     stop_loss = number(decision.get("stop_loss"))
@@ -460,15 +716,23 @@ def buy_position(
     if price <= 0:
         record_signal_execution(client, decision, "failed", "自动模拟买入失败：价格无效，未生成虚拟订单")
         return None
-    if len(positions) >= MAX_HOLDINGS:
-        record_signal_execution(client, decision, "blocked", f"自动模拟买入受阻：已达到持仓数量上限 {MAX_HOLDINGS} 只")
+    if len(positions) >= max_holdings:
+        record_signal_execution(client, decision, "blocked", f"自动模拟买入受阻：已达到持仓数量上限 {max_holdings} 只")
         return None
 
     cash = cash_balance(positions, trades)
     total_assets = INITIAL_CAPITAL + realized_pnl(trades) + floating_pnl(positions)
     reserve_cash = INITIAL_CAPITAL * CASH_RESERVE_RATE
     available_cash = max(0, cash - reserve_cash)
-    target_amount = INITIAL_CAPITAL * initial_position_rate(decision)
+    base_amount = INITIAL_CAPITAL * initial_position_rate(decision)
+    target_amount = adaptive_position_size(
+        base_amount,
+        decision_signal_strength(decision),
+        market_regime,
+        account_drawdown,
+        consecutive_losses,
+        stock_volatility_pct,
+    )
     max_single_amount = total_assets * MAX_SINGLE_POSITION_RATE
     risk_per_share = price - stop_loss if stop_loss > 0 and price > stop_loss else price * 0.06
     risk_amount_cap = INITIAL_CAPITAL * RISK_RATE / risk_per_share * price
@@ -720,7 +984,13 @@ def sell_reason(decision: dict[str, Any], position: dict[str, Any]) -> tuple[str
     return "", 0
 
 
-def insert_snapshot(client: SupabaseRest, positions: list[dict[str, Any]], trades: list[dict[str, Any]], trade_count: int) -> None:
+def insert_snapshot(
+    client: SupabaseRest,
+    positions: list[dict[str, Any]],
+    trades: list[dict[str, Any]],
+    trade_count: int,
+    regime: str = "震荡市",
+) -> None:
     hold_value = market_value(positions)
     realized = realized_pnl(trades)
     floating = floating_pnl(positions)
@@ -737,15 +1007,33 @@ def insert_snapshot(client: SupabaseRest, positions: list[dict[str, Any]], trade
         "total_return_rate": total_pnl / INITIAL_CAPITAL * 100 if INITIAL_CAPITAL > 0 else 0,
         "position_count": len(positions),
         "trade_count": trade_count,
-        "note": "auto paper trading snapshot",
+        "note": f"[{regime}] auto paper trading snapshot",
     }])
 
 
 def run(dry_run: bool = False) -> dict[str, int]:
     client = get_client()
+    regime_info = classify_market_regime(client)
+    regime = str(regime_info.get("regime") or "震荡市")
+    position_cap_pct = number(regime_info.get("position_cap_pct"), 40)
+    max_holdings = REGIME_MAX_HOLDINGS.get(regime, 4)
+    buy_blocked_by_regime = regime in {"熊市", "防御"}
+    print(f"[MarketRegime] {regime} | 仓位上限 {position_cap_pct}% | 最大持仓 {max_holdings}", flush=True)
+    if os.environ.get("A_STOCK_SKIP_SECTOR_RANKING", "").strip().lower() in {"1", "true", "yes"}:
+        print("[SectorRank] 已按环境变量跳过行业过滤", flush=True)
+        sector_ranks = {}
+    else:
+        try:
+            sector_ranks = sector_momentum_ranking(client, lookback_days=20)
+        except Exception as exc:
+            print(f"[SectorRank] 行业排名获取失败，跳过行业过滤: {exc}", flush=True)
+            sector_ranks = {}
     decisions = latest_live_decisions(client)
+    predictions = latest_model_predictions(client)
+    decisions = enrich_decisions_with_model_predictions(decisions, predictions)
     positions = open_positions(client)
     trades = trade_history(client)
+    snapshots = portfolio_snapshots(client)
     try:
         existing_orders = today_orders(client)
     except RuntimeError as reason:
@@ -760,6 +1048,9 @@ def run(dry_run: bool = False) -> dict[str, int]:
     decisions_by_code = latest_by_code(decisions)
     position_by_code = {str(item.get("code", "")).zfill(6): item for item in positions}
     trade_count = 0
+    total_assets_now = INITIAL_CAPITAL + realized_pnl(trades) + floating_pnl(positions)
+    account_drawdown = account_drawdown_pct(snapshots, total_assets_now)
+    consecutive_losses = consecutive_loss_count(trades)
 
     for position in list(positions):
         code = str(position.get("code", "")).zfill(6)
@@ -775,6 +1066,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
         position_by_code[code] = updated
 
     positions = [item for item in position_by_code.values() if integer(item.get("shares")) > 0]
+    mark_weak_sector_observations(client, positions, sector_ranks, dry_run)
 
     for position in list(positions):
         code = str(position.get("code", "")).zfill(6)
@@ -813,10 +1105,33 @@ def run(dry_run: bool = False) -> dict[str, int]:
     ]
     for decision in buy_candidates:
         code = str(decision.get("code", "")).zfill(6)
-        if len(position_by_code) >= MAX_HOLDINGS or (code, "buy") in ordered_keys:
+        if buy_blocked_by_regime:
+            if not dry_run:
+                record_signal_execution(client, decision, "blocked", f"市场状态为{regime}，自动模拟停止新增买入")
+            continue
+        sector = sector_name_for_item(client, decision)
+        sector_rank = sector_rank_for_name(sector, sector_ranks)
+        skip_reason = sector_skip_reason(decision, sector_rank)
+        if skip_reason:
+            full_reason = f"{skip_reason}（{sector or '未知行业'} #{sector_rank}）"
+            print(f"[SectorRank] {code} {full_reason}", flush=True)
+            if not dry_run:
+                record_signal_execution(client, decision, "blocked", full_reason)
+            continue
+        if len(position_by_code) >= max_holdings or (code, "buy") in ordered_keys:
             continue
         if not dry_run:
-            bought = buy_position(client, decision, list(position_by_code.values()), trades)
+            bought = buy_position(
+                client,
+                decision,
+                list(position_by_code.values()),
+                trades,
+                max_holdings=max_holdings,
+                market_regime=regime,
+                account_drawdown=account_drawdown,
+                consecutive_losses=consecutive_losses,
+                stock_volatility_pct=number(decision.get("stock_volatility_pct") or decision.get("volatility_pct"), 40),
+            )
             if bought:
                 position_by_code[code] = bought
                 trade_count += 1
@@ -824,7 +1139,7 @@ def run(dry_run: bool = False) -> dict[str, int]:
     final_positions = [item for item in position_by_code.values() if integer(item.get("shares")) > 0]
     final_trades = trade_history(client)
     if not dry_run:
-        insert_snapshot(client, final_positions, final_trades, trade_count)
+        insert_snapshot(client, final_positions, final_trades, trade_count, regime=regime)
     return {
         "decisions": len(decisions),
         "positions": len(final_positions),

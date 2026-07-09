@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 import time
 from pathlib import Path
 from datetime import datetime
@@ -30,9 +32,130 @@ import numpy as np
 import pandas as pd
 
 from a_stock_trade_common_v7 import (
-    get_spot_all, get_hist, score_stock, safe_float, normalize_code,
+    get_spot_all, get_hist, score_stock, multi_factor_score,
+    sector_momentum_ranking, safe_float, normalize_code,
     is_bad_name, balanced_pool, get_eastmoney_spot_meta
 )
+
+
+def _optional_supabase_client():
+    scripts_dir = Path(__file__).resolve().parents[1]
+    scripts_path = str(scripts_dir)
+    if scripts_path not in sys.path:
+        sys.path.insert(0, scripts_path)
+    try:
+        from sync_stock_data import SupabaseRest, env_value, read_env_file
+
+        env = read_env_file()
+        url = env_value("VITE_SUPABASE_URL", env) or os.environ.get("VITE_SUPABASE_URL", "")
+        key = env_value("SUPABASE_SERVICE_ROLE_KEY", env) or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        if not url or not key:
+            return None
+        return SupabaseRest(url, key)
+    except Exception:
+        return None
+
+
+def load_capital_flow_cache(client=None, limit: int = 5000) -> dict:
+    if client is None:
+        client = _optional_supabase_client()
+    if client is None:
+        return {}
+    select = ",".join([
+        "code",
+        "name",
+        "flow_date",
+        "north_bound_net_inflow",
+        "north_bound_holding_pct",
+        "north_bound_holding_change",
+        "big_order_net_inflow",
+        "big_order_buy_ratio",
+        "main_net_inflow",
+        "main_net_inflow_ratio",
+        "margin_balance_change",
+    ])
+    try:
+        rows = client.request(
+            "GET",
+            f"stock_capital_flow?select={select}&order=flow_date.desc&limit={int(limit)}",
+        ) or []
+    except Exception:
+        return {}
+
+    cache = {}
+    for row in rows:
+        code = normalize_code(row.get("code", ""))
+        if code and code not in cache:
+            cache[code] = row
+    return cache
+
+
+def load_sector_data_cache(client=None, sector_rankings: dict | None = None, limit: int = 6000) -> dict:
+    if client is None:
+        client = _optional_supabase_client()
+    if client is None:
+        return {}
+    sector_rankings = sector_rankings or {}
+    select = "code,name,shenwan_industry_l1,shenwan_industry_l2,concept_tags"
+    try:
+        rows = client.request("GET", f"stock_sector_mapping?select={select}&limit={int(limit)}") or []
+    except Exception:
+        return {}
+
+    cache = {}
+    for row in rows:
+        code = normalize_code(row.get("code", ""))
+        if not code:
+            continue
+        industry = str(row.get("shenwan_industry_l1") or "").strip()
+        ranking = sector_rankings.get(industry, {}) if industry else {}
+        sector_data = dict(row)
+        sector_data["sector_rank"] = ranking.get("rank", "")
+        sector_data["sector_return_20d"] = safe_float(ranking.get("momentum_20d"), 0)
+        sector_data["sector_return_60d"] = safe_float(ranking.get("momentum_20d"), 0)
+        sector_data["avg_volume_ratio"] = safe_float(ranking.get("avg_volume_ratio"), 1)
+        cache[code] = sector_data
+    return cache
+
+
+def build_scan_context(args) -> dict:
+    client = _optional_supabase_client()
+    sector_rankings = {}
+    skip_sector_ranking = os.environ.get("A_STOCK_SKIP_SECTOR_RANKING", "").strip() in ["1", "true", "yes"]
+    if client is not None and not skip_sector_ranking:
+        try:
+            sector_rankings = sector_momentum_ranking(client)
+        except Exception as e:
+            if args.verbose:
+                print(f"[multi-factor] 行业动量读取失败，继续使用个股评分：{e}")
+    elif skip_sector_ranking and args.verbose:
+        print("[multi-factor] 已按环境变量跳过行业动量排名。")
+    capital_flow_cache = load_capital_flow_cache(client)
+    sector_data_cache = load_sector_data_cache(client, sector_rankings)
+    return {
+        "capital_flow_cache": capital_flow_cache,
+        "sector_data_cache": sector_data_cache,
+        "market_state": getattr(args, "market_state", "震荡市"),
+    }
+
+
+def score_with_multifactor_fallback(
+    hist: pd.DataFrame,
+    code: str,
+    capital_flow: dict | None = None,
+    sector_data: dict | None = None,
+    market_state: str = "震荡市",
+) -> tuple[dict, bool]:
+    try:
+        return multi_factor_score(
+            hist,
+            code=code,
+            capital_flow=capital_flow,
+            sector_data=sector_data,
+            market_state=market_state,
+        ), True
+    except Exception:
+        return score_stock(hist), False
 
 
 def classify_pool(row: dict, args) -> str:
@@ -49,6 +172,8 @@ def classify_pool(row: dict, args) -> str:
     amount_yi = safe_float(row.get("成交额_亿"), 0)
     turnover = safe_float(row.get("换手率"), float("nan"))
     pct_5d = safe_float(row.get("5日涨跌幅"), float("nan"))
+    sector_rank = safe_float(row.get("行业排名"), float("nan"))
+    momentum_score = safe_float(row.get("因子动量"), float("nan"))
 
     standard_buy = (
         "回踩20日线低吸买点" in signal
@@ -86,7 +211,22 @@ def classify_pool(row: dict, args) -> str:
         )
     )
 
-    if (standard_buy and score >= args.strong_min_score and not standard_block) or quality_trend:
+    top_sector_bonus = (
+        not math.isnan(sector_rank)
+        and sector_rank <= 5
+        and standard_buy
+        and score >= args.strong_min_score - 3
+        and not standard_block
+    )
+    bottom_sector_cap = (
+        not math.isnan(sector_rank)
+        and sector_rank >= 19
+        and (math.isnan(momentum_score) or momentum_score <= 70)
+    )
+
+    if bottom_sector_cap:
+        return "观察池"
+    if (standard_buy and score >= args.strong_min_score and not standard_block) or quality_trend or top_sector_bonus:
         return "重点池"
     return "观察池"
 
@@ -140,11 +280,28 @@ def strategy_review(item: dict, args) -> tuple[str, str]:
     return "核心候选", ""
 
 
-def analyze_stock(row: pd.Series, args) -> dict | None:
+def analyze_stock(
+    row: pd.Series,
+    args,
+    capital_flow_cache: dict | None = None,
+    sector_data_cache: dict | None = None,
+    market_state: str = "震荡市",
+) -> dict | None:
     code = normalize_code(row["code"])
     name = row.get("name", "")
     hist, source = get_hist(code, days=360)
-    r = score_stock(hist)
+    capital_flow = (capital_flow_cache or {}).get(code)
+    sector_data = (sector_data_cache or {}).get(code)
+    r, used_multifactor = score_with_multifactor_fallback(
+        hist,
+        code,
+        capital_flow=capital_flow,
+        sector_data=sector_data,
+        market_state=market_state,
+    )
+    industry = str(row.get("industry", "") or "").strip()
+    if not industry and isinstance(sector_data, dict):
+        industry = str(sector_data.get("shenwan_industry_l1") or "").strip()
     has_buy = "买点" in r["signal"] and "暂无" not in r["signal"]
 
     if r["score"] < args.min_score and not has_buy:
@@ -154,7 +311,7 @@ def analyze_stock(row: pd.Series, args) -> dict | None:
         "生成日期": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "代码": code,
         "名称": name,
-        "行业": row.get("industry", ""),
+        "行业": industry,
         "排名分": r["score"],
         "昨收": round(r["last_close"], 3),
         "昨日日涨跌幅": round(safe_float(row.get("pct"), 0), 2),
@@ -170,6 +327,12 @@ def analyze_stock(row: pd.Series, args) -> dict | None:
         "10日涨跌幅": round(safe_float(row.get("pct_10d"), float("nan")), 2) if not math.isnan(safe_float(row.get("pct_10d"), float("nan"))) else np.nan,
         "20日涨跌幅": round(safe_float(row.get("pct_20d"), float("nan")), 2) if not math.isnan(safe_float(row.get("pct_20d"), float("nan"))) else np.nan,
         "60日涨跌幅": round(safe_float(row.get("pct_60d"), float("nan")), 2) if not math.isnan(safe_float(row.get("pct_60d"), float("nan"))) else np.nan,
+        "因子趋势": round(safe_float(r.get("factor_scores", {}).get("trend"), float("nan")), 2) if used_multifactor else "",
+        "因子动量": round(safe_float(r.get("factor_scores", {}).get("momentum"), float("nan")), 2) if used_multifactor else "",
+        "因子量价": round(safe_float(r.get("factor_scores", {}).get("volume"), float("nan")), 2) if used_multifactor else "",
+        "因子资金": round(safe_float(r.get("factor_scores", {}).get("flow"), float("nan")), 2) if used_multifactor else "",
+        "因子质量": round(safe_float(r.get("factor_scores", {}).get("quality"), float("nan")), 2) if used_multifactor else "",
+        "行业排名": sector_data.get("sector_rank", "") if isinstance(sector_data, dict) else "",
         "动作": r["action"],
         "信号": r["signal"],
         "MA20": round(r["ma20"], 3),
@@ -201,13 +364,20 @@ def analyze_stock(row: pd.Series, args) -> dict | None:
     return item
 
 
-def analyze_sequential(selected: pd.DataFrame, args) -> list[dict]:
+def analyze_sequential(selected: pd.DataFrame, args, scan_context: dict | None = None) -> list[dict]:
+    scan_context = scan_context or {}
     rows = []
     for i, (_, row) in enumerate(selected.iterrows(), start=1):
         code = normalize_code(row["code"])
         name = row.get("name", "")
         try:
-            item = analyze_stock(row, args)
+            item = analyze_stock(
+                row,
+                args,
+                capital_flow_cache=scan_context.get("capital_flow_cache"),
+                sector_data_cache=scan_context.get("sector_data_cache"),
+                market_state=scan_context.get("market_state", "震荡市"),
+            )
             if item:
                 rows.append(item)
         except KeyboardInterrupt:
@@ -282,16 +452,31 @@ def scan(args) -> pd.DataFrame:
     print("过滤条件：" + "，".join(filter_desc) + "。")
     print("说明：成交额只做流动性门槛，最后按技术评分和买点排序。\n")
 
+    scan_context = build_scan_context(args)
+    if args.verbose:
+        print(
+            "[multi-factor] "
+            f"资金流缓存 {len(scan_context.get('capital_flow_cache', {}))} 条，"
+            f"行业数据缓存 {len(scan_context.get('sector_data_cache', {}))} 条。"
+        )
+
     rows = []
     if args.workers <= 1:
-        rows = analyze_sequential(selected, args)
+        rows = analyze_sequential(selected, args, scan_context)
     else:
         print(f"并发加速：{args.workers} 个进程同时拉日K。")
         try:
             future_map = {}
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
                 for _, row in selected.iterrows():
-                    future = executor.submit(analyze_stock, row, args)
+                    future = executor.submit(
+                        analyze_stock,
+                        row,
+                        args,
+                        scan_context.get("capital_flow_cache"),
+                        scan_context.get("sector_data_cache"),
+                        scan_context.get("market_state", "震荡市"),
+                    )
                     future_map[future] = (normalize_code(row["code"]), row.get("name", ""))
                     if args.sleep > 0:
                         time.sleep(args.sleep)
@@ -313,7 +498,7 @@ def scan(args) -> pd.DataFrame:
                         print(f"总进度 {i}/{total}，当前入选 {len(rows)} 只。", flush=True)
         except Exception as e:
             print(f"并发启动失败，改为稳定单进程：{e}")
-            rows = analyze_sequential(selected, args)
+            rows = analyze_sequential(selected, args, scan_context)
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -413,6 +598,7 @@ def main():
     ap.add_argument("--min-mv", type=float, default=30.0, help="最低市值，单位亿元")
     ap.add_argument("--max-mv", type=float, default=None, help="最高市值，单位亿元")
     ap.add_argument("--pool-mode", choices=["balanced", "liquidity", "random"], default="balanced")
+    ap.add_argument("--market-state", default="震荡市", choices=["强牛市", "弱牛市", "震荡市", "震荡", "熊市", "防御"], help="多因子权重使用的市场状态")
     ap.add_argument("--sleep", type=float, default=0.15, help="每只股票之间停顿，网络差可调大")
     ap.add_argument("--workers", type=int, default=1, help="并发拉取日K的线程数，建议 1-4")
     ap.add_argument("--outdir", default="watchlists")
@@ -425,7 +611,7 @@ def main():
         return
 
     strong, observe = split_pools(df)
-    show_cols = ["池分类", "策略等级", "代码", "名称", "排名分", "昨收", "信号", "动作", "支撑1", "压力1", "建议止损", "入选理由", "主要风险", "策略复核"]
+    show_cols = ["池分类", "策略等级", "代码", "名称", "排名分", "因子趋势", "因子动量", "因子量价", "因子资金", "因子质量", "行业排名", "昨收", "信号", "动作", "支撑1", "压力1", "建议止损", "入选理由", "主要风险", "策略复核"]
     if not strong.empty:
         print("\n===== 重点池：明天优先盯 =====")
         print(strong[show_cols].to_string(index=False))

@@ -26,6 +26,12 @@ export interface RoughStock extends BaseStock {
   stopLoss: number
   reason: string
   risk: string
+  factorTrend: number
+  factorMomentum: number
+  factorVolume: number
+  factorFlow: number
+  factorQuality: number
+  sectorRank: number
 }
 
 export interface FineStock extends RoughStock {
@@ -266,6 +272,23 @@ export interface PortfolioSnapshot {
   positionCount: number
   tradeCount: number
   note: string
+}
+
+export interface MarketRegime {
+  id: string
+  regimeDate: string
+  regime: '强牛市' | '弱牛市' | '震荡市' | '熊市' | '防御' | string
+  csi300Close: number
+  csi300Ma20: number
+  csi300Ma60: number
+  marketTurnoverYi: number
+  limitUpCount: number
+  limitDownCount: number
+  breakRatePct: number
+  advanceDeclineRatio: number
+  positionCapPct: number
+  regimeNote: string
+  breadthSource: string
 }
 
 export interface ModelPrediction {

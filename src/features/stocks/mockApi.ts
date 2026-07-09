@@ -1,6 +1,7 @@
 import type {
   FineStock,
   HoldingStock,
+  MarketRegime,
   OverviewStats,
   RealtimeDecision,
   RoughStock,
@@ -11,6 +12,23 @@ import type {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const today = '2026-06-16'
+
+const marketRegime: MarketRegime = {
+  id: 'mock-regime',
+  regimeDate: today,
+  regime: '震荡市',
+  csi300Close: 3950,
+  csi300Ma20: 3920,
+  csi300Ma60: 3880,
+  marketTurnoverYi: 9500,
+  limitUpCount: 65,
+  limitDownCount: 12,
+  breakRatePct: 22.5,
+  advanceDeclineRatio: 1.3,
+  positionCapPct: 40,
+  regimeNote: '模拟数据：大盘震荡，方向不明，模拟仓位上限40%',
+  breadthSource: 'mock',
+}
 
 const roughStocks: RoughStock[] = [
   {
@@ -26,6 +44,12 @@ const roughStocks: RoughStock[] = [
     stopLoss: 51.6,
     reason: '趋势保持，量能温和，靠近支撑区',
     risk: '黄金板块波动放大，追高风险较高',
+    factorTrend: 82,
+    factorMomentum: 76,
+    factorVolume: 63,
+    factorFlow: 72,
+    factorQuality: 58,
+    sectorRank: 3,
   },
   {
     code: '603993',
@@ -40,6 +64,12 @@ const roughStocks: RoughStock[] = [
     stopLoss: 18.3,
     reason: '中期均线多头，板块强度仍在',
     risk: '距离压力位空间不足',
+    factorTrend: 78,
+    factorMomentum: 68,
+    factorVolume: 59,
+    factorFlow: 61,
+    factorQuality: 64,
+    sectorRank: 7,
   },
   {
     code: '002600',
@@ -54,6 +84,12 @@ const roughStocks: RoughStock[] = [
     stopLoss: 13.8,
     reason: '修复形态出现，短线资金回流',
     risk: '消费电子板块轮动较快',
+    factorTrend: 70,
+    factorMomentum: 73,
+    factorVolume: 66,
+    factorFlow: 57,
+    factorQuality: 60,
+    sectorRank: 9,
   },
 ]
 
@@ -223,6 +259,10 @@ export const stocksApi = {
   async getTasks(): Promise<TaskRecord[]> {
     await delay(80)
     return tasks
+  },
+  async getMarketRegime(): Promise<MarketRegime> {
+    await delay(80)
+    return marketRegime
   },
   async submitTradeForm(): Promise<{ success: true }> {
     await delay(120)

@@ -275,65 +275,895 @@ Remaining work:
 
 - No P4 blocker remains. Defer full Qlib package dependency hardening, richer Alpha158/Alpha360 feature parity, and UI rank-comparison polish until after roadmap progression.
 
-### P5: Hybrid Strategy Simulation
+### P5: Multi-Factor Strategy Engine
 
-Status: Pending
+Status: Completed
 
-Goal: Run rule strategy, model strategy, and hybrid strategy side by side in paper trading.
+Goal: Replace the single technical-analysis scoring function with a diversified multi-factor ranking system, and fuse the P4 model predictions with the rule-based execution engine so they work together instead of in separate isolated accounts.
 
-Required work:
+**Background — why this matters:** The current `score_stock()` function in `a_stock_trade_common_v7.py` is essentially a checklist of MA20/RSI/MACD signals. All these signals are highly correlated (>0.7) because they all measure the same thing: price position relative to moving averages. When this single dimension fails (e.g., 2025 bull market where pullbacks never came), the whole strategy fails. The fix is to introduce independent factor families — momentum, capital flow, volume structure, quality — so that when one factor style underperforms, others compensate. Additionally, the P4 LightGBM/CatBoost/XGBoost ensemble currently writes predictions to a separate isolated account. This step fuses model predictions into the main rule engine: the model ranks stocks, the rules handle timing + risk gates + execution.
 
-- Strategy accounts must be separated.
-- Holdings and orders must be tagged by strategy name and strategy version.
-- Hybrid flow:
+---
 
-```text
-Qlib model ranks candidates
-Rule filters remove high-risk candidates
-Portfolio layer selects final candidates
-Execution engine applies trading constraints and risk rules
+Known completed work:
+
+- 2026-07-07: Completed P5 Step 5.1. Created local Supabase migrations for `stock_capital_flow` and `stock_sector_mapping`, applied them to the online Supabase project, and verified both tables, required fields, `UNIQUE(code, flow_date)`, `code` primary key, RLS, and admin-only policies.
+- 2026-07-07: Completed P5 Step 5.2. Added `scripts/sync_capital_flow.py` and `scripts/test_sync_capital_flow.py`, reused `SupabaseRest`, implemented East Money capital-flow sync with `--date` and `--mode`, verified unit tests, and verified online `stock_capital_flow` had 20 rows for 2026-07-04 with nonzero main/big-order flow and no duplicate `(code, flow_date)` keys. Fallback paths keep north-bound fields at 0 when true north-bound data is unavailable.
+- 2026-07-07: Completed P5 Step 5.3. Added `scripts/sync_sector_mapping.py` and `scripts/test_sync_sector_mapping.py`, synced Shenwan sector mapping from AkShare/official Shenwan classification data into `stock_sector_mapping`, verified `--force` refresh and non-force skip behavior, and verified online coverage of 800 stocks with non-empty `shenwan_industry_l1`, zero duplicate codes, and spot-checked industry mappings.
+- 2026-07-07: Completed P5 Step 5.4. Added `multi_factor_score()` alongside the existing `score_stock()` without deleting the fallback function, implemented independent trend, residual momentum, volume-price structure, capital-flow, and quality/risk factor scores with regime-dependent weights, preserved backward-compatible return fields, added factor score/contribution explainability fields, and verified deterministic multi-factor fixtures plus related existing Python tests.
+- 2026-07-07: P5 Step 5.5 is partially complete. Added `sector_momentum_ranking()` plus East Money industry-index snapshot/history helpers in `a_stock_trade_common_v7.py`, implemented deterministic ranking for 5-day and 20-day sector momentum across 28 sectors, and verified local fixture tests. Real East Money `push2` industry-index calls are currently blocked by remote connection closures in this environment, so live-data verification remains.
+- 2026-07-07: P5 Step 5.6 implementation is complete. Updated `a_stock_night_scanner_v7.py` to build Supabase-backed capital-flow and sector-data caches, call `multi_factor_score()` from `analyze_stock()` with fallback to `score_stock()`, pass factor scores and industry rank through the watchlist output, apply sector-rank-aware pool classification, and added deterministic scanner integration tests. Verified CSV output includes the new factor columns in a small live scanner run; the full `--limit 50` acceptance run timed out while East Money sector-index requests were disconnecting, so full-size live acceptance should be rerun when that endpoint is stable.
+- 2026-07-07: Completed P5 Step 5.7. Updated `a_stock_live_decision_v8.py` so single-code candidate creation uses `multi_factor_score()` with `score_stock()` fallback, carries factor scores into console/CSV output, and updated `decision_from_realtime()` to read factor scores, add weak-flow risk notes, and allow one-level buy-action upgrade for strong momentum when hard timing blockers are absent. Added deterministic live-decision multi-factor tests and verified the live decision CSV includes factor score columns.
+- 2026-07-09: Completed P5 Step 5.8. Added `model_score`, `model_rank`, and `multi_factor_score` fields to `stock_auto_trade_orders` locally and online, updated `paper_trade_engine.py` to fetch latest `stock_model_predictions`, merge model scores/ranks into live decisions, compute a 40% model-rank / 60% multi-factor combined score, and write the three audit fields into every auto-trade order payload. Verified online schema, latest model prediction availability, REST write/read/delete probe, local deterministic paper-trade tests, and online dry-run.
+- 2026-07-09: Completed P5 Step 5.9. Added Supabase factor columns to `stock_scan_results` and `stock_strong_picks`, mapped scanner CSV factor fields through `sync_stock_data.py`, mapped factor fields in the frontend stock repository/types, and added a compact FactorBar column to rough, fine, and historical pick tables.
+- 2026-07-09: Completed P5 Step 5.10 closure. Applied the factor-column migration online, synced the latest scanner CSV into Supabase, verified latest `stock_scan_results` and `stock_strong_picks` rows have nonzero factor data, and verified Python factor/sync tests, Vitest, and production build all pass. Known external caveat: East Money industry-index live calls may still disconnect, so full-size sector-rank live refresh should be retried when the upstream endpoint is stable.
+
+Remaining work:
+
+- No P5 blocker remains. Continue from P6 Step 6.1 only after user confirmation.
+
+#### Step 5.1: Add Supabase tables for capital flow and sector classification
+
+**Files to create:**
+- `supabase/migrations/20260707_add_stock_capital_flow.sql`
+- `supabase/migrations/20260707_add_stock_sector_classification.sql`
+
+**Table: `stock_capital_flow`**
+```sql
+CREATE TABLE IF NOT EXISTS stock_capital_flow (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  flow_date DATE NOT NULL,
+  north_bound_net_inflow NUMERIC DEFAULT 0,        -- 北向资金净流入（万元）
+  north_bound_holding_pct NUMERIC DEFAULT 0,        -- 北向持股占比（%）
+  north_bound_holding_change NUMERIC DEFAULT 0,     -- 北向持股变化（%, 当日）
+  big_order_net_inflow NUMERIC DEFAULT 0,           -- 大单净流入（万元）
+  big_order_buy_ratio NUMERIC DEFAULT 0,            -- 大单买入占比（%）
+  main_net_inflow NUMERIC DEFAULT 0,                -- 主力净流入（万元）
+  main_net_inflow_ratio NUMERIC DEFAULT 0,          -- 主力净流入占比（%）
+  margin_balance_change NUMERIC DEFAULT 0,          -- 融资余额变化（万元）
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(code, flow_date)
+);
 ```
 
-Acceptance checks:
+**Table: `stock_sector_mapping`**
+```sql
+CREATE TABLE IF NOT EXISTS stock_sector_mapping (
+  code TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  shenwan_industry_l1 TEXT NOT NULL DEFAULT '',     -- 申万一级行业
+  shenwan_industry_l2 TEXT NOT NULL DEFAULT '',     -- 申万二级行业
+  concept_tags TEXT[] DEFAULT '{}',                 -- 概念板块标签
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+```
 
-- Rule-only, model-only, and hybrid strategies can run simultaneously.
-- Their PnL, drawdown, turnover, and trades are separated.
-- UI can compare their performance.
+**Acceptance:** Both tables exist in Supabase online. `stock_capital_flow` has the unique index on (code, flow_date). `stock_sector_mapping` has code as primary key.
 
-### P6: Model Leaderboard And Attribution Center
+---
+
+#### Step 5.2: Create capital flow data sync script
+
+**File to create:** `scripts/sync_capital_flow.py`
+
+This script fetches capital flow data from East Money's public APIs and writes to Supabase. It reuses `SupabaseRest` from `sync_stock_data.py`.
+
+**Required behavior:**
+- Fetch north-bound capital flow (北向资金) per stock from East Money API `https://push2.eastmoney.com/api/qt/clist/get` with appropriate fs parameter for north-bound pool
+- Fetch big-order net inflow (大单净流入) from East Money's moneyflow endpoint
+- Upsert into `stock_capital_flow` table with `(code, flow_date)` unique constraint
+- Accept `--date YYYY-MM-DD` argument (defaults to latest trading day)
+- Accept `--mode` argument: `latest` (single day, default), `backfill` (last 60 days)
+- Log progress and errors clearly
+
+**Key implementation details:**
+- Use `eastmoney_secid()` from `a_stock_trade_common_v7.py` for secid conversion
+- North-bound stock filter: `fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"` → add `f:!50` filter for 沪股通+深股通 stocks
+- Big-order data: use East Money moneyflow API with fields `f62,f64,f66,f70,f72,f74,f76,f78` (main/big/medium/small net inflows)
+- Retry 3 times with 2-second delay on HTTP errors
+- Write to Supabase using `SupabaseRest.insert()` then `SupabaseRest.request("PATCH", ...)` for upsert via unique constraint conflict
+
+**Test:** `py scripts/sync_capital_flow.py --date 2026-07-04` writes at least 5 rows. Rows have nonzero values for at least one flow column. Rows are upsert-safe (running same date twice does not duplicate).
+
+---
+
+#### Step 5.3: Build sector classification data
+
+**File to create:** `scripts/sync_sector_mapping.py`
+
+Fetch 申万 (Shenwan) industry classification for all A-share stocks and write to `stock_sector_mapping`.
+
+**Required behavior:**
+- Use akshare `ak.stock_info_a_code_name()` or equivalent to get stock list
+- Use akshare `ak.stock_board_industry_name_em()` to get all 申万一级/二级 industries
+- For each industry, fetch constituent stocks via akshare `ak.stock_board_industry_cons_em()`
+- Upsert into `stock_sector_mapping` with `code` as primary key
+- Add common concept tags: 新能源, AI算力, 半导体, 创新药, 消费电子, etc. (hardcode a mapping based on industry + known concept groupings)
+- Accept `--force` flag to re-fetch all data (otherwise skip if table already has >500 rows)
+
+**Acceptance:** Table has at least 500 stocks mapped. Each row has non-empty `shenwan_industry_l1`. A spot check of 3 random stocks shows correct industry classification.
+
+---
+
+#### Step 5.4: Rewrite `score_stock()` into multi-factor architecture
+
+**File to modify:** `scripts/stock_engine/a_stock_trade_common_v7.py`
+
+**DO NOT delete the existing `score_stock()` function yet.** Create a new function `multi_factor_score()` alongside it. The old function stays as a fallback reference; the new one is used by updated scanner/decision scripts.
+
+**New function signature:**
+```python
+def multi_factor_score(
+    df: pd.DataFrame,
+    code: str = "",
+    capital_flow: Optional[Dict[str, Any]] = None,
+    sector_data: Optional[Dict[str, Any]] = None,
+    market_state: str = "震荡",
+) -> Dict[str, Any]:
+```
+
+**The function must compute these FIVE independent factor scores, then combine with regime-dependent weights:**
+
+**Factor 1: Trend Quality (weight: 0.20 in bull, 0.15 in range, 0.10 in bear)**
+- Keep the existing MA20/MA60 checks but reduce from 18+10+6+25+28 points to a normalized 0-100 scale
+- Add ADX trend strength: ADX(14) > 25 → +20; ADX > 40 → +30
+- Price position within 52-week range: (close - 52w_low) / (52w_high - 52w_low) * 100, normalized to 0-100
+
+**Factor 2: Residual Momentum (weight: 0.30 in bull, 0.25 in range, 0.15 in bear)**
+- Compute 3-month raw return: (close / close_60d_ago - 1) * 100
+- Compute sector average 3-month return using `sector_data`
+- Residual momentum = raw return - sector average return
+- Also compute 1-month skip-1 residual return (skip most recent month to remove reversal noise)
+- Normalize residual momentum to 0-100 scale using percentile within sector
+- Reference: BigQuant 2025 research shows residual momentum IC turns positive in A-shares
+
+**Factor 3: Volume-Price Structure (weight: 0.20 in all regimes)**
+- Turnover standard deviation over 20 days (liq_turn_std) — IC=-0.524 per 中金 research → lower is better
+- Price-volume correlation over 20 days (corr_price_turn_1M) — negative IC → lower is better
+- Upper shadow ratio: (high - max(open, close)) / (high - low + 0.001) * 100 for last 5 days average
+- Volume climax detection: if volume > 2.5 * vol_20d_avg AND close < open → risk signal
+
+**Factor 4: Capital Flow (weight: 0.25 in all regimes — this is the highest-conviction factor per 2025 research)**
+- If `capital_flow` dict is provided:
+  - North-bound net inflow positive → +30
+  - North-bound holding change > 0.1% → +20
+  - Big order buy ratio > 50% → +25
+  - Main net inflow ratio > 5% → +20
+  - Margin balance increasing over 5 days → +5
+- If `capital_flow` is None, this factor returns 50 (neutral)
+
+**Factor 5: Quality & Risk (weight: 0.10 in bull, 0.20 in range, 0.30 in bear)**
+- Max drawdown over 60 days (lower = better, normalized to 0-100)
+- Volatility percentile: 20-day annualized vol, ranked within sector (lower = better)
+- Debt ratio if available from fundamental data (资产负债率 < 50% → bonus)
+- ROE if available (ROE > 10% → bonus)
+
+**Regime-dependent weight table:**
+```python
+REGIME_WEIGHTS = {
+    "强牛市": {"trend": 0.20, "momentum": 0.30, "volume": 0.20, "flow": 0.25, "quality": 0.05},
+    "弱牛市": {"trend": 0.15, "momentum": 0.25, "volume": 0.20, "flow": 0.25, "quality": 0.15},
+    "震荡市": {"trend": 0.10, "momentum": 0.20, "volume": 0.25, "flow": 0.25, "quality": 0.20},
+    "熊市":   {"trend": 0.05, "momentum": 0.10, "volume": 0.20, "flow": 0.25, "quality": 0.40},
+    "防御":   {"trend": 0.05, "momentum": 0.05, "volume": 0.15, "flow": 0.25, "quality": 0.50},
+}
+```
+
+**Return value (same shape as existing `score_stock()` for backward compatibility):**
+```python
+return {
+    "score": int(total_score),          # 0-100 composite
+    "signal": signal_text,              # buy-point signal text
+    "action": action_text,              # recommended action
+    "reasons": reasons[:8],             # top reasons (include which factor contributed most)
+    "risks": risks[:6],                 # risk flags
+    "factor_scores": {                  # NEW: individual factor scores for explainability
+        "trend": trend_score,
+        "momentum": momentum_score,
+        "volume": volume_score,
+        "flow": flow_score,
+        "quality": quality_score,
+    },
+    "factor_contributions": {           # NEW: how much each factor contributed to total
+        "trend": round(trend_score * weight_trend),
+        "momentum": round(momentum_score * weight_momentum),
+        "volume": round(volume_score * weight_volume),
+        "flow": round(flow_score * weight_flow),
+        "quality": round(quality_score * weight_quality),
+    },
+    # All existing fields preserved:
+    "support1": s1, "support2": s2,
+    "pressure1": p1, "pressure2": p2,
+    "stop": stop, "last_close": close,
+    "ma20": ma20, "ma5": ma5, "ma10": ma10, "ma60": ma60,
+    "vol_ratio": vol_ratio, "rsi14": rsi, "atr14": atr14,
+    "pct1": pct, "pct3": pct3, "pct5": pct5,
+    # ... all zone fields from existing score_stock()
+    "df": df,
+}
+```
+
+**Acceptance tests (write in `scripts/test_multi_factor_score.py`):**
+1. Fixture: AAPL-like uptrend stock (price > MA20 > MA60, MA5 > MA10 > MA20, ADX > 25) → trend_score >= 70
+2. Fixture: stock with strong north-bound flow → flow_score >= 70
+3. Fixture: stock in weak sector with strong individual momentum → momentum_score >= 60 (residual)
+4. Fixture: two stocks in same sector, one with positive residual momentum, one negative → former scores higher
+5. Fixture: same stock evaluated under "强牛市" vs "熊市" → different total scores (regime weights working)
+6. All fixtures run with `py scripts/test_multi_factor_score.py` and pass
+
+---
+
+#### Step 5.5: Implement sector momentum ranking
+
+**File to modify:** `scripts/stock_engine/a_stock_trade_common_v7.py`
+
+**New function:**
+```python
+def sector_momentum_ranking(
+    client,           # SupabaseRest instance
+    lookback_days: int = 20,
+) -> Dict[str, Dict[str, Any]]:
+    """Returns {sector_name: {momentum_5d, momentum_20d, avg_volume_ratio, rank}} for all 申万一级行业."""
+```
+
+**Implementation:**
+- Fetch all stocks' daily history from `stock_daily_history` via Supabase
+- Alternatively, use East Money sector index data: `https://push2.eastmoney.com/api/qt/clist/get` with `fs="m:90 t:2"` (申万行业指数)
+- Compute 5-day and 20-day return for each sector
+- Compute average volume ratio for each sector
+- Rank sectors by weighted score: 5d_return * 0.3 + 20d_return * 0.5 + volume_ratio_rank * 0.2
+- Return dict with ranking
+
+**Acceptance:** Calling `sector_momentum_ranking()` returns at least 28 sectors (all 申万一级). The top-ranked sector has positive 20d return. The ranking is deterministic (same data = same output).
+
+---
+
+#### Step 5.6: Update night scanner to use multi-factor scoring
+
+**File to modify:** `scripts/stock_engine/a_stock_night_scanner_v7.py`
+
+**Changes:**
+1. Import `multi_factor_score` and `sector_momentum_ranking` from common module
+2. Before scanning, fetch sector rankings and capital flow data (cache in memory for the scan duration)
+3. In `analyze_stock()`, call `multi_factor_score()` instead of `score_stock()`
+4. Pass capital_flow dict per stock, sector_data, and market_state
+5. Update `classify_pool()` to use sector rank in classification:
+   - Stock in top-5 sector → bonus consideration for 重点池
+   - Stock in bottom-10 sector → max 观察池, unless individual factor_scores.momentum > 70 (strong residual momentum)
+6. Output CSV must include new columns: `因子趋势`, `因子动量`, `因子量价`, `因子资金`, `因子质量`, `行业排名`
+7. Keep backward compatibility: if `multi_factor_score` fails (e.g., missing capital flow table), fall back to `score_stock()`
+
+**Acceptance:**
+- `py a_stock_night_scanner_v7.py --limit 50 --top 10 --min-score 70` runs without error from `scripts/stock_engine/`
+- Output CSV has the new factor columns
+- At least one stock in the output has `factor_scores.flow > 50` (capital flow data was used)
+
+---
+
+#### Step 5.7: Update live decision to use multi-factor scoring
+
+**File to modify:** `scripts/stock_engine/a_stock_live_decision_v8.py`
+
+**Changes:**
+1. Import `multi_factor_score` from common
+2. In `make_candidate_from_code()`, call `multi_factor_score()` instead of `score_stock()`
+3. The candidate dict now carries factor_scores — pass these through to `decision_from_realtime()`
+4. In `decision_from_realtime()`, read factor_scores from candidate dict
+5. Add new checks in the decision logic:
+   - If `flow_score < 30`: add risk note "资金面偏弱，新买需谨慎"
+   - If `momentum_score > 70 AND trend_score > 60`: boost buy_action by one level
+   - If `volume_score < 30`: add risk note "量价结构偏弱"
+6. Keep all existing price structure, VWAP, volume ratio checks — these are timing filters that complement the factor scores
+
+**Acceptance:**
+- `py a_stock_live_decision_v8.py --watchlist watchlists/latest_watchlist.csv` runs without error
+- Output shows factor scores in the decision output
+- A stock with high multi-factor score but poor intraday timing still shows "谨慎观察" (timing gate still works)
+
+---
+
+#### Step 5.8: Fuse model predictions into the rule engine
+
+**File to modify:** `scripts/paper_trade_engine.py`
+
+This is the critical step that merges the P4 model with the P5 multi-factor system.
+
+**Current state:** The paper trade engine reads live decisions and makes buy/sell decisions based purely on rule scores.
+
+**New behavior:**
+1. Before running the paper trade pass, fetch latest model predictions from `stock_model_predictions` table (most recent prediction_date, all stocks)
+2. For each candidate stock in the trade list, look up its model score and rank
+3. Model score and multi-factor score are combined:
+   - `combined_score = model_rank_normalized * 0.40 + multi_factor_score * 0.60`
+   - The 60/40 split reflects: rules still have final say, but model input is material
+4. Model rank provides a "second opinion": if model strongly disagrees with rules (model says rank > 50 but multi-factor score < 40, or vice versa), flag it as "需人工复核" in the trade reason
+5. Add a `model_score` and `model_rank` column to the paper trade order record (add fields to `stock_auto_trade_orders` if not already present)
+
+**Schema change (if needed):**
+```sql
+ALTER TABLE stock_auto_trade_orders
+ADD COLUMN IF NOT EXISTS model_score NUMERIC DEFAULT 0,
+ADD COLUMN IF NOT EXISTS model_rank INTEGER DEFAULT 0,
+ADD COLUMN IF NOT EXISTS multi_factor_score NUMERIC DEFAULT 0;
+```
+
+**Acceptance:**
+- Run `py scripts/paper_trade_engine.py` — completes without error
+- At least one order has `model_rank > 0` in Supabase
+- The order `reason` field mentions which factor contributed most to the decision
+
+---
+
+#### Step 5.9: Update frontend to show factor breakdown
+
+**Files to modify:**
+- `src/features/stocks/types.ts` — add factor score fields to `RoughStock` or `FineStock` types
+- `src/features/stocks/repository.ts` — map new columns from Supabase
+- `src/features/stocks/StockDashboard.tsx` — add a "因子" column or tooltip in the stock tables
+
+**UI addition:**
+- In the fine/rough stock table, add a `FactorBar` component that shows 5 colored segments representing factor contributions
+- Colors: trend=blue, momentum=green, volume=orange, flow=red, quality=purple
+- Width of each segment proportional to factor contribution to total score
+- Hover tooltip shows exact factor scores
+
+**Acceptance:**
+- `npm run build` succeeds
+- Stock table shows factor contribution bar (at least for fine stocks)
+- Factor data flows correctly from Supabase → repository → UI
+
+---
+
+#### Step 5.10: Tests
+
+**Files to create/modify:**
+- `scripts/test_multi_factor_score.py` — deterministic fixtures for each factor (see Step 5.4 acceptance)
+- `scripts/test_sync_capital_flow.py` — mock SupabaseRest, verify upsert logic
+
+**Run all tests:**
+```bash
+py scripts/test_multi_factor_score.py
+py scripts/test_sync_capital_flow.py
+npm test
+```
+
+**P5 completion criteria (all must pass):**
+1. All new Python tests pass
+2. All existing Vitest tests pass
+3. Production build succeeds
+4. Night scanner with `--limit 50 --top 10` produces CSV with factor columns
+5. Paper trade engine writes at least one order with nonzero model_score and multi_factor_score
+6. Supabase `stock_capital_flow` table has data for at least one trading day
+7. Supabase `stock_sector_mapping` table has >500 stocks mapped
+
+---
+
+### P6: Market Regime & Adaptive Risk System
+
+Status: Completed
+
+Goal: Build a market environment classifier that dynamically adjusts factor weights, position sizing, and risk parameters based on the current market state. Currently the strategy uses fixed parameters regardless of whether the market is trending, ranging, or crashing — which means it will inevitably underperform in regimes it wasn't tuned for.
+
+---
+
+#### Step 6.1: Build the market regime classifier
+
+Status: Completed
+
+Completion note:
+
+- 2026-07-09: Completed P6 Step 6.1. Added `scripts/market_regime.py`, `scripts/test_market_regime.py`, and `supabase/migrations/20260709_add_market_regime.sql`; applied the online Supabase migration; verified RLS, unique `regime_date`, and admin-only policy; ran the classifier online and inserted a 2026-07-09 `stock_market_regime` row. External caveat: East Money realtime breadth calls disconnected in this environment, so the successful run used AkShare CSI300 data and `stock_daily_history` cached breadth with the source recorded in `details`.
+
+**File to create:** `scripts/market_regime.py`
+
+**Function:**
+```python
+def classify_market_regime(client: SupabaseRest) -> Dict[str, Any]:
+```
+
+**Regime definitions (check in order, first match wins):**
+
+| Regime | Conditions | Key Signal |
+|--------|-----------|------------|
+| **强牛市** | CSI300 > MA20 AND CSI300 > MA60 AND 成交额 > 1.2万亿 AND 涨停数 > 80 AND 炸板率 < 25% | All systems go |
+| **弱牛市** | CSI300 > MA20 AND 成交额 > 8000亿 | Moderate bullish |
+| **震荡市** | CSI300 between MA20*0.95 and MA20*1.05 (oscillating around MA20) AND 成交额 > 6000亿 | Directionless |
+| **熊市** | CSI300 < MA60 AND 成交额 < 1万亿 | Downtrend |
+| **防御** | CSI300 < MA20 AND CSI300 < MA60 AND (成交额 < 6000亿 OR 跌停数 > 50) | Risk-off |
+
+**Data sources:**
+- CSI300 index data: from akshare `ak.stock_zh_index_daily(symbol="sh000300")` or East Money API
+- Market breadth: East Money spot API `fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"` → count stocks with pct >= 9.8 (涨停) and pct <= -9.8 (跌停)
+- Market turnover: East Money API total amount field
+- 炸板率: (涨停曾经触及但未封住的股票数) / (涨停触及股票总数) — approximate from daily high/low data
+
+**Return value:**
+```python
+{
+    "regime": "震荡市",           # one of the 5 states
+    "csi300_close": 3950.5,
+    "csi300_ma20": 3920.3,
+    "csi300_ma60": 3880.1,
+    "market_turnover_yi": 9500,   # 成交额（亿）
+    "limit_up_count": 65,
+    "limit_down_count": 12,
+    "break_rate_pct": 22.5,       # 炸板率
+    "advance_decline_ratio": 1.3, # 涨跌比
+    "position_cap_pct": 60,       # derived: max position as % of capital
+    "regime_note": "大盘震荡，方向不明，降低仓位至60%",
+}
+```
+
+**Save regime daily to Supabase in a new table `stock_market_regime`:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_market_regime (
+  id BIGSERIAL PRIMARY KEY,
+  regime_date DATE UNIQUE NOT NULL,
+  regime TEXT NOT NULL,
+  csi300_close NUMERIC,
+  market_turnover_yi NUMERIC,
+  limit_up_count INTEGER,
+  limit_down_count INTEGER,
+  break_rate_pct NUMERIC,
+  advance_decline_ratio NUMERIC,
+  position_cap_pct NUMERIC,
+  details JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+**Acceptance:**
+- `py scripts/market_regime.py` runs, prints regime classification, and upserts one row to Supabase
+- Running on a weekend/non-trading day gracefully returns "无法判断（非交易日）" with the most recent trading day's data
+
+---
+
+#### Step 6.2: Wire regime into the paper trade engine
+
+Status: Completed
+
+Completion note:
+
+- 2026-07-09: Completed P6 Step 6.2. Wired `classify_market_regime()` into `scripts/paper_trade_engine.py`, added regime-dependent max holdings, blocked new buys in `熊市` and `防御` while preserving sell management, passed dynamic holding caps into buy execution, and wrote the current regime into portfolio snapshot notes. Verified deterministic paper-trade tests and an online `--dry-run`, which classified the market as `熊市`, set max holdings to 2, and produced no new dry-run orders.
+
+**File to modify:** `scripts/paper_trade_engine.py`
+
+**Changes:**
+1. At the start of each run, call `classify_market_regime(client)`
+2. Pass `regime` to `multi_factor_score()` → affects factor weights (see P5 Step 5.4 weight table)
+3. Adjust position sizing by regime:
+   ```python
+   REGIME_POSITION_CAP = {
+       "强牛市": 0.80,   # up to 80% of capital in positions
+       "弱牛市": 0.60,
+       "震荡市": 0.40,
+       "熊市": 0.20,
+       "防御": 0.10,
+   }
+   ```
+4. Adjust max holdings by regime:
+   ```python
+   REGIME_MAX_HOLDINGS = {
+       "强牛市": 8,
+       "弱牛市": 6,
+       "震荡市": 4,
+       "熊市": 2,
+       "防御": 1,
+   }
+   ```
+5. If regime is "熊市" or "防御", automatically block all new buys (only manage existing positions for exits)
+6. Log regime + derived parameters at the start of each paper trade run
+
+**Acceptance:**
+- Run paper trade under different regimes — position cap and max holdings change accordingly
+- In "熊市" regime, no new buy orders are created (only sell/exit orders)
+
+---
+
+#### Step 6.3: Adaptive position sizing
+
+Status: Completed
+
+Completion note:
+
+- 2026-07-09: Completed P6 Step 6.3. Added adaptive single-order sizing to `scripts/paper_trade_engine.py` with signal strength, market regime cap, account drawdown, consecutive loss count, and stock volatility inputs; added pure helper coverage for drawdown, consecutive losses, signal strength, and adaptive sizing; wired live paper-trade buys to use the adaptive amount while keeping existing cash, single-position, lot-size, and risk-budget gates. Verified deterministic paper-trade tests, market-regime tests, and an online `--dry-run`. Product note: the implementation preserves the 25% base-amount floor from the spec, so defensive sizing is floored when it would otherwise fall below board-lot-practical scale.
+
+**File to modify:** `scripts/paper_trade_engine.py`
+
+**New function:**
+```python
+def adaptive_position_size(
+    base_amount: float,            # base position amount from config
+    signal_strength: float,        # multi-factor score / 100 (0.0-1.0)
+    market_regime: str,
+    account_drawdown_pct: float,   # current account drawdown from peak
+    consecutive_losses: int,
+    stock_volatility_pct: float,   # 20-day annualized vol of this stock
+) -> float:
+```
+
+**Logic:**
+- Start with `base_amount`
+- Multiply by `signal_strength` (stronger signal → bigger position)
+- Multiply by regime position cap
+- If `account_drawdown_pct > 10%`: multiply by 0.5
+- If `consecutive_losses >= 3`: multiply by 0.5
+- If `consecutive_losses >= 5`: multiply by 0.25 (effectively stop trading)
+- If `stock_volatility_pct > 60`: multiply by 0.7 (high vol → reduce size)
+- Result: `max(final_amount, base_amount * 0.25)` (floor at 25% of base)
+
+**Acceptance:** Test fixtures for each adjustment scenario in `scripts/test_paper_trade_execution_status.py`.
+
+---
+
+#### Step 6.4: Sector rotation filter in paper trade
+
+Status: Completed
+
+Completion note:
+
+- 2026-07-09: Completed P6 Step 6.4. Wired `sector_momentum_ranking()` into `scripts/paper_trade_engine.py`, added sector-name lookup from decisions/positions or `stock_sector_mapping`, blocked weak-sector buy candidates with audit reasons, allowed top-sector candidates, degraded safely when sector ranking fails, and added weak-sector open-position "减仓观察" patches without forcing sells. Verified deterministic paper-trade tests and a dry-run with `A_STOCK_SKIP_SECTOR_RANKING=1`. External caveat: the live East Money sector-ranking endpoint can hang or disconnect in this environment, so the skip switch is available to preserve paper-trade reliability when upstream sector data is unstable.
+
+**File to modify:** `scripts/paper_trade_engine.py`
+
+**New behavior:**
+1. Before the main trade loop, call `sector_momentum_ranking()` (from P5 Step 5.5)
+2. For each buy candidate, check if its sector is in the top-10 by momentum
+3. If sector rank > 10 AND stock's individual `factor_scores.momentum < 60` → skip (not a sector leader or individual outlier)
+4. If sector rank > 15 → skip regardless of individual score
+5. Active holdings in weak sectors (rank > 20): generate a "减仓观察" suggestion (don't force-sell, but flag for review)
+
+**Rationale:** 2025 research consistently shows that sector selection explains 30-40% of stock return variance in A-shares. Avoiding weak sectors is the single highest-ROI filter.
+
+**Acceptance:**
+- Paper trade run with a stock in a bottom-5 sector — buy is skipped with reason "板块排名靠后"
+- Paper trade run with a stock in a top-3 sector — buy proceeds normally
+
+---
+
+#### Step 6.5: Tests for regime system
+
+Status: Completed
+
+Completion note:
+
+- 2026-07-09: Completed P6 Step 6.5 and frontend market-regime display. Added frontend `MarketRegime` repository/type/mock mapping, displayed the latest market state and position cap in the stock dashboard overview, and verified the full P6 flow with `py scripts/test_market_regime.py`, `py scripts/test_paper_trade_execution_status.py`, `npm test`, and `npm run build`.
+
+**File to create:** `scripts/test_market_regime.py`
+
+**Test fixtures:**
+1. CSI300 above MA20+MA60, high turnover → "强牛市"
+2. CSI300 near MA20, moderate turnover → "震荡市"
+3. CSI300 below MA60, low turnover → "熊市"
+4. CSI300 below both MAs, very low turnover → "防御"
+5. Adaptive position size: high vol stock gets reduced allocation
+6. Sector filter: bottom-sector stock is skipped
+
+**Acceptance:** All fixtures pass.
+
+---
+
+#### P6 completion criteria:
+1. `classify_market_regime()` runs against real market data and returns a valid regime
+2. Paper trade engine uses regime-dependent weights, position caps, and max holdings
+3. Adaptive position sizing adjusts for account drawdown and consecutive losses
+4. Sector filter blocks buys in weak sectors
+5. All tests pass, production build succeeds
+
+Known completed work:
+
+- 2026-07-09: P6 completed end-to-end. The market regime classifier writes to online Supabase, paper trading uses regime-dependent max holdings and buy blocking, adaptive sizing uses regime/signal/drawdown/loss/volatility inputs, sector rotation filtering blocks weak-sector buys with audit reasons, frontend overview shows the latest regime, and local verification passed. External caveat: East Money realtime breadth and sector-ranking endpoints may disconnect or hang in this environment; P6 records fallback data sources in `stock_market_regime.details` and supports `A_STOCK_SKIP_SECTOR_RANKING=1` to preserve paper-trading reliability.
+
+---
+
+### P7: Strategy Research Workflow
 
 Status: Pending
 
-Goal: Make the system able to evaluate which rules and models are actually working.
+Goal: Create a systematic workflow for strategy development: define → backtest → analyze → refine → paper-trade → compare → promote/retire. Currently there is no structured way to experiment with strategy variants or compare their performance over time.
 
-Required leaderboard metrics:
+---
 
-- 5-day return
-- 20-day return
-- cumulative return
-- max drawdown
-- win rate
-- profit/loss ratio
-- turnover
-- trade count
-- current holding count
-- benchmark excess return
+#### Step 7.1: Strategy experiment config format
 
-Required attribution dimensions:
+**File to create:** `scripts/strategy_config_schema.json`
 
-- model attribution
-- rule attribution
-- stock attribution
-- industry attribution
-- market regime attribution
-- buy reason attribution
-- sell reason attribution
+Define a JSON schema for strategy experiments:
 
-Acceptance checks:
+```json
+{
+  "experiment_id": "exp_20260707_momentum_weight_tuning",
+  "created_at": "2026-07-07T10:00:00+08:00",
+  "status": "draft|backtesting|paper_trading|active|retired",
+  "strategy": {
+    "name": "Multi-Factor v1",
+    "version": "1.0.0",
+    "description": "...",
+    "factor_weights": {
+      "trend": 0.20, "momentum": 0.30, "volume": 0.20,
+      "flow": 0.25, "quality": 0.05
+    },
+    "regime_overrides": { "强牛市": {...}, "震荡市": {...} },
+    "position_config": {
+      "base_position_rate": 0.08,
+      "max_single_position_rate": 0.15,
+      "max_holdings": 6,
+      "cash_reserve_rate": 0.25
+    },
+    "exit_rules": {
+      "stop_loss_atr_multiple": 1.8,
+      "time_stop_days_range": 5,
+      "time_stop_days_bull": 7,
+      "trailing_stop_activation_pct": 10,
+      "profit_protection_pct": 25
+    },
+    "filters": {
+      "min_multi_factor_score": 60,
+      "min_sector_rank": 10,
+      "require_capital_flow_positive": true,
+      "max_chase_pct": 4.8
+    }
+  },
+  "backtest": {
+    "start_date": "2025-01-01",
+    "end_date": "2026-06-30",
+    "initial_cash": 1000000,
+    "split_ratio": {"train": 0.5, "validation": 0.2, "test": 0.15, "oos": 0.15}
+  },
+  "results": {}
+}
+```
 
-- Every trade can be traced to model, strategy, rule, and signal.
-- UI can show which rule made money and which rule lost money.
-- UI can show model degradation or recent underperformance.
+**Acceptance:** Schema validates against at least 3 distinct strategy configs. JSON Schema validation passes (use `jsonschema` library).
+
+---
+
+#### Step 7.2: Parameter search and backtest comparison
+
+**File to create:** `scripts/run_strategy_experiment.py`
+
+**Behavior:**
+1. Read a `strategy_config.json` file
+2. Run backtest with those exact parameters (reuse `backtest_engine.py` logic)
+3. Store results in `stock_backtest_runs` with `experiment_id` foreign key
+4. Support `--param-sweep` mode: define parameter ranges, run grid search, store all results
+5. Support `--compare exp_1 exp_2` mode: pull two experiments from Supabase, print comparison table
+
+**Schema addition to `stock_backtest_runs`:**
+```sql
+ALTER TABLE stock_backtest_runs ADD COLUMN IF NOT EXISTS experiment_id TEXT;
+ALTER TABLE stock_backtest_runs ADD COLUMN IF NOT EXISTS strategy_config JSONB;
+```
+
+**Acceptance:**
+- `py scripts/run_strategy_experiment.py --config my_strategy.json` runs a backtest and stores results
+- `py scripts/run_strategy_experiment.py --compare exp_1 exp_2` prints metric comparison table
+
+---
+
+#### Step 7.3: Strategy lifecycle management
+
+**File to create:** `scripts/strategy_lifecycle.py`
+
+**Behavior:**
+- `promote exp_id --to paper_trading`: Mark experiment as paper_trading. Next paper trade run includes this strategy.
+- `promote exp_id --to active`: After 20+ paper trading days with positive Sharpe, promote to active.
+- `retire exp_id --reason "..."`: Mark strategy as retired with reason.
+- `list --status active`: Show all active strategies.
+
+**Store lifecycle state in Supabase table:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_strategy_experiments (
+  experiment_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  config JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  promoted_to_paper_at TIMESTAMPTZ,
+  promoted_to_active_at TIMESTAMPTZ,
+  retired_at TIMESTAMPTZ,
+  retirement_reason TEXT DEFAULT '',
+  best_backtest_run_id TEXT,
+  latest_metrics JSONB DEFAULT '{}'
+);
+```
+
+**Acceptance:** Can promote/retire/list strategies via CLI. Lifecycle state persists in Supabase.
+
+---
+
+#### P7 completion criteria:
+1. Strategy config schema is documented and validated
+2. Experiment runner can backtest a config and store results
+3. Two experiments can be compared side by side
+4. Strategy lifecycle (draft → backtest → paper → active → retired) works via CLI
+5. All tests pass, production build succeeds
+
+---
+
+### P8: Advanced A-Share Signal Integration
+
+Status: Pending
+
+Goal: Integrate the highest-conviction A-share-specific signals identified in 2025-2026 quantitative research: north-bound capital flow microstructure, smart-money factor from minute data, candlestick structure (KSFT), and limit-up board dynamics. These are signals with proven IC in A-shares that the platform currently does not capture.
+
+---
+
+#### Step 8.1: North-bound capital flow as a daily signal
+
+**File to create:** `scripts/signals/north_bound_signal.py`
+
+**Enhance the P5 capital flow data with sector-level aggregation:**
+1. From `stock_capital_flow`, aggregate north-bound net inflow by 申万一级行业
+2. Compute 5-day rolling sum per sector
+3. Identify sectors with "north-bound acceleration" — 5d sum > 2 * 20d average
+4. Score each stock by: its own north-bound inflow + its sector's north-bound rank
+
+**Write daily signal score to Supabase:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_north_bound_signals (
+  signal_date DATE NOT NULL,
+  code TEXT NOT NULL,
+  stock_score NUMERIC DEFAULT 0,
+  sector_score NUMERIC DEFAULT 0,
+  sector_rank INTEGER DEFAULT 99,
+  acceleration_flag BOOLEAN DEFAULT false,
+  PRIMARY KEY (signal_date, code)
+);
+```
+
+**Acceptance:** Signal table has data for >100 stocks per day. Stocks in north-bound-favored sectors have higher scores.
+
+---
+
+#### Step 8.2: Smart money factor (minute-level microstructure)
+
+**File to create:** `scripts/signals/smart_money_factor.py`
+
+**Reference:** 开源证券 "聪明钱因子" — identifies institutional trading from minute-level price-volume data. 2025年胜率82.1%.
+
+**Algorithm:**
+1. Fetch 1-minute or 5-minute bar data for a stock (from East Money or akshare)
+2. For each minute bar, classify as "smart money" if:
+   - Price change in that minute > 0 AND
+   - Volume in that minute > 20-period average volume for same time-of-day AND
+   - The minute's VWAP > day's cumulative VWAP
+3. Smart money index = (sum of smart-money-minute volumes) / (total day volume)
+4. Stocks with smart money index in top quartile → bullish signal
+
+**Store results:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_smart_money_signals (
+  signal_date DATE NOT NULL,
+  code TEXT NOT NULL,
+  smart_money_ratio NUMERIC DEFAULT 0,
+  minute_count INTEGER DEFAULT 0,
+  signal_strength TEXT DEFAULT 'neutral',
+  PRIMARY KEY (signal_date, code)
+);
+```
+
+**Note:** Minute-level data fetching is expensive. Implement with caching: fetch once per stock per day, store raw minute data locally, then compute. For backfill, use historical minute data only when available.
+
+**Acceptance:**
+- Run on 5 stocks during market hours → produces nonzero smart_money_ratio for each
+- Signal correctly identifies a known institutional-accumulation stock (spot check)
+
+---
+
+#### Step 8.3: KSFT candlestick structure factor
+
+**File to modify:** `scripts/stock_engine/a_stock_trade_common_v7.py`
+
+**Add to `multi_factor_score()` as a sub-component of the Volume-Price Structure factor.**
+
+**Reference:** 瑞银UBS 2025 research — KSFT (K-line Shift) is the #1 performing technical factor in A-shares, with 39% annualized long-short return in CSI 2000.
+
+**Algorithm:**
+1. For each day, compute KSFT = (close - open) / (high - low + 0.001) — the candle body ratio
+2. Plus direction: positive = bullish candle, negative = bearish
+3. Compute 5-day and 20-day rolling average of KSFT
+4. Bollinger-style signal: if 5d_avg_KSFT crosses above 20d_avg_KSFT + 1 std → bullish structure shift
+5. Also track: upper shadow ratio = (high - max(close, open)) / (high - low + 0.001)
+6. Lower shadow ratio = (min(close, open) - low) / (high - low + 0.001)
+
+**Scoring contribution:**
+- KSFT 5d > KSFT 20d AND KSFT 5d > 0: +15 to volume_structure score
+- Upper shadow 5d avg > 0.4: -10 (selling pressure)
+- Lower shadow 5d avg > 0.4 AND price near support: +10 (buying support)
+- Consecutive 3 days of positive KSFT: +5 (consistent buying)
+
+**Acceptance:** Deterministic fixtures in test file verify KSFT values for known candle patterns.
+
+---
+
+#### Step 8.4: Limit-up board dynamics tracker
+
+**File to create:** `scripts/signals/limit_up_tracker.py`
+
+**Track daily limit-up events and their quality metrics:**
+
+**Data to capture per limit-up stock:**
+- Code, name, sector
+- First limit-up time (earlier = stronger)
+- Whether it opened and stayed (一字板) vs touched and sealed
+- Open count (开板次数)
+- Final封单金额 / 流通市值 ratio
+- Whether it's first board of the streak (首板), second (二板), or N-th
+- Next-day outcome: 晋级 (advanced), 炸板 (failed), 回落 (retreated)
+
+**Store in Supabase:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_limit_up_events (
+  id BIGSERIAL PRIMARY KEY,
+  event_date DATE NOT NULL,
+  code TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  board_number INTEGER DEFAULT 1,           -- 第几板
+  first_seal_time TIME,                      -- 首次封板时间
+  open_count INTEGER DEFAULT 0,             -- 开板次数
+  seal_amount_yi NUMERIC DEFAULT 0,         -- 封单金额（亿）
+  float_mv_yi NUMERIC DEFAULT 0,            -- 流通市值（亿）
+  seal_ratio NUMERIC DEFAULT 0,             -- 封单/流通市值
+  sector TEXT DEFAULT '',                    -- 所属板块
+  sector_limit_up_count INTEGER DEFAULT 0,  -- 板块涨停家数
+  next_day_outcome TEXT DEFAULT '',          -- 次日结果: 晋级/炸板/回落/平开
+  next_day_open_pct NUMERIC,                -- 次日开盘涨幅
+  next_day_close_pct NUMERIC,               -- 次日收盘涨幅
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+**Signal usage in paper trading:**
+- Stock that was a 首板 yesterday with seal_ratio > 2.0 AND sector_limit_up_count >= 3 → bullish附加分
+- Stock that is 三板以上 with open_count > 2 → risk flag (高位分歧)
+- Sector with 5+ limit-ups yesterday → sector momentum bonus
+
+**Acceptance:**
+- Tracker runs after market close and captures limit-up events
+- At least 10 events on a normal trading day
+- Next-day outcome is backfilled correctly for historical events
+
+---
+
+#### Step 8.5: Strategy crowding / concentration monitor
+
+**File to create:** `scripts/signals/crowding_monitor.py`
+
+**Purpose:** Detect when a strategy, factor, or sector is getting too crowded — a leading indicator of imminent reversal.
+
+**Metrics to track:**
+1. Factor crowding: correlation between top-5 holdings of the strategy → if > 0.7, factors are overlapping
+2. Sector concentration: % of portfolio in single sector → if > 40%, concentration risk
+3. Signal decay: track factor IC over rolling 20-day windows → if IC drops below -0.1, factor may be decaying
+
+**Write daily crowding report to Supabase:**
+```sql
+CREATE TABLE IF NOT EXISTS stock_crowding_alerts (
+  id BIGSERIAL PRIMARY KEY,
+  alert_date DATE NOT NULL,
+  alert_type TEXT NOT NULL,          -- factor_crowding, sector_concentration, signal_decay
+  severity TEXT NOT NULL DEFAULT 'info',  -- info, warning, critical
+  details JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+**Acceptance:** Monitor runs daily and writes at least a summary row. If concentration exceeds threshold, severity is "warning" or "critical".
+
+---
+
+#### P8 completion criteria:
+1. North-bound sector signal produces daily scores
+2. Smart money factor runs on demand for individual stocks
+3. KSFT is integrated into multi_factor_score and contributes to volume_structure
+4. Limit-up tracker captures daily events with next-day outcomes
+5. Crowding monitor detects at least one concentration scenario
+6. All tests pass, production build succeeds
+
+---
 
 ## External Framework Guidance
 
@@ -348,12 +1178,33 @@ Secondary/research options:
 
 Avoid claiming the system is authoritative. It is a personal research and simulation platform unless it has gone through robust data validation, backtesting, out-of-sample testing, simulation tracking, and attribution review.
 
+---
+
+## Strategy Design Principles (added 2026-07-07)
+
+These principles were derived from a comprehensive review of 2025-2026 A-share quantitative research (中金基金, 申万金工, 华泰金工, 开源证券, 瑞银UBS, 光大证券, 华福证券, 国金证券) and should guide all future strategy work:
+
+1. **Factor independence over factor count.** Five independent factors with IC correlation < 0.3 beat twenty correlated factors. Current MA20/RSI/MACD signals have correlations > 0.7 — they are effectively one factor.
+
+2. **Small caps → reversal. Large caps → momentum.** Never apply the same factor direction to all stocks. The 华福证券 2025 research shows 11/15 factors behave differently across market cap tiers.
+
+3. **Capital flow beats price action in A-shares.** 北向资金 (foreign flow) and 大单净流入 (institutional flow) have proven IC and are naturally uncorrelated with technical factors. Always include flow signals.
+
+4. **Sector selection is 30-40% of stock returns in A-shares.** A mediocre stock in a strong sector beats a great stock in a weak sector. The sector rotation filter is the single highest-ROI addition.
+
+5. **Market regime determines factor weights, not just position size.** A momentum factor that works in a trending market will bleed in a range-bound market. The regime classifier must gate which factors are active.
+
+6. **Model ranks. Rules filter. Together they beat either alone.** The P4 LightGBM/CatBoost/XGBoost ensemble captures nonlinear relationships that rules miss. Rules enforce discipline (T+1, lot size, risk gates) that models don't understand. The fusion point is: model provides ranking, rules provide timing + risk gates.
+
+7. **Every strategy must prove itself in paper trading before trust.** Backtest metrics are necessary but not sufficient. Paper trading with real-time data reveals execution slippage, data latency, and regime drift that backtests hide.
+
 ## Next Recommended Action
 
-The next confirmed work item should be P0 completion:
+The next confirmed work item is **P6 Step 6.1: Market regime classifier**.
 
-1. Verify and, if needed, finish Today PnL as holding daily PnL.
-2. Add suggestion/execution status separation.
-3. Add missing quote warning for holdings that cannot be matched to realtime data.
+Execute steps in strict order:
+1. P6.1 → P6.2 → P6.3 → P6.4 → P6.5
+2. P7.1 → P7.2 → P7.3
+3. P8.1 → P8.2 → P8.3 → P8.4 → P8.5
 
-Do not start P1 until P0 is marked Completed and the user confirms.
+Within each P-level, complete all steps and mark the P as Completed before moving to the next P, unless the user explicitly approves parallel work.

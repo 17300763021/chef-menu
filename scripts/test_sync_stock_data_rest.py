@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from sync_stock_data import SupabaseRest
+from sync_stock_data import SupabaseRest, scan_row
 
 
 class FakeResponse:
@@ -34,6 +34,26 @@ class FakeErrorBody:
 
 
 class SupabaseRestTest(unittest.TestCase):
+    def test_scan_row_maps_multi_factor_columns(self) -> None:
+        mapped = scan_row({
+            "生成日期": "2026-07-09 15:40:00",
+            "代码": "600001",
+            "名称": "Alpha",
+            "因子趋势": "71.5",
+            "因子动量": "82",
+            "因子量价": "63",
+            "因子资金": "77",
+            "因子质量": "55",
+            "行业排名": "4",
+        })
+
+        self.assertEqual(mapped["factor_trend"], 71.5)
+        self.assertEqual(mapped["factor_momentum"], 82)
+        self.assertEqual(mapped["factor_volume"], 63)
+        self.assertEqual(mapped["factor_flow"], 77)
+        self.assertEqual(mapped["factor_quality"], 55)
+        self.assertEqual(mapped["sector_rank"], 4)
+
     def test_request_retries_transient_network_errors(self) -> None:
         client = SupabaseRest("https://example.supabase.co", "service-key", retry_delay_seconds=0)
         calls = []

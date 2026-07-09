@@ -14,6 +14,7 @@ import type {
   ModelPortfolioSnapshot,
   ModelPosition,
   ModelPrediction,
+  MarketRegime,
   MissedRunner,
   OverviewStats,
   PaperTradeOrder,
@@ -214,6 +215,12 @@ function mapRoughStock(row: Row): RoughStock {
     stopLoss: numberValue(row, 'stop_loss'),
     reason: text(row, 'reason'),
     risk: text(row, 'risk'),
+    factorTrend: numberValue(row, 'factor_trend'),
+    factorMomentum: numberValue(row, 'factor_momentum'),
+    factorVolume: numberValue(row, 'factor_volume'),
+    factorFlow: numberValue(row, 'factor_flow'),
+    factorQuality: numberValue(row, 'factor_quality'),
+    sectorRank: numberValue(row, 'sector_rank'),
   }
 }
 
@@ -360,6 +367,26 @@ function mapPortfolioSnapshot(row: Row): PortfolioSnapshot {
     positionCount: numberValue(row, 'position_count'),
     tradeCount: numberValue(row, 'trade_count'),
     note: text(row, 'note'),
+  }
+}
+
+function mapMarketRegime(row: Row): MarketRegime {
+  const details = jsonValue(row, 'details') as Record<string, unknown> | null
+  return {
+    id: text(row, 'id'),
+    regimeDate: text(row, 'regime_date'),
+    regime: text(row, 'regime'),
+    csi300Close: numberValue(row, 'csi300_close'),
+    csi300Ma20: Number(details?.csi300_ma20 ?? 0),
+    csi300Ma60: Number(details?.csi300_ma60 ?? 0),
+    marketTurnoverYi: numberValue(row, 'market_turnover_yi'),
+    limitUpCount: numberValue(row, 'limit_up_count'),
+    limitDownCount: numberValue(row, 'limit_down_count'),
+    breakRatePct: numberValue(row, 'break_rate_pct'),
+    advanceDeclineRatio: numberValue(row, 'advance_decline_ratio'),
+    positionCapPct: numberValue(row, 'position_cap_pct'),
+    regimeNote: String(details?.regime_note ?? ''),
+    breadthSource: String(details?.breadth_source ?? ''),
   }
 }
 
@@ -564,6 +591,7 @@ export interface StockRepository {
   getTasks(): Promise<TaskRecord[]>
   getPaperTradeOrders(): Promise<PaperTradeOrder[]>
   getPortfolioSnapshots(): Promise<PortfolioSnapshot[]>
+  getMarketRegime(): Promise<MarketRegime | null>
   getBacktestRuns(): Promise<BacktestRun[]>
   getBacktestTrades(): Promise<BacktestTrade[]>
   getMissedRunners(): Promise<MissedRunner[]>
@@ -662,6 +690,11 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
     async getPortfolioSnapshots() {
       const rows = await selectRows('stock_portfolio_snapshots', 'snapshot_time')
       return (rows ?? []).map(mapPortfolioSnapshot)
+    },
+    async getMarketRegime() {
+      const rows = await selectRows('stock_market_regime', 'regime_date')
+      if (!client) return stocksApi.getMarketRegime()
+      return rows?.[0] ? mapMarketRegime(rows[0]) : null
     },
     async getBacktestRuns() {
       const rows = await selectRows('stock_backtest_runs', 'run_time')

@@ -155,6 +155,12 @@ def scan_row(row: dict[str, str]) -> dict[str, Any]:
         "stop_loss": parse_float(row.get("建议止损")) or 0,
         "reason": row.get("入选理由", ""),
         "risk": row.get("主要风险", ""),
+        "factor_trend": parse_float(row.get("因子趋势")) or 0,
+        "factor_momentum": parse_float(row.get("因子动量")) or 0,
+        "factor_volume": parse_float(row.get("因子量价")) or 0,
+        "factor_flow": parse_float(row.get("因子资金")) or 0,
+        "factor_quality": parse_float(row.get("因子质量")) or 0,
+        "sector_rank": int(parse_float(row.get("行业排名")) or 0),
     }
 
 

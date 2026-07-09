@@ -149,6 +149,7 @@ _EM_META_CACHE_AT = 0.0
 _INDUSTRY_CACHE: Optional[pd.DataFrame] = None
 _INDUSTRY_CACHE_AT = 0.0
 _INDUSTRY_TREND_CACHE: Dict[str, Dict[str, Any]] = {}
+_SECTOR_MOMENTUM_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 
 def _eastmoney_spot_direct() -> pd.DataFrame:
@@ -304,6 +305,167 @@ def _eastmoney_industry_board_direct() -> pd.DataFrame:
         except Exception as e:
             errors.append(f"{url}: {e}")
     raise RuntimeError("行业板块直连失败：" + " | ".join(errors[-3:]))
+
+
+def _eastmoney_sector_index_snapshot() -> pd.DataFrame:
+    """Fetch East Money Shenwan/industry index snapshot rows."""
+    kill_proxy_env()
+    http_timeout = safe_float(os.environ.get("A_STOCK_HTTP_TIMEOUT"), 8)
+    http_retries = int(safe_float(os.environ.get("A_STOCK_HTTP_RETRIES"), 1))
+    params = {
+        "pn": "1",
+        "pz": "200",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:90 t:2",
+        "fields": "f12,f14,f2,f3,f5,f6,f8,f104,f105",
+    }
+    errors = []
+    for url in EASTMONEY_SPOT_URLS:
+        try:
+            resp = retry_call(
+                requests.get,
+                url,
+                params=params,
+                headers=EASTMONEY_HEADERS,
+                timeout=http_timeout,
+                retries=http_retries,
+                sleep=1,
+            )
+            resp.raise_for_status()
+            rows = (resp.json().get("data") or {}).get("diff") or []
+            raw = pd.DataFrame(rows)
+            if raw.empty:
+                raise RuntimeError("East Money sector index snapshot returned empty data")
+            out = pd.DataFrame()
+            out["code"] = raw.get("f12", "").astype(str).str.strip()
+            out["industry"] = raw.get("f14", "").astype(str).str.strip()
+            out["pct"] = pd.to_numeric(raw.get("f3"), errors="coerce")
+            out["volume"] = pd.to_numeric(raw.get("f5"), errors="coerce")
+            out["amount"] = pd.to_numeric(raw.get("f6"), errors="coerce")
+            out["volume_ratio"] = pd.to_numeric(raw.get("f8"), errors="coerce")
+            out = out.dropna(subset=["industry"]).reset_index(drop=True)
+            return out
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    raise RuntimeError("East Money sector index snapshot failed: " + " | ".join(errors[-3:]))
+
+
+def _eastmoney_sector_index_history(code: str, lookback_days: int = 20) -> pd.DataFrame:
+    """Fetch daily K-line history for one East Money industry index."""
+    kill_proxy_env()
+    http_timeout = safe_float(os.environ.get("A_STOCK_HTTP_TIMEOUT"), 8)
+    http_retries = int(safe_float(os.environ.get("A_STOCK_HTTP_RETRIES"), 1))
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=max(lookback_days + 40, 70))).strftime("%Y%m%d")
+    params = {
+        "secid": f"90.{code}",
+        "klt": "101",
+        "fqt": "0",
+        "beg": start,
+        "end": end,
+        "lmt": str(max(lookback_days + 10, 30)),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    errors = []
+    for _ in range(max(1, http_retries + 1)):
+        try:
+            resp = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=http_timeout)
+            resp.raise_for_status()
+            klines = ((resp.json().get("data") or {}).get("klines") or [])
+            records = []
+            for line in klines:
+                parts = str(line).split(",")
+                if len(parts) < 6:
+                    continue
+                records.append({
+                    "date": parts[0],
+                    "open": safe_float(parts[1]),
+                    "close": safe_float(parts[2]),
+                    "high": safe_float(parts[3]),
+                    "low": safe_float(parts[4]),
+                    "volume": safe_float(parts[5]),
+                })
+            out = pd.DataFrame(records)
+            if out.empty:
+                raise RuntimeError(f"East Money sector history returned empty data for {code}")
+            return out
+        except Exception as e:
+            errors.append(str(e))
+            time.sleep(0.5)
+    raise RuntimeError(f"East Money sector history failed for {code}: " + " | ".join(errors[-3:]))
+
+
+def _sector_return(history: pd.DataFrame, days: int) -> float:
+    close = pd.to_numeric(history.get("close"), errors="coerce").dropna()
+    if len(close) <= days:
+        return float("nan")
+    base = safe_float(close.iloc[-days - 1])
+    last = safe_float(close.iloc[-1])
+    return (last / base - 1) * 100 if base else float("nan")
+
+
+def sector_momentum_ranking(client=None, lookback_days: int = 20) -> Dict[str, Dict[str, Any]]:
+    """Return momentum ranking for East Money Shenwan/industry indexes."""
+    cache_key = f"{lookback_days}:{datetime.now().date().isoformat()}"
+    if cache_key in _SECTOR_MOMENTUM_CACHE:
+        return {k: v.copy() for k, v in _SECTOR_MOMENTUM_CACHE[cache_key].items()}
+
+    snapshot = _eastmoney_sector_index_snapshot()
+    rows: List[Dict[str, Any]] = []
+    for item in snapshot.to_dict("records"):
+        code = str(item.get("code") or "").strip()
+        industry = str(item.get("industry") or "").strip()
+        if not code or not industry:
+            continue
+        try:
+            history = _eastmoney_sector_index_history(code, lookback_days=lookback_days)
+        except Exception:
+            continue
+        momentum_5d = _sector_return(history, 5)
+        momentum_20d = _sector_return(history, lookback_days)
+        if math.isnan(momentum_20d):
+            continue
+        volume = pd.to_numeric(history.get("volume"), errors="coerce")
+        avg_volume = safe_float(volume.tail(5).mean(), 0)
+        base_volume = safe_float(volume.tail(20).mean(), 0)
+        avg_volume_ratio = avg_volume / base_volume if base_volume > 0 else safe_float(item.get("volume_ratio"), 1.0)
+        rows.append({
+            "industry": industry,
+            "momentum_5d": safe_float(momentum_5d, 0),
+            "momentum_20d": safe_float(momentum_20d, 0),
+            "avg_volume_ratio": safe_float(avg_volume_ratio, 1.0),
+        })
+
+    if not rows:
+        return {}
+
+    ranked = pd.DataFrame(rows)
+    ranked["volume_ratio_rank"] = ranked["avg_volume_ratio"].rank(method="min", ascending=True, pct=True)
+    ranked["weighted_score"] = (
+        ranked["momentum_5d"] * 0.3
+        + ranked["momentum_20d"] * 0.5
+        + ranked["volume_ratio_rank"] * 0.2
+    )
+    ranked = ranked.sort_values(["weighted_score", "momentum_20d", "industry"], ascending=[False, False, True]).reset_index(drop=True)
+    ranked["rank"] = np.arange(1, len(ranked) + 1)
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in ranked.to_dict("records"):
+        result[str(item["industry"])] = {
+            "momentum_5d": round(safe_float(item.get("momentum_5d"), 0), 4),
+            "momentum_20d": round(safe_float(item.get("momentum_20d"), 0), 4),
+            "avg_volume_ratio": round(safe_float(item.get("avg_volume_ratio"), 1.0), 4),
+            "rank": int(item["rank"]),
+        }
+    _SECTOR_MOMENTUM_CACHE[cache_key] = {k: v.copy() for k, v in result.items()}
+    return result
 
 
 def _tencent_spot_direct() -> pd.DataFrame:
@@ -1662,6 +1824,276 @@ def score_stock(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _clamp_score(value: Any, default: float = 50.0) -> float:
+    v = safe_float(value, default)
+    if math.isnan(v):
+        v = default
+    return float(max(0, min(100, v)))
+
+
+def _series_float(df: pd.DataFrame, column: str, default: float = float("nan")) -> pd.Series:
+    if column in df.columns:
+        return pd.to_numeric(df[column], errors="coerce")
+    return pd.Series([default] * len(df), index=df.index, dtype="float64")
+
+
+def _linear_score(value: float, low: float, high: float, inverse: bool = False) -> float:
+    if math.isnan(value):
+        return 50.0
+    if high == low:
+        return 50.0
+    raw = (value - low) / (high - low) * 100
+    score = 100 - raw if inverse else raw
+    return _clamp_score(score)
+
+
+def _adx14(df: pd.DataFrame) -> float:
+    if len(df) < 16:
+        return float("nan")
+    high = _series_float(df, "high")
+    low = _series_float(df, "low")
+    close = _series_float(df, "close")
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=14).mean()
+    plus_di = 100 * plus_dm.rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    return safe_float(dx.rolling(14, min_periods=1).mean().iloc[-1])
+
+
+def _max_drawdown_score(close: pd.Series, lookback: int = 60) -> float:
+    recent = close.tail(lookback).dropna()
+    if recent.empty:
+        return 50.0
+    running_high = recent.cummax()
+    drawdown = (recent / running_high - 1) * 100
+    max_dd = abs(safe_float(drawdown.min(), 0))
+    return _linear_score(max_dd, 35, 0)
+
+
+def multi_factor_score(
+    df: pd.DataFrame,
+    code: str = "",
+    capital_flow: Optional[Dict[str, Any]] = None,
+    sector_data: Optional[Dict[str, Any]] = None,
+    market_state: str = "震荡市",
+) -> Dict[str, Any]:
+    """Multi-factor stock score used by P5 strategy research.
+
+    The function is simulation/research only. It ranks candidates; it does not
+    execute or authorize trades.
+    """
+    if df is None or len(df) < 30:
+        raise ValueError("multi_factor_score requires at least 30 rows of OHLCV data")
+
+    REGIME_WEIGHTS = {
+        "强牛市": {"trend": 0.20, "momentum": 0.30, "volume": 0.20, "flow": 0.25, "quality": 0.05},
+        "弱牛市": {"trend": 0.15, "momentum": 0.25, "volume": 0.20, "flow": 0.25, "quality": 0.15},
+        "震荡市": {"trend": 0.10, "momentum": 0.20, "volume": 0.25, "flow": 0.25, "quality": 0.20},
+        "震荡": {"trend": 0.10, "momentum": 0.20, "volume": 0.25, "flow": 0.25, "quality": 0.20},
+        "熊市": {"trend": 0.05, "momentum": 0.10, "volume": 0.20, "flow": 0.25, "quality": 0.40},
+        "防御": {"trend": 0.05, "momentum": 0.05, "volume": 0.15, "flow": 0.25, "quality": 0.50},
+    }
+    weights = REGIME_WEIGHTS.get(market_state, REGIME_WEIGHTS["震荡市"])
+
+    df = df.copy()
+    close_s = _series_float(df, "close")
+    open_s = _series_float(df, "open")
+    high_s = _series_float(df, "high")
+    low_s = _series_float(df, "low")
+    volume_s = _series_float(df, "volume", 0)
+    turnover_s = _series_float(df, "turnover", float("nan"))
+
+    close = safe_float(close_s.iloc[-1])
+    high = safe_float(high_s.iloc[-1])
+    low = safe_float(low_s.iloc[-1])
+    open_ = safe_float(open_s.iloc[-1])
+    if math.isnan(close) or close <= 0:
+        raise ValueError("multi_factor_score requires a valid latest close")
+
+    ma5 = safe_float(close_s.rolling(5).mean().iloc[-1])
+    ma10 = safe_float(close_s.rolling(10).mean().iloc[-1])
+    ma20 = safe_float(close_s.rolling(20).mean().iloc[-1])
+    ma60 = safe_float(close_s.rolling(60).mean().iloc[-1]) if len(df) >= 60 else safe_float(close_s.mean())
+    ma20_prev = safe_float(close_s.rolling(20).mean().iloc[-6]) if len(df) >= 25 else ma20
+    atr14 = safe_float((high_s - low_s).rolling(14).mean().iloc[-1])
+    vol5 = safe_float(volume_s.rolling(5).mean().iloc[-1], 0)
+    vol_ratio = safe_float(volume_s.iloc[-1], 0) / vol5 if vol5 > 0 else float("nan")
+    rsi = safe_float(df.iloc[-1].get("rsi14"), 50)
+    pct = (close / safe_float(close_s.iloc[-2], close) - 1) * 100 if len(close_s) >= 2 else 0
+    pct3 = (close / safe_float(close_s.iloc[-4], close) - 1) * 100 if len(close_s) >= 4 else 0
+    pct5 = (close / safe_float(close_s.iloc[-6], close) - 1) * 100 if len(close_s) >= 6 else 0
+
+    reasons: List[str] = []
+    risks: List[str] = []
+
+    trend_parts = []
+    trend_parts.append(80 if close > ma20 and ma20 >= ma20_prev else 35)
+    trend_parts.append(85 if ma5 > ma10 > ma20 else 45)
+    trend_parts.append(75 if close > ma60 else 35)
+    adx = _adx14(df)
+    if not math.isnan(adx):
+        trend_parts.append(90 if adx > 40 else 75 if adx > 25 else 45)
+    high_52w = safe_float(high_s.tail(252).max(), high)
+    low_52w = safe_float(low_s.tail(252).min(), low)
+    range_pos = (close - low_52w) / (high_52w - low_52w) * 100 if high_52w > low_52w else 50
+    trend_parts.append(_clamp_score(range_pos))
+    trend_score = _clamp_score(np.nanmean(trend_parts))
+
+    sector_data = sector_data or {}
+    close_60 = safe_float(close_s.iloc[-61], safe_float(close_s.iloc[0])) if len(close_s) > 60 else safe_float(close_s.iloc[0])
+    raw_return_60 = (close / close_60 - 1) * 100 if close_60 else 0
+    sector_return_60 = safe_float(sector_data.get("sector_return_60d"), 0)
+    residual_60 = raw_return_60 - sector_return_60
+    close_skip_start = safe_float(close_s.iloc[-41], safe_float(close_s.iloc[0])) if len(close_s) > 40 else safe_float(close_s.iloc[0])
+    close_skip_end = safe_float(close_s.iloc[-21], close) if len(close_s) > 20 else close
+    skip_return = (close_skip_end / close_skip_start - 1) * 100 if close_skip_start else 0
+    residual_skip = skip_return - safe_float(sector_data.get("sector_return_20d_skip_1m"), 0)
+    percentile = sector_data.get("momentum_percentile")
+    if percentile is not None:
+        momentum_score = _clamp_score(percentile)
+    else:
+        momentum_score = _clamp_score(50 + residual_60 * 1.2 + residual_skip * 0.8)
+
+    turnover_std = safe_float(turnover_s.tail(20).std())
+    turnover_component = _linear_score(turnover_std, 5, 0)
+    price_turn_corr = safe_float(close_s.tail(20).corr(turnover_s.tail(20)))
+    corr_component = _linear_score(price_turn_corr, 1, -1)
+    shadow = (high_s - pd.concat([open_s, close_s], axis=1).max(axis=1)) / (high_s - low_s + 0.001) * 100
+    upper_shadow_5 = safe_float(shadow.tail(5).mean(), 0)
+    shadow_component = _linear_score(upper_shadow_5, 60, 0)
+    volume_climax = safe_float(volume_s.iloc[-1], 0) > safe_float(volume_s.tail(20).mean(), 0) * 2.5 and close < open_
+    volume_score = _clamp_score(np.nanmean([turnover_component, corr_component, shadow_component]))
+    if volume_climax:
+        volume_score = _clamp_score(volume_score - 25)
+        risks.append("量价结构风险：放量收阴")
+
+    if capital_flow:
+        flow_score = 0.0
+        if safe_float(capital_flow.get("north_bound_net_inflow"), 0) > 0:
+            flow_score += 30
+        if safe_float(capital_flow.get("north_bound_holding_change"), 0) > 0.1:
+            flow_score += 20
+        if safe_float(capital_flow.get("big_order_buy_ratio"), 0) > 50:
+            flow_score += 25
+        if safe_float(capital_flow.get("main_net_inflow_ratio"), 0) > 5:
+            flow_score += 20
+        if safe_float(capital_flow.get("margin_balance_change"), 0) > 0:
+            flow_score += 5
+        flow_score = _clamp_score(flow_score)
+    else:
+        flow_score = 50.0
+
+    drawdown_component = _max_drawdown_score(close_s, 60)
+    returns = close_s.pct_change().dropna()
+    ann_vol = safe_float(returns.tail(20).std(), 0) * math.sqrt(252) * 100
+    vol_percentile = sector_data.get("volatility_percentile")
+    if vol_percentile is not None:
+        vol_component = _linear_score(safe_float(vol_percentile), 100, 0)
+    else:
+        vol_component = _linear_score(ann_vol, 80, 10)
+    quality_score = np.nanmean([drawdown_component, vol_component])
+    debt_ratio = sector_data.get("debt_ratio")
+    roe = sector_data.get("roe")
+    if debt_ratio is not None and safe_float(debt_ratio) < 50:
+        quality_score += 8
+    if roe is not None and safe_float(roe) > 10:
+        quality_score += 8
+    quality_score = _clamp_score(quality_score)
+
+    factor_scores = {
+        "trend": round(trend_score, 2),
+        "momentum": round(momentum_score, 2),
+        "volume": round(volume_score, 2),
+        "flow": round(flow_score, 2),
+        "quality": round(quality_score, 2),
+    }
+    factor_contributions = {
+        key: round(factor_scores[key] * weights[key])
+        for key in ["trend", "momentum", "volume", "flow", "quality"]
+    }
+    total_score = int(_clamp_score(sum(factor_scores[key] * weights[key] for key in factor_scores)))
+
+    strongest = max(factor_scores, key=lambda key: factor_scores[key])
+    reasons.append(f"主导因子：{strongest} {factor_scores[strongest]:.0f}")
+    if trend_score >= 70:
+        reasons.append("趋势质量较强")
+    if momentum_score >= 60:
+        reasons.append("残差动量占优")
+    if flow_score >= 70:
+        reasons.append("资金流因子较强")
+    if quality_score < 35:
+        risks.append("质量/波动风险偏高")
+    if volume_score < 35:
+        risks.append("量价结构偏弱")
+
+    if total_score >= 78:
+        signal = "多因子强势候选"
+        action = "可进入第二天确认"
+    elif total_score >= 70:
+        signal = "多因子偏强候选"
+        action = "观察，等第二天确认"
+    elif total_score >= 60:
+        signal = "多因子中性偏强"
+        action = "只观察，不建议追买"
+    else:
+        signal = "多因子暂不支持新买"
+        action = "不建议新买"
+
+    zones = key_price_zones(df)
+    s1, s2, p1, p2 = support_pressure(df)
+    stop = min(s1 * 0.985, close * 0.94)
+    upper = safe_float(((high - max(open_, close)) / (high - low + 0.001)) * 100, 0)
+
+    return {
+        "score": total_score,
+        "signal": signal,
+        "action": action,
+        "reasons": reasons[:8],
+        "risks": risks[:6],
+        "factor_scores": factor_scores,
+        "factor_contributions": factor_contributions,
+        "support1": s1,
+        "support2": s2,
+        "pressure1": p1,
+        "pressure2": p2,
+        "stop": stop,
+        "last_close": close,
+        "ma20": ma20,
+        "ma5": ma5,
+        "ma10": ma10,
+        "ma60": ma60,
+        "vol_ratio": vol_ratio,
+        "rsi14": rsi,
+        "atr14": atr14,
+        "pct1": pct,
+        "pct3": pct3,
+        "pct5": pct5,
+        "adx14": adx,
+        "upper_shadow": upper,
+        "support_zone_low": zones.get("support_zone_low"),
+        "support_zone_high": zones.get("support_zone_high"),
+        "support_zone_strength": zones.get("support_zone_strength"),
+        "pressure_zone_low": zones.get("pressure_zone_low"),
+        "pressure_zone_high": zones.get("pressure_zone_high"),
+        "pressure_zone_strength": zones.get("pressure_zone_strength"),
+        "box_low": zones.get("box_low"),
+        "box_high": zones.get("box_high"),
+        "neckline": zones.get("neckline"),
+        "false_break_risk": zones.get("false_break_risk"),
+        "zone_note": zones.get("zone_note"),
+        "df": df,
+    }
+
+
 def is_bad_name(name: str) -> bool:
     name = str(name).upper()
     return any(x in name for x in ["ST", "退", "N", "C"])
@@ -1754,6 +2186,12 @@ def decision_from_realtime(
     atr14 = safe_float(candidate.get("ATR14") or candidate.get("atr14"))
     zone_note = str(candidate.get("关键位说明") or candidate.get("zone_note") or "")
     hold_days = int(safe_float(candidate.get("持仓天数") or candidate.get("hold_days"), 0))
+    factor_scores = candidate.get("factor_scores") if isinstance(candidate.get("factor_scores"), dict) else {}
+    trend_score = safe_float(factor_scores.get("trend", candidate.get("因子趋势")), float("nan"))
+    momentum_score = safe_float(factor_scores.get("momentum", candidate.get("因子动量")), float("nan"))
+    volume_score = safe_float(factor_scores.get("volume", candidate.get("因子量价")), float("nan"))
+    flow_score = safe_float(factor_scores.get("flow", candidate.get("因子资金")), float("nan"))
+    quality_score = safe_float(factor_scores.get("quality", candidate.get("因子质量")), float("nan"))
     false_break_raw = candidate.get("假突破风险")
     if false_break_raw is None:
         false_break_raw = candidate.get("false_break_risk")
@@ -2026,6 +2464,8 @@ def decision_from_realtime(
     target_1r = basis_price + r_unit if _is_level(r_unit) else float("nan")
     target_2r = basis_price + 2 * r_unit if _is_level(r_unit) else float("nan")
     risk_notes = list(dict.fromkeys(risk_notes))
+    if not math.isnan(flow_score) and flow_score < 30:
+        risk_notes = list(dict.fromkeys(risk_notes + ["资金面偏弱，新买需谨慎"]))
 
     # 卖出判断
     sell_action = "持有观察"
@@ -2082,6 +2522,14 @@ def decision_from_realtime(
     else:
         buy_action = "不建议买"
 
+    strong_momentum = not math.isnan(momentum_score) and momentum_score > 70
+    trend_not_weak = math.isnan(trend_score) or trend_score >= 50
+    if strong_momentum and trend_not_weak and not hard_blockers and not chase_block:
+        if buy_action == "不建议买":
+            buy_action = "谨慎观察，等回踩确认"
+        elif buy_action == "谨慎观察，等回踩确认":
+            buy_action = "可以买小仓"
+
     if mode == "sell":
         final_action = sell_action
     else:
@@ -2125,6 +2573,11 @@ def decision_from_realtime(
         "检查总数": check_total,
         "检查项": checks,
         "买入建议": buy_action,
+        "因子趋势": trend_score,
+        "因子动量": momentum_score,
+        "因子量价": volume_score,
+        "因子资金": flow_score,
+        "因子质量": quality_score,
         "压力状态": pressure_state,
         "突破昨晚压力": breakout_pressure,
         "突破参考位": max(breakout_levels) if breakout_pressure else float("nan"),

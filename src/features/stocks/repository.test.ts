@@ -141,6 +141,90 @@ describe('stock repository', () => {
     ])
   })
 
+  it('maps multi-factor stock scan fields from Supabase rows', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_scan_results: [{
+        scan_date: '2026-07-09',
+        code: '600001',
+        name: 'Alpha',
+        score: 80,
+        prev_close: 10,
+        signal: '多因子测试',
+        action: '观察',
+        support_level: 9.5,
+        resistance_level: 11,
+        stop_loss: 9,
+        reason: 'fixture',
+        risk: '',
+        factor_trend: 71,
+        factor_momentum: 82,
+        factor_volume: 63,
+        factor_flow: 77,
+        factor_quality: 55,
+        sector_rank: 4,
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getRoughStocks()).resolves.toMatchObject([{
+      factorTrend: 71,
+      factorMomentum: 82,
+      factorVolume: 63,
+      factorFlow: 77,
+      factorQuality: 55,
+      sectorRank: 4,
+    }])
+  })
+
+  it('loads the latest market regime from Supabase rows', async () => {
+    const rowsByTable: Record<string, unknown[]> = {
+      stock_market_regime: [{
+        id: 'regime-1',
+        regime_date: '2026-07-09',
+        regime: '熊市',
+        csi300_close: 4755.534,
+        market_turnover_yi: 9819.46,
+        limit_up_count: 8,
+        limit_down_count: 1,
+        break_rate_pct: 50,
+        advance_decline_ratio: 3.4444,
+        position_cap_pct: 20,
+        details: {
+          csi300_ma20: 4880.862,
+          csi300_ma60: 4846.421,
+          regime_note: '指数弱于中期均线，模拟仓位上限20%',
+          breadth_source: 'stock_daily_history_cache',
+        },
+        created_at: '2026-07-09T09:00:00Z',
+      }],
+    }
+    const client = {
+      from: (table: string) => ({
+        select: () => ({
+          order: () => Promise.resolve({ data: rowsByTable[table] ?? [], error: null }),
+        }),
+      }),
+    } as unknown as Parameters<typeof createStockRepository>[0]
+    const repository = createStockRepository(client)
+
+    await expect(repository.getMarketRegime()).resolves.toMatchObject({
+      regime: '熊市',
+      regimeDate: '2026-07-09',
+      positionCapPct: 20,
+      csi300Ma20: 4880.862,
+      csi300Ma60: 4846.421,
+      regimeNote: '指数弱于中期均线，模拟仓位上限20%',
+      breadthSource: 'stock_daily_history_cache',
+    })
+  })
+
   it('translates automatic trading reasons for display', async () => {
     const rowsByTable: Record<string, unknown[]> = {
       stock_auto_trade_orders: [{

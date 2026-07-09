@@ -15,6 +15,7 @@ import type {
   ModelPortfolioSnapshot,
   ModelPosition,
   ModelPrediction,
+  MarketRegime,
   MissedRunner,
   OverviewStats,
   PaperTradeOrder,
@@ -30,6 +31,14 @@ import './stocks.css'
 
 type StockRow = RoughStock | FineStock | RealtimeDecision | HoldingStock | TradeRecord | TaskRecord | SignalEvent | PositionAllocation | PaperTradeOrder | PortfolioSnapshot | BacktestRun | BacktestTrade | MissedRunner | BacktestEquityPoint | ModelPrediction | ModelDecision | ModelPosition | ModelOrder | ModelPortfolioSnapshot
 type TabId = 'auto' | 'model' | 'holdings' | 'backtest' | 'tasks' | 'account' | 'signals' | 'live' | 'rough' | 'fine' | 'history' | 'trades'
+
+const regimeTone: Record<string, string> = {
+  强牛市: 'strong-bull',
+  弱牛市: 'weak-bull',
+  震荡市: 'range',
+  熊市: 'bear',
+  防御: 'defense',
+}
 
 interface Column<T> {
   header: string
@@ -54,6 +63,35 @@ function ColorNumber({ value, suffix = '' }: { value: number; suffix?: string })
 function StatusTag({ status }: { status: string }) {
   const tone = status.includes('止损') ? 'risk' : status.includes('止盈') ? 'profit' : status.includes('可买') ? 'buy' : status.includes('成功') ? 'ok' : 'neutral'
   return <span className={`stock-status stock-status-${tone}`}>{status}</span>
+}
+
+function FactorBar({ stock }: { stock: RoughStock }) {
+  const factors = [
+    { label: '趋势', value: stock.factorTrend, color: '#3B82F6' },
+    { label: '动量', value: stock.factorMomentum, color: '#22C55E' },
+    { label: '量价', value: stock.factorVolume, color: '#F97316' },
+    { label: '资金', value: stock.factorFlow, color: '#EF4444' },
+    { label: '质量', value: stock.factorQuality, color: '#8B5CF6' },
+  ]
+  const total = factors.reduce((sum, item) => sum + Math.max(0, item.value), 0) || 1
+  const title = factors.map((item) => `${item.label}:${item.value.toFixed(0)}`).join(' | ')
+
+  return (
+    <div className="stock-factor-cell" title={title}>
+      <div className="stock-factor-bar">
+        {factors.map((item) => (
+          <span
+            key={item.label}
+            style={{
+              flexGrow: Math.max(2, (Math.max(0, item.value) / total) * 100),
+              backgroundColor: item.color,
+            }}
+          />
+        ))}
+      </div>
+      <b>#{stock.sectorRank || '-'}</b>
+    </div>
+  )
 }
 
 function shanghaiDateValue() {
@@ -176,6 +214,7 @@ export default function StockDashboard() {
   const [historicalFineStocks, setHistoricalFineStocks] = useState<FineStock[]>([])
   const [paperOrders, setPaperOrders] = useState<PaperTradeOrder[]>([])
   const [portfolioSnapshots, setPortfolioSnapshots] = useState<PortfolioSnapshot[]>([])
+  const [marketRegime, setMarketRegime] = useState<MarketRegime | null>(null)
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([])
   const [backtestTrades, setBacktestTrades] = useState<BacktestTrade[]>([])
   const [missedRunners, setMissedRunners] = useState<MissedRunner[]>([])
@@ -219,7 +258,7 @@ export default function StockDashboard() {
   }, [executionStock, holdings])
 
   async function loadStockData() {
-    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
+    const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, regime, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
       stockRepository.getOverview(),
       stockRepository.getRoughStocks(),
       stockRepository.getFineStocks(),
@@ -231,6 +270,7 @@ export default function StockDashboard() {
       stockRepository.getHistoricalFineStocks(),
       stockRepository.getPaperTradeOrders(),
       stockRepository.getPortfolioSnapshots(),
+      stockRepository.getMarketRegime(),
       stockRepository.getBacktestRuns(),
       stockRepository.getBacktestTrades(),
       stockRepository.getMissedRunners(),
@@ -252,6 +292,7 @@ export default function StockDashboard() {
     setHistoricalFineStocks(historicalPicks)
     setPaperOrders(autoOrders)
     setPortfolioSnapshots(snapshots)
+    setMarketRegime(regime)
     setBacktestRuns(btRuns)
     setBacktestTrades(btTrades)
     setMissedRunners(missed)
@@ -267,7 +308,7 @@ export default function StockDashboard() {
     let mounted = true
     async function load() {
       setLoading(true)
-      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
+      const [stats, rough, fine, live, currentHoldings, tradeRecords, taskRecords, signalEvents, historicalPicks, autoOrders, snapshots, regime, btRuns, btTrades, missed, curve, modelPreds, modelDecisionRows, modelPositionRows, modelOrderRows, modelSnapshotRows] = await Promise.all([
         stockRepository.getOverview(),
         stockRepository.getRoughStocks(),
         stockRepository.getFineStocks(),
@@ -279,6 +320,7 @@ export default function StockDashboard() {
         stockRepository.getHistoricalFineStocks(),
         stockRepository.getPaperTradeOrders(),
         stockRepository.getPortfolioSnapshots(),
+        stockRepository.getMarketRegime(),
         stockRepository.getBacktestRuns(),
         stockRepository.getBacktestTrades(),
         stockRepository.getMissedRunners(),
@@ -301,6 +343,7 @@ export default function StockDashboard() {
       setHistoricalFineStocks(historicalPicks)
       setPaperOrders(autoOrders)
       setPortfolioSnapshots(snapshots)
+      setMarketRegime(regime)
       setBacktestRuns(btRuns)
       setBacktestTrades(btTrades)
       setMissedRunners(missed)
@@ -347,6 +390,7 @@ export default function StockDashboard() {
     { header: '代码', cell: (row) => row.code },
     { header: '名称', cell: (row) => row.name },
     { header: '排名分', cell: (row) => row.score, align: 'right' },
+    { header: '因子', cell: (row) => <FactorBar stock={row} /> },
     { header: '昨收', cell: (row) => formatPrice(row.prevClose), align: 'right' },
     { header: '信号', cell: (row) => row.signal },
     { header: '动作', cell: (row) => row.action },
@@ -361,6 +405,7 @@ export default function StockDashboard() {
     { header: '名称', cell: (row) => row.name },
     { header: '策略等级', cell: (row) => row.strategyLevel },
     { header: '排名分', cell: (row) => row.score, align: 'right' },
+    { header: '因子', cell: (row) => <FactorBar stock={row} /> },
     { header: '信号', cell: (row) => row.signal },
     { header: '动作', cell: (row) => row.action },
     { header: '复核', cell: (row) => row.reviewStatus },
@@ -453,6 +498,7 @@ export default function StockDashboard() {
     { header: '名称', cell: (row) => row.name },
     { header: '策略等级', cell: (row) => row.strategyLevel },
     { header: '排名分', cell: (row) => row.score, align: 'right' },
+    { header: '因子', cell: (row) => <FactorBar stock={row} /> },
     { header: '昨收', cell: (row) => formatPrice(row.prevClose), align: 'right' },
     { header: '信号', cell: (row) => row.signal },
     { header: '入选理由', cell: (row) => row.reason },
@@ -933,7 +979,19 @@ export default function StockDashboard() {
           <span>风控规则</span>
           <b>最多 6 只；单票 15%；留现金 25%</b>
         </section>
+        <section>
+          <span>市场状态</span>
+          {marketRegime ? (
+            <b className={`stock-regime-badge stock-regime-${regimeTone[marketRegime.regime] ?? 'range'}`}>
+              {marketRegime.regime}
+              <small>仓位上限 {marketRegime.positionCapPct || '-'}%</small>
+            </b>
+          ) : (
+            <b className="stock-regime-badge stock-regime-range">暂无数据</b>
+          )}
+        </section>
       </div>
+      {marketRegime?.regimeNote && <div className="stock-account-warning">{marketRegime.regimeNote}</div>}
       {accountSummary.positionCountWarning && <div className="stock-account-warning">{accountSummary.positionCountWarning}</div>}
       {todayQuoteWarning && <div className="stock-account-warning">{todayQuoteWarning}</div>}
 

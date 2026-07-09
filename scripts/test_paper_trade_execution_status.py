@@ -7,7 +7,20 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from paper_trade_engine import buy_position, record_skipped_sell_decision, sell_decision, sell_position
+import paper_trade_engine as engine
+from paper_trade_engine import (
+    account_drawdown_pct,
+    adaptive_position_size,
+    buy_position,
+    consecutive_loss_count,
+    decision_signal_strength,
+    enrich_decisions_with_model_predictions,
+    insert_snapshot,
+    record_skipped_sell_decision,
+    run,
+    sell_decision,
+    sell_position,
+)
 
 
 class FakeSupabaseClient:
@@ -28,6 +41,334 @@ class FakeSupabaseClient:
 
 
 class PaperTradeExecutionStatusTest(unittest.TestCase):
+    def patch_engine(self, **replacements):
+        original_values = {name: getattr(engine, name, None) for name in replacements}
+        missing = {name for name in replacements if not hasattr(engine, name)}
+        for name, value in replacements.items():
+            setattr(engine, name, value)
+
+        def restore():
+            for name, value in original_values.items():
+                if name in missing:
+                    delattr(engine, name)
+                else:
+                    setattr(engine, name, value)
+
+        return restore
+
+    def test_adaptive_position_size_applies_regime_caps(self) -> None:
+        strong_bull = adaptive_position_size(
+            base_amount=100000,
+            signal_strength=1.0,
+            market_regime="强牛市",
+            account_drawdown_pct=0,
+            consecutive_losses=0,
+            stock_volatility_pct=40,
+        )
+        defense = adaptive_position_size(
+            base_amount=100000,
+            signal_strength=1.0,
+            market_regime="防御",
+            account_drawdown_pct=0,
+            consecutive_losses=0,
+            stock_volatility_pct=40,
+        )
+
+        self.assertEqual(strong_bull, 80000)
+        self.assertEqual(defense, 25000)
+
+    def test_adaptive_position_size_shrinks_after_five_consecutive_losses_to_floor(self) -> None:
+        result = adaptive_position_size(
+            base_amount=100000,
+            signal_strength=1.0,
+            market_regime="强牛市",
+            account_drawdown_pct=0,
+            consecutive_losses=5,
+            stock_volatility_pct=40,
+        )
+
+        self.assertEqual(result, 25000)
+
+    def test_adaptive_position_size_combines_drawdown_and_high_volatility(self) -> None:
+        result = adaptive_position_size(
+            base_amount=100000,
+            signal_strength=0.8,
+            market_regime="弱牛市",
+            account_drawdown_pct=6,
+            consecutive_losses=0,
+            stock_volatility_pct=65,
+        )
+
+        self.assertEqual(result, 29400)
+
+    def test_account_drawdown_uses_peak_snapshot_total_assets(self) -> None:
+        snapshots = [
+            {"total_assets": 1030000},
+            {"total_assets": 1200000},
+            {"total_assets": 1100000},
+        ]
+
+        self.assertAlmostEqual(account_drawdown_pct(snapshots, current_total_assets=1080000), 10.0)
+
+    def test_consecutive_loss_count_stops_at_latest_profitable_trade(self) -> None:
+        trades = [
+            {"sell_date": "2026-07-01", "pnl_amount": -100},
+            {"sell_date": "2026-07-02", "pnl_amount": 50},
+            {"sell_date": "2026-07-03", "pnl_amount": -20},
+            {"sell_date": "2026-07-04", "pnl_amount": -30},
+        ]
+
+        self.assertEqual(consecutive_loss_count(trades), 2)
+
+    def test_decision_signal_strength_uses_multi_factor_score(self) -> None:
+        self.assertEqual(decision_signal_strength({"multi_factor_score": 72}), 0.72)
+        self.assertEqual(decision_signal_strength({"score": 60}), 0.6)
+        self.assertEqual(decision_signal_strength({}), 1.0)
+
+    def test_buy_position_uses_adaptive_size_inputs(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {
+            "code": "000001",
+            "name": "Ping An",
+            "current_price": 10,
+            "suggest_buy_price": 10,
+            "stop_loss": 9,
+            "can_buy": True,
+            "multi_factor_score": 100,
+        }
+
+        result = buy_position(
+            client,
+            decision,
+            [],
+            [],
+            market_regime="防御",
+            account_drawdown=0,
+            consecutive_losses=0,
+            stock_volatility_pct=40,
+        )
+
+        self.assertIsNotNone(result)
+        order_payload = [
+            request[2][0]
+            for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0]
+        self.assertLessEqual(order_payload["amount"], 25000)
+
+    def test_sector_filter_blocks_bottom_sector_buy_candidate(self) -> None:
+        calls: list[str] = []
+        client = FakeSupabaseClient()
+
+        def fake_buy_position(*args, **kwargs):
+            calls.append("buy")
+            return {"code": "000001", "shares": 100}
+
+        restore = self.patch_engine(
+            get_client=lambda: client,
+            classify_market_regime=lambda active_client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda active_client: [{
+                "code": "000001",
+                "can_buy": True,
+                "current_price": 10,
+                "shenwan_industry_l1": "弱行业",
+                "factor_scores": {"momentum": 45},
+            }],
+            latest_model_predictions=lambda active_client: {},
+            open_positions=lambda active_client: [],
+            trade_history=lambda active_client: [],
+            portfolio_snapshots=lambda active_client: [],
+            today_orders=lambda active_client: [],
+            sector_momentum_ranking=lambda active_client, lookback_days=20: {"弱行业": {"rank": 18}},
+            buy_position=fake_buy_position,
+            insert_snapshot=lambda active_client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["orders"], 0)
+        signal_reasons = [
+            request[2]["execution_reason"]
+            for request in client.requests
+            if request[0] == "PATCH" and request[1].startswith("stock_signal_events?")
+        ]
+        self.assertIn("板块排名靠后", "".join(signal_reasons))
+
+    def test_sector_filter_allows_top_sector_buy_candidate(self) -> None:
+        calls: list[str] = []
+
+        def fake_buy_position(*args, **kwargs):
+            calls.append("buy")
+            return {"code": "000001", "shares": 100}
+
+        restore = self.patch_engine(
+            get_client=lambda: FakeSupabaseClient(),
+            classify_market_regime=lambda client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda client: [{
+                "code": "000001",
+                "can_buy": True,
+                "current_price": 10,
+                "shenwan_industry_l1": "强行业",
+                "factor_scores": {"momentum": 40},
+            }],
+            latest_model_predictions=lambda client: {},
+            open_positions=lambda client: [],
+            trade_history=lambda client: [],
+            portfolio_snapshots=lambda client: [],
+            today_orders=lambda client: [],
+            sector_momentum_ranking=lambda client, lookback_days=20: {"强行业": {"rank": 3}},
+            buy_position=fake_buy_position,
+            insert_snapshot=lambda client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, ["buy"])
+        self.assertEqual(result["orders"], 1)
+
+    def test_sector_rank_failure_degrades_without_blocking_buy(self) -> None:
+        calls: list[str] = []
+
+        def fake_sector_ranking(client, lookback_days=20):
+            raise RuntimeError("sector unavailable")
+
+        def fake_buy_position(*args, **kwargs):
+            calls.append("buy")
+            return {"code": "000001", "shares": 100}
+
+        restore = self.patch_engine(
+            get_client=lambda: FakeSupabaseClient(),
+            classify_market_regime=lambda client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda client: [{"code": "000001", "can_buy": True, "current_price": 10}],
+            latest_model_predictions=lambda client: {},
+            open_positions=lambda client: [],
+            trade_history=lambda client: [],
+            portfolio_snapshots=lambda client: [],
+            today_orders=lambda client: [],
+            sector_momentum_ranking=fake_sector_ranking,
+            buy_position=fake_buy_position,
+            insert_snapshot=lambda client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, ["buy"])
+        self.assertEqual(result["orders"], 1)
+
+    def test_weak_sector_open_position_gets_observation_patch(self) -> None:
+        client = FakeSupabaseClient()
+        positions = [{
+            "id": "pos-1",
+            "code": "000001",
+            "shares": 100,
+            "current_price": 10,
+            "cost_price": 10,
+            "shenwan_industry_l1": "弱行业",
+        }]
+
+        restore = self.patch_engine(
+            get_client=lambda: client,
+            classify_market_regime=lambda active_client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda active_client: [{"code": "000001", "current_price": 10}],
+            latest_model_predictions=lambda active_client: {},
+            open_positions=lambda active_client: positions,
+            trade_history=lambda active_client: [],
+            portfolio_snapshots=lambda active_client: [],
+            today_orders=lambda active_client: [],
+            sector_momentum_ranking=lambda active_client, lookback_days=20: {"弱行业": {"rank": 21}},
+            insert_snapshot=lambda active_client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            run(dry_run=False)
+        finally:
+            restore()
+
+        position_patches = [
+            request[2]
+            for request in client.requests
+            if request[0] == "PATCH" and request[1].startswith("stock_positions?")
+        ]
+        self.assertTrue(any("减仓观察" in str(payload.get("current_suggestion")) for payload in position_patches))
+
+    def test_bear_regime_blocks_new_buys_in_run(self) -> None:
+        calls: list[str] = []
+
+        def fake_buy_position(*args, **kwargs):
+            calls.append("buy")
+            return {"code": "000001", "shares": 100}
+
+        restore = self.patch_engine(
+            get_client=lambda: FakeSupabaseClient(),
+            classify_market_regime=lambda client: {"regime": "熊市", "position_cap_pct": 20},
+            latest_live_decisions=lambda client: [{"code": "000001", "can_buy": True, "current_price": 10}],
+            latest_model_predictions=lambda client: {},
+            open_positions=lambda client: [],
+            trade_history=lambda client: [],
+            portfolio_snapshots=lambda client: [],
+            today_orders=lambda client: [],
+            sector_momentum_ranking=lambda client, lookback_days=20: {},
+            buy_position=fake_buy_position,
+            insert_snapshot=lambda client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["orders"], 0)
+
+    def test_strong_bull_regime_raises_run_holding_cap_to_eight(self) -> None:
+        calls: list[str] = []
+        positions = [
+            {"code": f"00000{index}", "shares": 100, "current_price": 10, "cost_price": 10}
+            for index in range(1, 7)
+        ]
+
+        def fake_buy_position(client, decision, current_positions, trades, max_holdings=6, **kwargs):
+            calls.append(f"buy:{max_holdings}:{len(current_positions)}")
+            return {"code": "000007", "shares": 100, "current_price": 10, "cost_price": 10}
+
+        restore = self.patch_engine(
+            get_client=lambda: FakeSupabaseClient(),
+            classify_market_regime=lambda client: {"regime": "强牛市", "position_cap_pct": 80},
+            latest_live_decisions=lambda client: [{"code": "000007", "can_buy": True, "current_price": 10}],
+            latest_model_predictions=lambda client: {},
+            open_positions=lambda client: positions,
+            trade_history=lambda client: [],
+            portfolio_snapshots=lambda client: [],
+            today_orders=lambda client: [],
+            sector_momentum_ranking=lambda client, lookback_days=20: {},
+            buy_position=fake_buy_position,
+            insert_snapshot=lambda client, positions, trades, trade_count, regime="震荡市": None,
+        )
+        try:
+            result = run(dry_run=False)
+        finally:
+            restore()
+
+        self.assertEqual(calls, ["buy:8:6"])
+        self.assertEqual(result["orders"], 1)
+
+    def test_insert_snapshot_records_regime_in_note(self) -> None:
+        client = FakeSupabaseClient()
+
+        insert_snapshot(client, [], [], 0, regime="熊市")
+
+        snapshot_payload = [
+            request[2][0]
+            for request in client.requests
+            if request[0] == "INSERT" and request[1] == "stock_portfolio_snapshots"
+        ][0]
+        self.assertEqual(snapshot_payload["note"], "[熊市] auto paper trading snapshot")
+
     def test_invalid_buy_price_marks_signal_failed_instead_of_silent_skip(self) -> None:
         client = FakeSupabaseClient()
         decision = {
@@ -51,6 +392,47 @@ class PaperTradeExecutionStatusTest(unittest.TestCase):
         payload = patches[0][2]
         self.assertEqual(payload["execution_status"], "failed")
         self.assertIn("价格无效", payload["execution_reason"])
+
+    def test_model_prediction_fields_are_written_to_order_payload(self) -> None:
+        client = FakeSupabaseClient()
+        decision = {
+            "code": "000001",
+            "name": "平安银行",
+            "current_price": 11,
+            "suggest_sell_price": 11,
+            "model_score": 0.72,
+            "model_rank": 8,
+            "multi_factor_score": 66,
+        }
+        position = {"id": "pos-1", "code": "000001", "shares": 1000, "cost_price": 10, "buy_date": "2026-01-01"}
+
+        sell_position(client, decision, position, [position], [], "test sell", 500)
+
+        order_payload = [
+            request[2][0]
+            for request in client.requests
+            if request[0] == "POST" and request[1] == "stock_auto_trade_orders"
+        ][0]
+        self.assertEqual(order_payload["model_score"], 0.72)
+        self.assertEqual(order_payload["model_rank"], 8)
+        self.assertEqual(order_payload["multi_factor_score"], 66)
+
+    def test_latest_model_predictions_are_merged_with_multi_factor_score(self) -> None:
+        predictions = {
+            "000001": {"score": 0.8, "rank": 5},
+            "000002": {"score": 0.2, "rank": 80},
+        }
+        decisions = [
+            {"code": "000001", "score": 70},
+            {"code": "000002", "multi_factor_score": 40},
+        ]
+
+        enriched = enrich_decisions_with_model_predictions(decisions, predictions)
+
+        self.assertEqual(enriched[0]["model_score"], 0.8)
+        self.assertEqual(enriched[0]["model_rank"], 5)
+        self.assertEqual(enriched[0]["multi_factor_score"], 70)
+        self.assertGreater(enriched[0]["combined_score"], enriched[1]["combined_score"])
 
     def test_stop_loss_sell_decision_clears_all_shares(self) -> None:
         result = sell_decision(
