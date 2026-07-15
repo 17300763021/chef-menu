@@ -1,0 +1,41 @@
+name: Legacy Record Reconciliation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/legacy-reconciliation.yml
+      - scripts/classify_legacy_records.py
+      - scripts/test_classify_legacy_records.py
+      - supabase/migrations/*_add_legacy_record_classifications.sql
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test deterministic classification
+        run: python scripts/test_classify_legacy_records.py
+      - name: Classify fixed M0.2 evidence and publish atomically
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: >-
+          python scripts/classify_legacy_records.py
+          --evidence-id legacy-20260715T031710984732Z-2ddcee6336bb
+          --report-out reconciliation/report.json
+      - name: Upload non-sensitive reconciliation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-reconciliation-${{ github.sha }}
+          path: reconciliation/report.json
+          if-no-files-found: error
+          retention-days: 90

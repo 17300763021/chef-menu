@@ -190,7 +190,12 @@ Acceptance:
 
 ### M0.3 Classify polluted records
 
-Status: Pending
+Status: In Progress
+
+Progress note:
+- 2026-07-15: Implementing deterministic classification from the fixed M0.2 forensic archive, with append-only run and record mappings, atomic cloud publication, source-record hashes, reversible dispositions, and explicit protection against excluding legitimate filled orders.
+- Read-only audit identified 18 orphan trade-history records for `603032` with no matching filled sell order and an unchanged open 900-share position. Their final frozen PnL sum is CNY -40,227.89; 5 are exact repeated fingerprints. Fifteen legitimate trade projections uniquely match filled sell orders, and all 32 filled main/model orders passed structural checks.
+- Remaining work: deploy the migration, run fixtures and the cloud classifier twice, verify all 350 records are mapped identically, prove append-only enforcement, and record final completion evidence.
 
 Required work:
 
