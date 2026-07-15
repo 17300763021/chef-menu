@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from legacy_account_freeze import LEGACY_ACCOUNT_FREEZE_REASON, LEGACY_ACCOUNT_FROZEN
 from market_regime import classify_market_regime
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
@@ -1044,6 +1045,9 @@ def insert_snapshot(
 
 
 def run(dry_run: bool = False) -> dict[str, int]:
+    if LEGACY_ACCOUNT_FROZEN and not dry_run:
+        print(f"[LegacyAccountFrozen] {LEGACY_ACCOUNT_FREEZE_REASON}", flush=True)
+        return {"decisions": 0, "positions": 0, "orders": 0, "snapshots": 0}
     client = get_client()
     regime_info = classify_market_regime(client)
     regime = str(regime_info.get("regime") or "震荡市")

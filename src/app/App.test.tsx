@@ -69,14 +69,15 @@ describe('chef menu application', () => {
     expect(screen.queryByRole('tab', { name: '今日精选' })).not.toBeInTheDocument()
   }, 10000)
 
-  it('asks visitors to log in before adding a stock holding', async () => {
+  it('keeps the legacy stock account read-only', async () => {
     render(<AppProvider repository={new LocalRepository()}><App /></AppProvider>)
 
     await userEvent.click(await screen.findByRole('link', { name: '股票助手' }))
     await userEvent.click(await screen.findByRole('tab', { name: '持仓执行' }))
-    await userEvent.click(screen.getByRole('button', { name: '新增持仓' }))
 
-    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('旧模拟账户已冻结')
+    expect(screen.getByRole('button', { name: '新增持仓' })).toBeDisabled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('asks visitors to log in before requesting a cloud stock task', async () => {

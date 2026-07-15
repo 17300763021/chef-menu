@@ -21,7 +21,6 @@ on:
           - night_scan
           - live_decision
           - live_session
-          - paper_trade
           - backtest
           - sync_latest
           - pending
@@ -43,6 +42,7 @@ jobs:
           TZ: Asia/Shanghai
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LEGACY_ACCOUNT_FROZEN: "true"
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
           INPUT_MODE: ${{ github.event.inputs.mode }}

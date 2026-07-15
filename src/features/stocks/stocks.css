@@ -172,6 +172,23 @@
   font-weight: 700;
 }
 
+.stock-legacy-freeze-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  color: #7f1d1d;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.stock-legacy-freeze-banner strong {
+  flex: 0 0 auto;
+}
+
 .stock-chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -42,6 +42,13 @@ class FakeSupabaseClient:
 
 
 class PaperTradeExecutionStatusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_legacy_account_frozen = engine.LEGACY_ACCOUNT_FROZEN
+        engine.LEGACY_ACCOUNT_FROZEN = False
+
+    def tearDown(self) -> None:
+        engine.LEGACY_ACCOUNT_FROZEN = self.original_legacy_account_frozen
+
     def patch_engine(self, **replacements):
         original_values = {name: getattr(engine, name, None) for name in replacements}
         missing = {name for name in replacements if not hasattr(engine, name)}

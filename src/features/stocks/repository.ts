@@ -34,6 +34,17 @@ import type {
 type StockSupabaseClient = SupabaseClient | null
 type Row = Record<string, unknown>
 
+export const LEGACY_ACCOUNT_FROZEN = true
+export const LEGACY_ACCOUNT_FREEZE_MESSAGE = '旧模拟账户已冻结并进入审计，只允许读取历史数据。'
+
+interface StockRepositoryOptions {
+  legacyAccountFrozen?: boolean
+}
+
+function rejectFrozenLegacyWrite(legacyAccountFrozen: boolean): void {
+  if (legacyAccountFrozen) throw new Error(LEGACY_ACCOUNT_FREEZE_MESSAGE)
+}
+
 function text(row: Row, key: string, fallback = '') {
   return String(row[key] ?? fallback)
 }
@@ -611,7 +622,11 @@ export interface StockRepository {
   requestJob(jobType: StockJobType): Promise<void>
 }
 
-export function createStockRepository(client: StockSupabaseClient = supabase): StockRepository {
+export function createStockRepository(
+  client: StockSupabaseClient = supabase,
+  options: StockRepositoryOptions = {},
+): StockRepository {
+  const legacyAccountFrozen = options.legacyAccountFrozen ?? false
   let localHoldings: HoldingStock[] | null = null
 
   async function localHoldingList() {
@@ -743,6 +758,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       return (rows ?? []).map(mapFineStock)
     },
     async addHolding(input) {
+      rejectFrozenLegacyWrite(legacyAccountFrozen)
       const holding = calculateHolding(input)
       if (client) {
         try {
@@ -770,6 +786,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       return holding
     },
     async saveTrade(input) {
+      rejectFrozenLegacyWrite(legacyAccountFrozen)
       const holding = input.holding
       if (input.action === '加仓') {
         const totalCost = holding.costPrice * holding.shares + input.price * input.shares
@@ -866,6 +883,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       return { holding: nextHolding, tradeRecord }
     },
     async confirmSignalBuy(input) {
+      rejectFrozenLegacyWrite(legacyAccountFrozen)
       const holding = await this.addHolding({
         code: input.signal.code,
         name: input.signal.name,
@@ -907,6 +925,7 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
       }
     },
     async recordTTrade(input) {
+      rejectFrozenLegacyWrite(legacyAccountFrozen)
       const result = await this.saveTrade({
         action: input.action === '做T买' ? '加仓' : '减仓',
         holding: input.holding,
@@ -936,4 +955,4 @@ export function createStockRepository(client: StockSupabaseClient = supabase): S
   }
 }
 
-export const stockRepository = createStockRepository()
+export const stockRepository = createStockRepository(supabase, { legacyAccountFrozen: LEGACY_ACCOUNT_FROZEN })

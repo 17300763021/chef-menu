@@ -785,4 +785,18 @@ describe('stock repository', () => {
       consecutiveLosses: 0,
     }])
   })
+
+  it('rejects legacy account mutations when the production freeze is enabled', async () => {
+    const repository = createStockRepository(null, { legacyAccountFrozen: true })
+
+    await expect(repository.addHolding({
+      code: '000001',
+      name: '平安银行',
+      costPrice: 10,
+      shares: 100,
+      currentPrice: 10,
+      buyDate: '2026-07-15',
+      currentSuggestion: 'test',
+    })).rejects.toThrow('旧模拟账户已冻结')
+  })
 })

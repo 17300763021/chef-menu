@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from legacy_account_freeze import LEGACY_ACCOUNT_FREEZE_REASON, LEGACY_ACCOUNT_FROZEN
 from sync_stock_data import SupabaseRest, env_value, read_env_file
 
 
@@ -275,8 +276,12 @@ def sync_generated(stock_dir: Path, include_holdings: bool = False) -> None:
     run_command(args, ROOT)
 
 
-def run_paper_trade() -> None:
+def run_paper_trade() -> bool:
+    if LEGACY_ACCOUNT_FROZEN:
+        print(f"[LegacyAccountFrozen] {LEGACY_ACCOUNT_FREEZE_REASON}", flush=True)
+        return False
     run_command([sys.executable, str(ROOT / "scripts" / "paper_trade_engine.py")], ROOT)
+    return True
 
 
 def run_backtest() -> None:
@@ -387,13 +392,12 @@ def execute_job(job_type: str) -> int:
     if job_type == "live_decision":
         run_live_decision()
         sync_generated(ENGINE_DIR)
-        run_paper_trade()
-        return 2
+        paper_trade_ran = run_paper_trade()
+        return 2 if paper_trade_ran else 1
     if job_type == "live_session":
         return run_live_session()
     if job_type == "paper_trade":
-        run_paper_trade()
-        return 1
+        return 1 if run_paper_trade() else 0
     if job_type == "backtest":
         run_backtest()
         return 1
@@ -404,9 +408,9 @@ def execute_job(job_type: str) -> int:
         run_night_scan()
         run_live_decision()
         sync_generated(ENGINE_DIR)
-        run_paper_trade()
+        paper_trade_ran = run_paper_trade()
         run_backtest()
-        return 4
+        return 4 if paper_trade_ran else 3
     if job_type == "auto":
         hour = datetime.now(timezone.utc).hour
         if hour >= 7:

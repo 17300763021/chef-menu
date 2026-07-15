@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useApp } from '../../app/AppContext'
 import { signIn } from '../auth'
 import { buildAccountSummary, dailyHoldingPnlDetails, formatDailyHoldingPnlQuoteWarning, recommendSignalBuy } from './account'
-import { stockRepository } from './repository'
+import { LEGACY_ACCOUNT_FREEZE_MESSAGE, LEGACY_ACCOUNT_FROZEN, stockRepository } from './repository'
 import type { PositionAllocation } from './account'
 import type {
   BacktestRun,
@@ -445,11 +445,18 @@ export default function StockDashboard() {
             setExecutionStock({ code: row.code, name: row.name })
           }}>{'\u6267\u884c\u8bb0\u5f55'}</button>
           {(['加仓', '减仓', '清仓'] as TradeAction[]).map((action) => (
-            <button key={action} type="button" onClick={(event) => {
+            <button
+              key={action}
+              type="button"
+              disabled={LEGACY_ACCOUNT_FROZEN}
+              title={LEGACY_ACCOUNT_FROZEN ? LEGACY_ACCOUNT_FREEZE_MESSAGE : undefined}
+              onClick={(event) => {
               event.stopPropagation()
+              if (rejectFrozenLegacyWrite()) return
               if (!requireStockLogin()) return
               setTradeModal({ action, stock: row })
-            }}>{action}</button>
+              }}
+            >{action}</button>
           ))}
         </div>
       ),
@@ -687,7 +694,14 @@ export default function StockDashboard() {
     return false
   }
 
+  function rejectFrozenLegacyWrite() {
+    if (!LEGACY_ACCOUNT_FROZEN) return false
+    setErrorMessage(LEGACY_ACCOUNT_FREEZE_MESSAGE)
+    return true
+  }
+
   async function handleSignalBuy(signal: SignalEvent) {
+    if (rejectFrozenLegacyWrite()) return
     if (!requireStockLogin()) return
     const recommendation = recommendSignalBuy(signal, accountSummary)
     if (recommendation.maxShares <= 0) {
@@ -716,6 +730,7 @@ export default function StockDashboard() {
   }
 
   async function handleSignalSell(signal: SignalEvent) {
+    if (rejectFrozenLegacyWrite()) return
     if (!requireStockLogin()) return
     const holding = holdings.find((item) => item.code === signal.code)
     if (!holding) {
@@ -745,6 +760,7 @@ export default function StockDashboard() {
   }
 
   async function handleSignalT(signal: SignalEvent) {
+    if (rejectFrozenLegacyWrite()) return
     if (!requireStockLogin()) return
     const holding = holdings.find((item) => item.code === signal.code)
     if (!holding) {
@@ -792,6 +808,7 @@ export default function StockDashboard() {
   }
 
   function signalActions(signal: SignalEvent) {
+    if (LEGACY_ACCOUNT_FROZEN) return <span>历史只读</span>
     if (signal.status !== '新信号') return <span>-</span>
     return (
       <div className="stock-row-actions">
@@ -805,6 +822,7 @@ export default function StockDashboard() {
 
   async function submitTrade(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (rejectFrozenLegacyWrite()) return
     if (!requireStockLogin()) return
     if (!tradeModal) return
     setErrorMessage('')
@@ -835,6 +853,7 @@ export default function StockDashboard() {
 
   async function submitHolding(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (rejectFrozenLegacyWrite()) return
     if (!requireStockLogin()) return
     const form = new FormData(event.currentTarget)
     setErrorMessage('')
@@ -938,6 +957,13 @@ export default function StockDashboard() {
           )}
         </div>
       </header>
+
+      {LEGACY_ACCOUNT_FROZEN && (
+        <div className="stock-legacy-freeze-banner" role="status">
+          <strong>旧模拟账户已冻结</strong>
+          <span>当前数据仅供历史追溯，正在进行账本审计；不会生成新订单、成交、持仓变更或账户快照。</span>
+        </div>
+      )}
 
       <div className="stock-stats">
         {[
@@ -1268,9 +1294,15 @@ export default function StockDashboard() {
                   <h2>当前持仓</h2>
                   <p>手动记录线下买入后的持仓，也可以先写自己的跟踪建议。</p>
                 </div>
-                <button type="button" onClick={() => {
+                <button
+                  type="button"
+                  disabled={LEGACY_ACCOUNT_FROZEN}
+                  title={LEGACY_ACCOUNT_FROZEN ? LEGACY_ACCOUNT_FREEZE_MESSAGE : undefined}
+                  onClick={() => {
+                  if (rejectFrozenLegacyWrite()) return
                   if (requireStockLogin()) setShowAddHoldingModal(true)
-                }}>新增持仓</button>
+                  }}
+                >新增持仓</button>
               </div>
               <DataTable columns={holdingColumns} data={holdings} onRowClick={setSelectedStock} />
             </div>
@@ -1361,7 +1393,7 @@ export default function StockDashboard() {
         </div>
       )}
 
-      {tradeModal && (
+      {tradeModal && !LEGACY_ACCOUNT_FROZEN && (
         <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label={`记录${tradeModal.action}`}>
           <form className="stock-modal" onSubmit={submitTrade}>
             <h2>记录{tradeModal.action}</h2>
@@ -1378,7 +1410,7 @@ export default function StockDashboard() {
         </div>
       )}
 
-      {showAddHoldingModal && (
+      {showAddHoldingModal && !LEGACY_ACCOUNT_FROZEN && (
         <div className="stock-modal-backdrop" role="dialog" aria-modal="true" aria-label="新增持仓">
           <form className="stock-modal" onSubmit={submitHolding}>
             <h2>新增持仓</h2>
