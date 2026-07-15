@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: legacy-record-reconciliation
+  cancel-in-progress: false
+
 jobs:
   classify:
     runs-on: ubuntu-latest
