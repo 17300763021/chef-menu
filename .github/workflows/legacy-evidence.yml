@@ -2,6 +2,13 @@ name: Legacy Forensic Evidence
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/legacy-evidence.yml
+      - scripts/capture_legacy_evidence.py
+      - scripts/test_capture_legacy_evidence.py
+      - supabase/migrations/*_add_legacy_evidence_manifests.sql
 
 permissions:
   actions: read
