@@ -148,12 +148,11 @@ Goal: Stop the legacy engine from creating additional unreliable state and estab
 
 ### M0.1 Freeze legacy automatic execution
 
-Status: In Progress
+Status: Completed
 
-Progress note:
-- 2026-07-15: Implemented fail-closed guards in the legacy task runner, paper engine, model engine, React repository, and stock dashboard; removed the manual paper-trade workflow option; added a visible read-only warning; and applied the online `freeze_legacy_stock_ledgers` migration with write-blocking triggers on eight legacy ledger tables.
-- Verification so far: freeze fixtures passed; legacy paper-engine tests passed; model-engine tests passed; full Vitest passed; production build passed; Python compilation passed; online trigger catalog returned all eight guards; and a service-role write probe was rejected without leaving a record.
-- Remaining work: deploy the code and UI to GitHub, verify the cloud deployment, then record final completion evidence.
+Completion note:
+- 2026-07-15: Implemented fail-closed guards in the legacy task runner, paper engine, model engine, React repository, and stock dashboard; removed the manual paper-trade workflow option; added a visible read-only warning; and applied online migration `20260715025450_freeze_legacy_stock_ledgers` with write-blocking triggers on eight legacy ledger tables.
+- Verification: 55 related Python tests and 42 frontend tests passed, the production build and Python compilation passed, all eight online triggers were present, a service-role write probe was rejected without leaving a row, GitHub Pages deployment run `29385529464` succeeded, and the deployed asset exposed the legacy-account freeze banner.
 
 Required work:
 
@@ -485,7 +484,7 @@ M0.1 -> M0.2 -> M0.3 -> M0.4
 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9
 ```
 
-The first incomplete item is `M0.1 Freeze legacy automatic execution`.
+The first incomplete item is `M0.2 Export and checksum legacy evidence`.
 
 # Completion Record Format
 
