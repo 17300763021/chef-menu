@@ -143,7 +143,11 @@ These figures are audit evidence, not permanent account truth. M0 must produce a
 
 ## M0: Freeze Legacy System And Preserve Evidence
 
-Status: Pending
+Status: Completed
+
+Completion note:
+- 2026-07-15: Completed the full M0 legacy freeze, immutable evidence capture, deterministic pollution classification, and reproducible frozen account baseline without deleting or rewriting legacy evidence.
+- Verification: M0.1 through M0.4 each passed their production-facing acceptance checks. The legacy source remains frozen at 350 records, and the next permitted roadmap item is M1 only after separate user confirmation.
 
 Goal: Stop the legacy engine from creating additional unreliable state and establish a reproducible account baseline without deleting evidence.
 
@@ -212,12 +216,13 @@ Acceptance:
 
 ### M0.4 Rebuild legacy account baseline
 
-Status: In Progress
+Status: Completed
 
-Progress note:
-- 2026-07-15: Implementing deterministic main/model legacy account replay from the fixed M0.2 archive and M0.3 classification, with acquisition fees capitalized into book cost, sell fees included in realized PnL, slippage disclosed but not deducted twice, frozen read-model prices used for valuation, and atomic append-only publication.
-- Read-only preview: the main account reconciles to cash CNY 913,162.06, market value CNY 18,063.00, realized PnL CNY -66,588.41, floating PnL CNY -2,186.53, total PnL CNY -68,774.94, and total assets CNY 931,225.06. The model account reconciles to total assets CNY 999,502.04. These remain preview figures until cloud publication and acceptance pass.
-- Remaining work: deploy schema and code, pass accounting fixtures, publish two account baselines plus 32 ledger entries and 6 positions twice in the cloud, verify idempotency and zero reconciliation differences, reject mutations, and preserve original polluted comparisons.
+Completion note:
+- 2026-07-15: Added deterministic account replay from the fixed M0.2 archive and M0.3 classification, original-versus-reconciled comparisons, four append-only service-only baseline tables, an atomic `SECURITY INVOKER` publication RPC, and a GitHub Actions cloud rebuild workflow. Acquisition fees are capitalized into book cost, sell fees reduce realized PnL, recorded slippage is disclosed but not deducted twice, and missing frozen valuation fails closed.
+- Verification: Six M0.4 accounting and schema fixtures, five M0.3 fixtures, four evidence fixtures, four freeze fixtures, and Python compilation passed. Cloud runs `29403040639` and `29403295417` succeeded with baseline `legacy-baseline-legacy-account-baseline-v1-2adf9fceb123` and SHA-256 `2adf9fceb123ff4a38433c183add3718b9b56269a61fdf8b0daaa7e1c0a84d3a`; the second returned `idempotent_replay=true`, leaving one run, two accounts, 32 unique fill-surrogate entries, and six positions. All cash/equity, initial-capital/PnL, and final-position differences are CNY 0.00; four service-role mutation probes were rejected; and all 350 frozen source records remained unchanged.
+- Reconciled result: the main account has cash CNY 913,162.06, market value CNY 18,063.00, realized PnL CNY -66,588.41, floating PnL CNY -2,186.53, total PnL CNY -68,774.94, and total assets CNY 931,225.06, compared with the polluted original total assets of CNY 891,037.47. The model account has total assets CNY 999,502.04. Original polluted metrics and the stale latest stored snapshots remain visible in the immutable report.
+- Remaining limitations: the legacy system has filled-order evidence rather than a separate fill table, so the 32 replay events are explicitly labelled `filled_order_surrogate`. Valuation is a dated historical baseline from the frozen M0.2 position read model, not a current market valuation or evidence of strategy profitability. Post-migration advisor findings are limited to intentional RLS-with-no-public-policy notices, expected unused fresh indexes, and a low-volume unindexed classification foreign key; no new security warning was introduced.
 
 Required work:
 
@@ -500,7 +505,7 @@ M0.1 -> M0.2 -> M0.3 -> M0.4
 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9
 ```
 
-The first incomplete item is `M0.4 Rebuild legacy account baseline`.
+The first incomplete item is `M1 Cloud-Only Foundation And Cost Safety`.
 
 # Completion Record Format
 
