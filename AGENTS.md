@@ -169,12 +169,12 @@ Acceptance:
 
 ### M0.2 Capture immutable forensic backup
 
-Status: In Progress
+Status: Completed
 
-Progress note:
-- 2026-07-15: Added deterministic legacy-ledger export, per-table and per-file SHA-256 hashing, live schema capture, current account snapshots, recent GitHub Actions log capture, private content-addressed Supabase Storage upload, append-only online evidence manifests, and a manual cloud capture workflow.
-- Verification so far: four evidence fixtures passed; all eight live tables reconciled before/export/after in a read-only preview; 350 rows, three workflow logs, live schema, migrations, and workflow definitions produced a reproducible archive; the online manifest table has RLS, an append-only trigger, and service-role-only schema export access.
-- Remaining work: commit and deploy the workflow, run the authoritative cloud capture, re-download and verify the archive, prove manifest mutation is rejected, then record completion evidence.
+Completion note:
+- 2026-07-15: Added deterministic legacy-ledger export, per-table and per-file SHA-256 hashing, live schema capture, current account snapshots, recent GitHub Actions log capture, private content-addressed Supabase Storage upload, append-only online evidence manifests, and a controlled cloud capture workflow.
+- Online evidence `legacy-20260715T031710984732Z-2ddcee6336bb` captured 350 rows across all eight frozen tables plus three workflow logs, live schema, migrations, workflow definitions, and current account snapshots. Private archive `sha256/2d/2ddcee6336bb189a24eda7522e49dd8924e56b8c4bf184a78f4636208044e715.zip` is 102,020 bytes and was independently re-downloaded with an identical SHA-256. Cloud run `29386154729` succeeded, its non-sensitive manifest artifact was present, and a service-role mutation probe was rejected by the append-only trigger without changing the record.
+- Immutability boundary: Supabase Storage does not provide object lock or versioning. Tampering is made evident through content-addressed storage, an append-only database manifest, source-commit anchoring, and the separate GitHub Actions manifest artifact.
 
 Required work:
 
@@ -489,7 +489,7 @@ M0.1 -> M0.2 -> M0.3 -> M0.4
 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9
 ```
 
-The first incomplete item is `M0.2 Export and checksum legacy evidence`.
+The first incomplete item is `M0.3 Classify polluted records`.
 
 # Completion Record Format
 
