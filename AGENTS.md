@@ -130,6 +130,7 @@ GitHub Actions cache is a performance cache only and is never an authoritative d
 The legacy platform is not trusted as the V2 accounting or strategy baseline. Preserve these audit facts until M0 is completed:
 
 - Legacy `stock_trade_history` contained approximately CNY 38,014.93 of duplicated phantom losses caused by repeated failed close attempts.
+- The final M0.2 frozen evidence contains one additional post-audit phantom loss of CNY 2,212.96, bringing the reproducible M0.3 polluted-record total to CNY 40,227.89 across 18 records. The earlier CNY 38,014.93 figure remains a dated audit observation rather than the final frozen total.
 - Order-ledger-based realized loss was approximately CNY 66,554.39, with an additional open floating loss of approximately CNY 2,216.25 at the time of audit.
 - Fifteen legitimate filled exits contained five wins and ten losses; approximate profit factor was 0.213.
 - The three largest legitimate losses contributed approximately 89% of legitimate realized loss.
@@ -190,12 +191,12 @@ Acceptance:
 
 ### M0.3 Classify polluted records
 
-Status: In Progress
+Status: Completed
 
-Progress note:
-- 2026-07-15: Implementing deterministic classification from the fixed M0.2 forensic archive, with append-only run and record mappings, atomic cloud publication, source-record hashes, reversible dispositions, and explicit protection against excluding legitimate filled orders.
-- Read-only audit identified 18 orphan trade-history records for `603032` with no matching filled sell order and an unchanged open 900-share position. Their final frozen PnL sum is CNY -40,227.89; 5 are exact repeated fingerprints. Fifteen legitimate trade projections uniquely match filled sell orders, and all 32 filled main/model orders passed structural checks.
-- Remaining work: deploy the migration, run fixtures and the cloud classifier twice, verify all 350 records are mapped identically, prove append-only enforcement, and record final completion evidence.
+Completion note:
+- 2026-07-15: Added deterministic classification from fixed M0.2 evidence, source-record and result hashes, reversible dispositions, append-only run and record tables, an atomic idempotent publication RPC, and a serialized cloud reconciliation workflow. Classified all 350 records as 32 authoritative candidates, 17 legitimate non-fill audit events, 15 legitimate derived trade projections, 18 polluted exclusions, and 268 reference-only read-model rows.
+- Verification: Five deterministic fixtures and related M0 tests passed. Cloud runs `29400568287` and `29400634579` produced classification hash `37134ef5cb32717ec28ace054b9f156fa0c27f3c6c705cd7967b21d475c661ce`; the second run returned `idempotent_replay=true`, leaving one run and 350 mappings. All 18 excluded records have evidence-backed reasons and hashes, service-role mutation probes were rejected, review-required count is zero, and legitimate filled orders excluded is zero.
+- Remaining limitations: M0.3 classifies records but does not yet rebuild cash, positions, or PnL. The reproducible final polluted PnL is CNY -40,227.89; it exceeds the earlier dated audit figure by the final CNY -2,212.96 phantom record written before M0.1 froze the legacy ledger.
 
 Required work:
 
@@ -494,7 +495,7 @@ M0.1 -> M0.2 -> M0.3 -> M0.4
 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9
 ```
 
-The first incomplete item is `M0.3 Classify polluted records`.
+The first incomplete item is `M0.4 Rebuild legacy account baseline`.
 
 # Completion Record Format
 
