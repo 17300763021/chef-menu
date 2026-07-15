@@ -1,0 +1,34 @@
+name: Legacy Forensic Evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test evidence capture
+        run: python scripts/test_capture_legacy_evidence.py
+      - name: Capture and verify online evidence
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/capture_legacy_evidence.py --manifest-out evidence/manifest.json
+      - name: Upload non-sensitive verification manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-evidence-manifest-${{ github.sha }}
+          path: evidence/manifest.json
+          if-no-files-found: error
+          retention-days: 90

@@ -169,7 +169,12 @@ Acceptance:
 
 ### M0.2 Capture immutable forensic backup
 
-Status: Pending
+Status: In Progress
+
+Progress note:
+- 2026-07-15: Added deterministic legacy-ledger export, per-table and per-file SHA-256 hashing, live schema capture, current account snapshots, recent GitHub Actions log capture, private content-addressed Supabase Storage upload, append-only online evidence manifests, and a manual cloud capture workflow.
+- Verification so far: four evidence fixtures passed; all eight live tables reconciled before/export/after in a read-only preview; 350 rows, three workflow logs, live schema, migrations, and workflow definitions produced a reproducible archive; the online manifest table has RLS, an append-only trigger, and service-role-only schema export access.
+- Remaining work: commit and deploy the workflow, run the authoritative cloud capture, re-download and verify the archive, prove manifest mutation is rejected, then record completion evidence.
 
 Required work:
 
