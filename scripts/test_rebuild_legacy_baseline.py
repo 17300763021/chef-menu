@@ -6,7 +6,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from rebuild_legacy_baseline import replay_account
+from rebuild_legacy_baseline import money, replay_account
 
 
 def filled(order_id, side, shares, price, fee, before, after, cash_before="0", cash_after="0", slippage="0"):
@@ -31,6 +31,11 @@ def filled(order_id, side, shares, price, fee, before, after, cash_before="0", c
 
 
 class RebuildLegacyBaselineTest(unittest.TestCase):
+    def test_money_normalizes_negative_zero(self):
+        from decimal import Decimal
+
+        self.assertEqual(money(Decimal("-0.001")), "0.00")
+
     def test_buy_fee_sell_fee_and_partial_position_reconcile(self):
         orders = [
             filled("buy", "buy", 100, 10, 5, 0, 100, slippage="50"),
