@@ -212,7 +212,12 @@ Acceptance:
 
 ### M0.4 Rebuild legacy account baseline
 
-Status: Pending
+Status: In Progress
+
+Progress note:
+- 2026-07-15: Implementing deterministic main/model legacy account replay from the fixed M0.2 archive and M0.3 classification, with acquisition fees capitalized into book cost, sell fees included in realized PnL, slippage disclosed but not deducted twice, frozen read-model prices used for valuation, and atomic append-only publication.
+- Read-only preview: the main account reconciles to cash CNY 913,162.06, market value CNY 18,063.00, realized PnL CNY -66,588.41, floating PnL CNY -2,186.53, total PnL CNY -68,774.94, and total assets CNY 931,225.06. The model account reconciles to total assets CNY 999,502.04. These remain preview figures until cloud publication and acceptance pass.
+- Remaining work: deploy schema and code, pass accounting fixtures, publish two account baselines plus 32 ledger entries and 6 positions twice in the cloud, verify idempotency and zero reconciliation differences, reject mutations, and preserve original polluted comparisons.
 
 Required work:
 

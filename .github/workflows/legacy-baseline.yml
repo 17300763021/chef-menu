@@ -1,0 +1,45 @@
+name: Legacy Account Baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/legacy-baseline.yml
+      - scripts/rebuild_legacy_baseline.py
+      - scripts/test_rebuild_legacy_baseline.py
+      - supabase/migrations/*_add_legacy_account_baselines.sql
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-account-baseline
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test accounting reconstruction
+        run: python scripts/test_rebuild_legacy_baseline.py
+      - name: Rebuild and atomically freeze historical baselines
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: >-
+          python scripts/rebuild_legacy_baseline.py
+          --evidence-id legacy-20260715T031710984732Z-2ddcee6336bb
+          --report-out baseline/report.json
+      - name: Upload non-sensitive baseline comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-account-baseline-${{ github.sha }}
+          path: baseline/report.json
+          if-no-files-found: error
+          retention-days: 90
