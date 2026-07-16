@@ -238,7 +238,12 @@ Acceptance:
 
 ## M1: Cloud-Only Foundation And Cost Safety
 
-Status: Pending
+Status: In Progress
+
+Completion note:
+- 2026-07-16: Implemented the M1 cloud runtime foundation, pinned application and Python dependencies, converted legacy stock schedules to manual diagnostics, pinned GitHub Actions by commit SHA, separated development, shadow, and disabled main-simulation accounts, and deployed service-role-only Supabase runtime, heartbeat, recovery, and hard-quota controls.
+- Verification: Local unit, legacy regression, frontend, production-build, Python compilation, dependency-audit, and SQL parse checks passed. The first online acceptance produced one database run from ten duplicate claims; enforced the 79%, 80%, 90%, and 100% quota decisions; completed a stale-heartbeat recovery; and reset quota state to zero. Supabase RLS, RPC grants, account isolation, and the active ten-minute cron monitor were queried online.
+- Remaining limitations: GitHub-hosted acceptance and RQAlpha/Qlib import evidence, a second online idempotency run, post-migration advisors, cron run history, and final immutable completion evidence remain required before M1 can be marked Completed.
 
 Goal: Run the complete production workflow online without relying on the user's computer or creating uncontrolled costs.
 

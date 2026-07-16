@@ -1,0 +1,12 @@
+akshare==1.18.64
+pandas==3.0.3
+numpy==2.5.1
+openpyxl==3.1.5
+matplotlib==3.11.0
+requests==2.34.2
+backtrader==1.9.78.123
+lightgbm==4.6.0
+catboost==1.2.10
+xgboost==3.3.0
+scikit-learn==1.9.0
+joblib==1.5.3

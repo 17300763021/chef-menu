@@ -1,0 +1,3 @@
+# Target mature frameworks. Installed only by the M1 acceptance smoke test until M3/M6.
+rqalpha==6.2.1
+pyqlib==0.9.7

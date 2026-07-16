@@ -5,10 +5,6 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    - cron: "25 1 * * 1-5"
-    - cron: "55 4 * * 1-5"
-    - cron: "40 7 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
@@ -30,13 +26,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.11"
+          python-version-file: .python-version
           cache: pip
+          cache-dependency-path: scripts/stock_engine/requirements.lock.txt
       - name: Install dependencies
-        run: python -m pip install -r scripts/stock_engine/requirements.txt
+        run: python -m pip install -r scripts/stock_engine/requirements.lock.txt
       - name: Run stock task
         env:
           TZ: Asia/Shanghai
