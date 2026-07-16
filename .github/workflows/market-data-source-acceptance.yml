@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/market-data-source-acceptance.yml
+      - AGENTS.md
       - scripts/market_data/**
       - scripts/test_market_data_contracts.py
       - scripts/test_market_data_quality.py
