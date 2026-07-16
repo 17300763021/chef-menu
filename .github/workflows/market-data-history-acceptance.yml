@@ -1,0 +1,78 @@
+name: M2 Historical Market Data Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "Inclusive acceptance end date; blank uses runner yesterday"
+        required: false
+        type: string
+      mode:
+        description: "sample is fast qualification; full builds the CSI 800 history"
+        required: true
+        default: full
+        type: choice
+        options: [full, sample]
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-history-acceptance.yml
+      - scripts/market_data/**
+      - scripts/test_historical_market_data.py
+      - scripts/test_historical_quality_gates.py
+      - scripts/test_adjustment_engine.py
+      - scripts/test_tradeability.py
+      - .python-version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m2-historical-market-data-acceptance
+  cancel-in-progress: false
+
+jobs:
+  historical-market-data-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned M2 dependencies
+        run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Run deterministic M2.3 and prerequisite tests
+        run: |
+          python -m scripts.test_market_data_contracts
+          python -m scripts.test_market_data_quality
+          python -m scripts.test_market_calendar
+          python -m scripts.test_point_in_time_universe
+          python -m scripts.test_historical_market_data
+          python -m scripts.test_historical_quality_gates
+          python -m scripts.test_adjustment_engine
+          python -m scripts.test_tradeability
+      - name: Select acceptance parameters
+        id: acceptance
+        env:
+          INPUT_END_DATE: ${{ github.event.inputs.end_date }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
+          echo "mode=${INPUT_MODE:-full}" >> "$GITHUB_OUTPUT"
+      - name: Build fail-closed historical market evidence
+        run: >-
+          python -m scripts.market_data.historical_bars
+          --end-date "${{ steps.acceptance.outputs.end_date }}"
+          --mode "${{ steps.acceptance.outputs.mode }}"
+          --output-dir historical-market-acceptance
+      - name: Upload non-authoritative M2.3 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-${{ github.sha }}-${{ steps.acceptance.outputs.end_date }}-${{ steps.acceptance.outputs.mode }}
+          path: historical-market-acceptance/*
+          if-no-files-found: warn
+          retention-days: 30
