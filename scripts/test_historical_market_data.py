@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import verification_symbols
+from scripts.market_data.historical_bars import bounded_symbols, shard_symbols, verification_symbols
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
@@ -31,6 +31,14 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(len(first), 40)
         self.assertEqual(first[0], symbols[0])
         self.assertEqual(first[-1], symbols[-1])
+
+    def test_bounded_and_round_robin_shards_cover_once(self) -> None:
+        symbols = [f"{value:06d}" for value in range(1403)]
+        bounded = bounded_symbols(symbols, 100)
+        self.assertEqual(len(bounded), 100)
+        shards = [shard_symbols(bounded, index, 2) for index in range(2)]
+        self.assertEqual(sorted([item for shard in shards for item in shard]), bounded)
+        self.assertFalse(set(shards[0]) & set(shards[1]))
 
 
 if __name__ == "__main__":

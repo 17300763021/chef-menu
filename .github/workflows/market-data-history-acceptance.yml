@@ -8,11 +8,11 @@ on:
         required: false
         type: string
       mode:
-        description: "sample is fast qualification; full builds the CSI 800 history"
+        description: "preflight uses 100 representative symbols; full requires explicit manual selection"
         required: true
-        default: full
+        default: preflight
         type: choice
-        options: [full, sample]
+        options: [preflight, full, sample]
   push:
     branches: [main]
     paths:
@@ -20,6 +20,7 @@ on:
       - scripts/market_data/**
       - scripts/test_historical_market_data.py
       - scripts/test_historical_quality_gates.py
+      - scripts/test_merge_historical_shards.py
       - scripts/test_adjustment_engine.py
       - scripts/test_tradeability.py
       - .python-version
@@ -28,13 +29,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: m2-historical-market-data-acceptance
+  group: m2-historical-market-data-${{ github.event_name }}-${{ inputs.mode || 'sample' }}
   cancel-in-progress: false
 
 jobs:
-  historical-market-data-acceptance:
+  deterministic-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -52,27 +53,150 @@ jobs:
           python -m scripts.test_point_in_time_universe
           python -m scripts.test_historical_market_data
           python -m scripts.test_historical_quality_gates
+          python -m scripts.test_merge_historical_shards
           python -m scripts.test_adjustment_engine
           python -m scripts.test_tradeability
-      - name: Select acceptance parameters
+
+  sample:
+    if: github.event_name == 'push' || inputs.mode == 'sample'
+    needs: deterministic-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Select sample end date
         id: acceptance
         env:
-          INPUT_END_DATE: ${{ github.event.inputs.end_date }}
-          INPUT_MODE: ${{ github.event.inputs.mode }}
-        run: |
-          echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
-          echo "mode=${INPUT_MODE:-full}" >> "$GITHUB_OUTPUT"
-      - name: Build fail-closed historical market evidence
+          INPUT_END_DATE: ${{ inputs.end_date }}
+        run: echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
+      - name: Build observable sample evidence
         run: >-
-          python -m scripts.market_data.historical_bars
+          python -u -m scripts.market_data.historical_bars
           --end-date "${{ steps.acceptance.outputs.end_date }}"
-          --mode "${{ steps.acceptance.outputs.mode }}"
-          --output-dir historical-market-acceptance
-      - name: Upload non-authoritative M2.3 evidence
+          --mode sample
+          --output-dir historical-market-sample
+      - name: Upload sample evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: m2-history-${{ github.sha }}-${{ steps.acceptance.outputs.end_date }}-${{ steps.acceptance.outputs.mode }}
+          name: m2-history-sample-${{ github.sha }}-${{ steps.acceptance.outputs.end_date }}
+          path: historical-market-sample/*
+          if-no-files-found: warn
+          retention-days: 30
+
+  plan:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'sample'
+    needs: deterministic-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.export.outputs.matrix }}
+      mode: ${{ steps.export.outputs.mode }}
+      end_date: ${{ steps.export.outputs.end_date }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Select acceptance end date
+        id: date
+        env:
+          INPUT_END_DATE: ${{ inputs.end_date }}
+        run: echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
+      - name: Build deterministic shard plan
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ steps.date.outputs.end_date }}"
+          --mode "${{ inputs.mode }}"
+          --plan-output shard-plan.json
+      - name: Export shard matrix
+        id: export
+        env:
+          END_DATE: ${{ steps.date.outputs.end_date }}
+        run: |
+          python - <<'PY'
+          import json, os
+          plan = json.load(open("shard-plan.json", encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("matrix=" + json.dumps(plan["matrix"], separators=(",", ":")) + "\n")
+              stream.write("mode=" + plan["mode"] + "\n")
+              stream.write("end_date=" + os.environ["END_DATE"] + "\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-plan-${{ github.run_id }}
+          path: shard-plan.json
+          retention-days: 30
+
+  shard:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Build observable shard
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ needs.plan.outputs.end_date }}"
+          --mode "${{ needs.plan.outputs.mode }}"
+          --shard-index "${{ matrix.shard_index }}"
+          --shard-count "${{ matrix.shard_count }}"
+          --output-dir "historical-shard-${{ matrix.shard_index }}"
+      - name: Upload completed shard checkpoint
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-shard-${{ github.run_id }}-${{ matrix.shard_index }}
+          path: historical-shard-${{ matrix.shard_index }}/*
+          if-no-files-found: warn
+          retention-days: 30
+
+  merge:
+    needs: [plan, shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Download accepted shard checkpoints
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: m2-history-shard-${{ github.run_id }}-*
+          path: downloaded-shards
+      - name: Merge and reconcile every shard
+        run: >-
+          python -u -m scripts.market_data.merge_historical_shards
+          --input-dir downloaded-shards
+          --output-dir historical-market-acceptance
+      - name: Upload merged non-authoritative evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-merged-${{ github.run_id }}-${{ needs.plan.outputs.mode }}
           path: historical-market-acceptance/*
           if-no-files-found: warn
           retention-days: 30

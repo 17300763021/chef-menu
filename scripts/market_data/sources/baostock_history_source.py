@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import socket
 from datetime import date
 from typing import Any
 
@@ -16,8 +17,10 @@ STATUS_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,trade
 class BaostockHistorySource:
     name = "baostock"
 
-    def __init__(self, attempts: int = 3) -> None:
+    def __init__(self, attempts: int = 3, timeout_seconds: float = 30.0) -> None:
         self.attempts = attempts
+        self.timeout_seconds = timeout_seconds
+        self._previous_socket_timeout: float | None = None
 
     def __enter__(self) -> "BaostockHistorySource":
         try:
@@ -25,6 +28,8 @@ class BaostockHistorySource:
         except ImportError as error:
             raise RuntimeError("baostock is not installed") from error
         self._bs = bs
+        self._previous_socket_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(self.timeout_seconds)
         result = None
         for attempt in range(1, self.attempts + 1):
             result = bs.login()
@@ -32,10 +37,14 @@ class BaostockHistorySource:
                 return self
             if attempt < self.attempts:
                 time.sleep(2 ** (attempt - 1))
+        socket.setdefaulttimeout(self._previous_socket_timeout)
         raise RuntimeError(f"BaoStock login failed: {result.error_code} {result.error_msg}")
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        self._bs.logout()
+        try:
+            self._bs.logout()
+        finally:
+            socket.setdefaulttimeout(self._previous_socket_timeout)
 
     @staticmethod
     def _rows(query: Any, label: str) -> list[dict[str, str]]:

@@ -6,6 +6,7 @@ import argparse
 import gzip
 import json
 import sys
+import time
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -30,6 +31,10 @@ from scripts.market_data.sources.baostock_history_source import BaostockHistoryS
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
+
+
+SHARD_SIZE = 50
+PREFLIGHT_SYMBOLS = 100
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -69,6 +74,25 @@ def verification_symbols(symbols: list[str], mode: str, maximum: int = 40) -> li
     return [symbols[index] for index in sorted(positions)]
 
 
+def bounded_symbols(symbols: list[str], maximum: int | None) -> list[str]:
+    if maximum is None or len(symbols) <= maximum:
+        return symbols
+    if maximum < 2:
+        raise ValueError("symbol limit must be at least 2")
+    positions = {round(index * (len(symbols) - 1) / (maximum - 1)) for index in range(maximum)}
+    return [symbols[index] for index in sorted(positions)]
+
+
+def shard_symbols(symbols: list[str], shard_index: int, shard_count: int) -> list[str]:
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("invalid shard coordinates")
+    return symbols[shard_index::shard_count]
+
+
+def _progress(event: str, **values: Any) -> None:
+    print(json.dumps({"event": event, **values}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
 def listing_age(reference: SecurityReference, session: date, calendar_dates: tuple[date, ...]) -> int:
     return max(0, bisect_right(calendar_dates, session) - bisect_right(calendar_dates, reference.ipo_date - timedelta(days=1)))
 
@@ -79,10 +103,20 @@ def _row_for_tradeability(bar: DailyBar | None) -> dict[str, object] | None:
     return {"high": bar.high, "low": bar.low, "close": bar.close}
 
 
-def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference]]:
-    start = HISTORY_START if mode == "full" else max(HISTORY_START, end - timedelta(days=150))
+def run(
+    end: date,
+    *,
+    mode: str = "sample",
+    workers: int = 4,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    symbol_attempts: int = 2,
+) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference]]:
+    start = HISTORY_START if mode in {"preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
+    _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
     primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
     secondary_calendar = BaostockCalendarSource().fetch(HISTORY_START, end)
+    _progress("calendars_loaded", primary_sessions=len(primary_calendar.open_dates), secondary_sessions=len(secondary_calendar.open_dates))
     calendar_gates = evaluate_calendars(primary_calendar, secondary_calendar)
     csi = CsiIndexSource()
     current = csi.fetch_current()
@@ -90,6 +124,7 @@ def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str,
         raise ValueError(f"requested end {end} precedes CSI snapshot {current.as_of_date}")
     events, discovered = csi.fetch_events(primary_calendar, current.as_of_date)
     snapshots = reconstruct(current, events)
+    _progress("universe_reconstructed", effective_snapshots=len(snapshots), official_events=len(events), as_of_date=current.as_of_date.isoformat())
     universe_gates = evaluate_universe(events, snapshots, discovered, current.as_of_date)
     if not accepted([*calendar_gates, *universe_gates]):
         raise RuntimeError("M2.2 prerequisite gates failed")
@@ -97,13 +132,27 @@ def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str,
     expected = membership_keys(sessions, snapshots)
     if mode == "sample":
         expected = {key: value for key, value in expected.items() if key[0] in SAMPLE_SYMBOLS}
-    symbols = sorted({symbol for symbol, _ in expected})
+    all_symbols = sorted({symbol for symbol, _ in expected})
+    selected_symbols = bounded_symbols(all_symbols, PREFLIGHT_SYMBOLS if mode == "preflight" else None)
+    selected_set = set(selected_symbols)
+    expected = {key: value for key, value in expected.items() if key[0] in selected_set}
+    global_expected_key_count = len(expected)
+    global_verification_targets = verification_symbols(selected_symbols, "sample" if mode == "sample" else "full")
+    symbols = shard_symbols(selected_symbols, shard_index, shard_count)
+    symbol_set = set(symbols)
+    expected = {key: value for key, value in expected.items() if key[0] in symbol_set}
+    _progress(
+        "scope_ready", mode=mode, shard_index=shard_index, shard_count=shard_count,
+        shard_symbols=len(symbols), global_symbols=len(selected_symbols), expected_keys=len(expected),
+    )
     ranges = {
         symbol: (min(day for code, day in expected if code == symbol), max(day for code, day in expected if code == symbol))
         for symbol in symbols
     }
-    verification_targets = verification_symbols(symbols, mode)
+    verification_targets = [symbol for symbol in global_verification_targets if symbol in symbol_set]
+    _progress("verification_started", symbols=len(verification_targets))
     verification_by_symbol, verification_failures = fetch_primary(verification_targets, ranges, 1)
+    _progress("verification_completed", succeeded=len(verification_by_symbol), failed=len(verification_failures))
 
     secondary_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
     raw_by_symbol: dict[str, dict[date, DailyBar]] = {}
@@ -112,17 +161,39 @@ def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str,
     references: list[SecurityReference] = []
     adjustments: list[AdjustmentEvent] = []
     secondary_failures: dict[str, str] = {}
-    with BaostockHistorySource() as source:
-        for symbol in symbols:
-            try:
-                secondary_by_symbol[symbol] = source.fetch_status(symbol, *ranges[symbol])
-                raw_by_symbol[symbol] = source.bars_from_status(symbol, secondary_by_symbol[symbol])
-                qfq_by_symbol[symbol] = source.fetch_bars(symbol, *ranges[symbol], "2")
-                hfq_by_symbol[symbol] = source.fetch_bars(symbol, *ranges[symbol], "1")
-                references.append(source.fetch_reference(symbol))
-                adjustments.extend(source.fetch_adjustments(symbol, end))
-            except Exception as error:
-                secondary_failures[symbol] = f"{type(error).__name__}: {error}"
+    started_at = time.monotonic()
+    with BaostockHistorySource(timeout_seconds=30) as source:
+        for position, symbol in enumerate(symbols, start=1):
+            last_error: Exception | None = None
+            for attempt in range(1, symbol_attempts + 1):
+                try:
+                    status = source.fetch_status(symbol, *ranges[symbol])
+                    raw = source.bars_from_status(symbol, status)
+                    qfq = source.fetch_bars(symbol, *ranges[symbol], "2")
+                    hfq = source.fetch_bars(symbol, *ranges[symbol], "1")
+                    reference = source.fetch_reference(symbol)
+                    events_for_symbol = source.fetch_adjustments(symbol, end)
+                    secondary_by_symbol[symbol] = status
+                    raw_by_symbol[symbol] = raw
+                    qfq_by_symbol[symbol] = qfq
+                    hfq_by_symbol[symbol] = hfq
+                    references.append(reference)
+                    adjustments.extend(events_for_symbol)
+                    last_error = None
+                    break
+                except Exception as error:
+                    last_error = error
+                    _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"{type(error).__name__}: {error}")
+                    if attempt < symbol_attempts:
+                        time.sleep(2 ** (attempt - 1))
+            if last_error is not None:
+                secondary_failures[symbol] = f"{type(last_error).__name__}: {last_error}"
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            _progress(
+                "symbol_completed", symbol=symbol, completed=position, total=len(symbols),
+                succeeded=position - len(secondary_failures), failed=len(secondary_failures),
+                elapsed_seconds=round(elapsed, 1), estimated_remaining_seconds=round(elapsed / position * (len(symbols) - position), 1),
+            )
 
     primary_map = {(symbol, day): row for symbol, rows in raw_by_symbol.items() for day, row in rows.items() if (symbol, day) in expected}
     verification_map = {row.key: row for rows in verification_by_symbol.values() for row in rows if row.key in expected}
@@ -182,6 +253,8 @@ def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str,
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
         "business_end": current.as_of_date.isoformat(), "symbol_count": len(symbols),
+        "global_symbol_count": len(selected_symbols), "global_expected_key_count": global_expected_key_count,
+        "shard_index": shard_index, "shard_count": shard_count,
         "verification_symbol_count": len(verification_targets),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
         "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina",
@@ -193,6 +266,27 @@ def run(end: date, *, mode: str = "sample", workers: int = 4) -> tuple[dict[str,
         "gates": [gate.canonical() for gate in gates],
     }
     return manifest, bars, facts, adjustments, references
+
+
+def build_plan(end: date, mode: str) -> dict[str, Any]:
+    if mode == "sample":
+        shard_count = 1
+        symbol_limit = len(SAMPLE_SYMBOLS)
+    else:
+        primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
+        csi = CsiIndexSource()
+        current = csi.fetch_current()
+        events, _ = csi.fetch_events(primary_calendar, current.as_of_date)
+        snapshots = reconstruct(current, events)
+        sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
+        symbols = sorted({symbol for symbol, _ in membership_keys(sessions, snapshots)})
+        symbol_limit = min(len(symbols), PREFLIGHT_SYMBOLS) if mode == "preflight" else len(symbols)
+        shard_count = (symbol_limit + SHARD_SIZE - 1) // SHARD_SIZE
+    return {
+        "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
+        "shard_size": SHARD_SIZE, "shard_count": shard_count,
+        "matrix": {"include": [{"shard_index": index, "shard_count": shard_count} for index in range(shard_count)]},
+    }
 
 
 def _write_gzip(path: Path, value: Any) -> None:
@@ -214,11 +308,23 @@ def write_outputs(output_dir: Path, manifest: dict[str, Any], bars: list[Histori
 def main() -> int:
     parser = argparse.ArgumentParser(description="M2.3 historical market-data acceptance")
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today() - timedelta(days=1))
-    parser.add_argument("--mode", choices=("sample", "full"), default="sample")
+    parser.add_argument("--mode", choices=("sample", "preflight", "full"), default="sample")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--plan-output", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
     args = parser.parse_args()
-    result = run(args.end_date, mode=args.mode, workers=args.workers)
+    if args.plan_output:
+        plan = build_plan(args.end_date, args.mode)
+        args.plan_output.parent.mkdir(parents=True, exist_ok=True)
+        args.plan_output.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True), flush=True)
+        return 0
+    result = run(
+        args.end_date, mode=args.mode, workers=args.workers,
+        shard_index=args.shard_index, shard_count=args.shard_count,
+    )
     manifest = result[0]
     write_outputs(args.output_dir, *result)
     print(json.dumps({key: manifest[key] for key in ("accepted", "mode", "business_end", "symbol_count", "expected_key_count", "bar_count", "tradeability_count", "adjustment_event_count", "bars_sha256", "tradeability_sha256", "adjustments_sha256", "gates")}, ensure_ascii=False, indent=2, sort_keys=True))
