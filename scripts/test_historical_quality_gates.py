@@ -46,6 +46,23 @@ class HistoricalQualityGateTests(unittest.TestCase):
         self.assertTrue(by_name["historical_cross_source_close"].passed)
         self.assertTrue(by_name["corporate_action_adjustment_spot_check"].passed)
 
+    def test_unchanged_factor_metadata_is_not_a_corporate_action(self) -> None:
+        days = (date(2026, 6, 11), date(2026, 6, 12), date(2026, 6, 13))
+        rows = [bar(days[0], "100", "100"), bar(days[1], "95", "100"), bar(days[2], "101", "101")]
+        gates = evaluate_historical(
+            expected_keys={("600519", day) for day in days}, calendar_dates=set(days),
+            bars=rows, facts=[fact(day) for day in days],
+            adjustments=[
+                AdjustmentEvent.build("600519", days[1], "0.95", "1.05"),
+                AdjustmentEvent.build("600519", days[2], "0.95", "1.05"),
+            ],
+            close_checks=[("600519", day, Decimal("100"), Decimal("100")) for day in days],
+            verification_expected=3,
+        )
+        gate = next(value for value in gates if value.name == "corporate_action_adjustment_spot_check")
+        self.assertTrue(gate.passed)
+        self.assertEqual(gate.actual, "1/1 (100.00%)")
+
 
 if __name__ == "__main__":
     unittest.main()

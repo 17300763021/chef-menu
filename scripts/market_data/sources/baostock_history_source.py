@@ -5,13 +5,15 @@ from __future__ import annotations
 import time
 import socket
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
-from scripts.market_data.contracts import DailyBar, baostock_symbol, normalize_baostock_row, normalize_symbol, parse_date
+from scripts.market_data.contracts import PRICE_QUANTUM, DailyBar, baostock_symbol, decimal_value, normalize_baostock_row, normalize_symbol, parse_date
 from scripts.market_data.historical_contracts import AdjustmentEvent, SecurityReference
 
 
 STATUS_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,isST"
+AdjustedOHLC = tuple[Decimal, Decimal, Decimal, Decimal]
 
 
 class BaostockHistorySource:
@@ -68,22 +70,32 @@ class BaostockHistorySource:
         code = normalize_symbol(symbol)
         return {
             business_date: normalize_baostock_row(row, code)
-            for business_date, row in rows.items() if str(row.get("open", "")).strip()
+            for business_date, row in rows.items()
+            if str(row.get("tradestatus", "")).strip() == "1" and str(row.get("open", "")).strip()
         }
 
-    def fetch_bars(self, symbol: str, start: date, end: date, adjustflag: str) -> dict[date, DailyBar]:
-        if adjustflag not in {"1", "2", "3"}:
-            raise ValueError("BaoStock adjustflag must be 1, 2, or 3")
+    @staticmethod
+    def adjusted_prices_from_rows(rows: list[dict[str, str]]) -> dict[date, AdjustedOHLC]:
+        output: dict[date, AdjustedOHLC] = {}
+        for row in rows:
+            if not str(row.get("open", "")).strip():
+                continue
+            prices = tuple(decimal_value(row.get(field), field, PRICE_QUANTUM) for field in ("open", "high", "low", "close"))
+            if any(value is None for value in prices):
+                raise ValueError(f"missing adjusted OHLC for {row.get('date')}")
+            output[parse_date(row["date"])] = prices  # type: ignore[assignment]
+        return output
+
+    def fetch_adjusted_prices(self, symbol: str, start: date, end: date, adjustflag: str) -> dict[date, AdjustedOHLC]:
+        if adjustflag not in {"1", "2"}:
+            raise ValueError("adjusted BaoStock prices require adjustflag 1 or 2")
         code = normalize_symbol(symbol)
         query = self._bs.query_history_k_data_plus(
             baostock_symbol(code), STATUS_FIELDS, start_date=start.isoformat(), end_date=end.isoformat(),
             frequency="d", adjustflag=adjustflag,
         )
-        rows = self._rows(query, f"bars {code} adjustflag={adjustflag}")
-        return {
-            parse_date(row["date"]): normalize_baostock_row(row, code)
-            for row in rows if str(row.get("open", "")).strip()
-        }
+        rows = self._rows(query, f"adjusted prices {code} adjustflag={adjustflag}")
+        return self.adjusted_prices_from_rows(rows)
 
     def fetch_reference(self, symbol: str) -> SecurityReference:
         code = normalize_symbol(symbol)

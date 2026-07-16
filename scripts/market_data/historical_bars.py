@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import signal
 import sys
 import time
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import date, timedelta
 from decimal import Decimal
 from importlib.metadata import version
@@ -33,8 +35,9 @@ from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 
 
-SHARD_SIZE = 50
+SHARD_SIZE = 10
 PREFLIGHT_SYMBOLS = 100
+SYMBOL_DEADLINE_SECONDS = 90
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -52,7 +55,7 @@ def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, 
 
 
 def fetch_primary(symbols: list[str], ranges: dict[str, tuple[date, date]], workers: int) -> tuple[dict[str, list[DailyBar]], dict[str, str]]:
-    source = AkshareHistorySource()
+    source = AkshareHistorySource(attempts=5)
     output: dict[str, list[DailyBar]] = {}
     failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -91,6 +94,26 @@ def shard_symbols(symbols: list[str], shard_index: int, shard_count: int) -> lis
 
 def _progress(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, **values}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+@contextmanager
+def symbol_deadline(seconds: int):
+    """Enforce a real per-symbol deadline on the Linux cloud runner."""
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(signum: int, frame: object) -> None:
+        raise TimeoutError(f"symbol acquisition exceeded {seconds} seconds")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def listing_age(reference: SecurityReference, session: date, calendar_dates: tuple[date, ...]) -> int:
@@ -150,14 +173,18 @@ def run(
         for symbol in symbols
     }
     verification_targets = [symbol for symbol in global_verification_targets if symbol in symbol_set]
+    verification_delay = 0 if mode == "sample" else (shard_index % 4) * 5
+    if verification_delay:
+        _progress("verification_stagger", delay_seconds=verification_delay)
+        time.sleep(verification_delay)
     _progress("verification_started", symbols=len(verification_targets))
     verification_by_symbol, verification_failures = fetch_primary(verification_targets, ranges, 1)
     _progress("verification_completed", succeeded=len(verification_by_symbol), failed=len(verification_failures))
 
     secondary_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
     raw_by_symbol: dict[str, dict[date, DailyBar]] = {}
-    qfq_by_symbol: dict[str, dict[date, DailyBar]] = {}
-    hfq_by_symbol: dict[str, dict[date, DailyBar]] = {}
+    qfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
+    hfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
     references: list[SecurityReference] = []
     adjustments: list[AdjustmentEvent] = []
     secondary_failures: dict[str, str] = {}
@@ -167,12 +194,13 @@ def run(
             last_error: Exception | None = None
             for attempt in range(1, symbol_attempts + 1):
                 try:
-                    status = source.fetch_status(symbol, *ranges[symbol])
-                    raw = source.bars_from_status(symbol, status)
-                    qfq = source.fetch_bars(symbol, *ranges[symbol], "2")
-                    hfq = source.fetch_bars(symbol, *ranges[symbol], "1")
-                    reference = source.fetch_reference(symbol)
-                    events_for_symbol = source.fetch_adjustments(symbol, end)
+                    with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
+                        status = source.fetch_status(symbol, *ranges[symbol])
+                        raw = source.bars_from_status(symbol, status)
+                        qfq = source.fetch_adjusted_prices(symbol, *ranges[symbol], "2")
+                        hfq = source.fetch_adjusted_prices(symbol, *ranges[symbol], "1")
+                        reference = source.fetch_reference(symbol)
+                        events_for_symbol = source.fetch_adjustments(symbol, end)
                     secondary_by_symbol[symbol] = status
                     raw_by_symbol[symbol] = raw
                     qfq_by_symbol[symbol] = qfq
@@ -229,8 +257,7 @@ def run(
             open_price=raw.open, high=raw.high, low=raw.low, close=raw.close, previous_close=previous_close,
             volume_shares=raw.volume_shares, amount_cny=raw.amount_cny, turnover_percent=raw.turnover_percent,
             qfq_factor=qfq_factor, hfq_factor=hfq_factor,
-            qfq_prices=(qfq.open, qfq.high, qfq.low, qfq.close),
-            hfq_prices=(hfq.open, hfq.high, hfq.low, hfq.close), primary_source="baostock",
+            qfq_prices=qfq, hfq_prices=hfq, primary_source="baostock",
         ))
         verification = verification_map.get((symbol, business_date))
         if verification:

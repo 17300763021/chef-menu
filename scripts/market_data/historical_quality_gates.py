@@ -89,7 +89,15 @@ def evaluate_historical(
     eligible_events = 0
     aligned_events = 0
     unaligned_events: list[str] = []
-    for event in adjustment_rows:
+    factor_change_events: list[AdjustmentEvent] = []
+    previous_factors: dict[str, tuple[Decimal, Decimal]] = {}
+    for event in sorted(adjustment_rows, key=lambda value: (value.symbol, value.effective_date)):
+        factors = (event.qfq_factor, event.hfq_factor)
+        previous = previous_factors.get(event.symbol)
+        if previous is None or factors != previous:
+            factor_change_events.append(event)
+        previous_factors[event.symbol] = factors
+    for event in factor_change_events:
         rows = bars_by_symbol.get(event.symbol, [])
         if len(rows) < 2 or not (rows[0].business_date < event.effective_date <= rows[-1].business_date):
             continue
@@ -110,7 +118,7 @@ def evaluate_historical(
         "corporate_action_adjustment_spot_check",
         eligible_events > 0 and event_alignment_bps >= 9500,
         f"{aligned_events}/{eligible_events} ({event_alignment_bps / 100:.2f}%)",
-        ">= 95.00% eligible action dates show adjusted/raw discontinuity correction",
+        ">= 95.00% factor-change action dates show adjusted/raw discontinuity correction",
         details=tuple(unaligned_events[:20]),
     ))
 

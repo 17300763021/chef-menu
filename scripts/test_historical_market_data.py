@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
 from scripts.market_data.historical_bars import bounded_symbols, shard_symbols, verification_symbols
+from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
@@ -39,6 +40,22 @@ class HistoricalMarketDataTests(unittest.TestCase):
         shards = [shard_symbols(bounded, index, 2) for index in range(2)]
         self.assertEqual(sorted([item for shard in shards for item in shard]), bounded)
         self.assertFalse(set(shards[0]) & set(shards[1]))
+
+    def test_adjusted_prices_do_not_require_volume_or_amount(self) -> None:
+        rows = [{
+            "date": "2026-07-15", "open": "10", "high": "11", "low": "9", "close": "10.5",
+            "volume": "", "amount": "",
+        }]
+        prices = BaostockHistorySource.adjusted_prices_from_rows(rows)
+        self.assertEqual(prices[date(2026, 7, 15)][3], Decimal("10.5000"))
+
+    def test_suspended_status_row_is_not_a_trading_bar(self) -> None:
+        rows = {date(2026, 7, 15): {
+            "date": "2026-07-15", "code": "sh.600519",
+            "open": "10", "high": "10", "low": "10", "close": "10", "preclose": "10",
+            "volume": "", "amount": "", "turn": "", "tradestatus": "0", "isST": "0",
+        }}
+        self.assertEqual(BaostockHistorySource.bars_from_status("600519", rows), {})
 
 
 if __name__ == "__main__":
