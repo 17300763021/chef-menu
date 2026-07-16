@@ -1,0 +1,60 @@
+name: M2 Market Data Source Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "Inclusive sample end date (YYYY-MM-DD); blank uses runner date"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-source-acceptance.yml
+      - scripts/market_data/**
+      - scripts/test_market_data_contracts.py
+      - scripts/test_market_data_quality.py
+      - .python-version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m2-market-data-source-acceptance
+  cancel-in-progress: false
+
+jobs:
+  source-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned M2.1 source dependencies
+        run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Run deterministic M2.1 tests
+        run: |
+          python -m scripts.test_market_data_contracts
+          python -m scripts.test_market_data_quality
+      - name: Select sample end date
+        id: sample
+        env:
+          INPUT_END_DATE: ${{ github.event.inputs.end_date }}
+        run: echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
+      - name: Run live 20-symbol source qualification
+        run: >-
+          python -m scripts.market_data.sample_capture
+          --end-date "${{ steps.sample.outputs.end_date }}"
+          --output-dir source-acceptance
+      - name: Upload non-authoritative source evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-source-acceptance-${{ github.sha }}-${{ steps.sample.outputs.end_date }}
+          path: source-acceptance/*
+          if-no-files-found: warn
+          retention-days: 30

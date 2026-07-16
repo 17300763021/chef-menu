@@ -266,7 +266,12 @@ Acceptance:
 
 ## M2: Point-In-Time A-Share Data Foundation
 
-Status: Pending
+Status: In Progress
+
+Completion note:
+- 2026-07-16: Implemented the bounded M2.1 source-admission slice only: strict unadjusted daily-bar contracts, AKShare/Eastmoney primary and BaoStock secondary adapters, a fixed 20-symbol by 60-trading-day sample, fail-closed quality gates, deterministic non-authoritative manifests, and a manual-or-code-change cloud acceptance workflow with no Supabase or account credentials.
+- Verification: Nine deterministic M2.1 tests and related M0/M1 regression checks passed. Two independent local live captures for business date 2026-07-15 each produced 1,200 rows per source, no source failures, 100% primary coverage, zero duplicate or OHLC errors, 100% cross-source close/volume-unit/amount consistency, and identical dataset SHA-256 `735a02ec7a4ef483f1d634d3c8796e2002e18b80f9fa648304ab4df0ba35308f`.
+- Remaining limitations: M2.1 still requires GitHub-hosted live acceptance and repeated artifact verification before source admission is accepted. The evidence is explicitly non-authoritative and cannot create simulated orders. Historical point-in-time universes, corporate actions, fundamentals, storage publication, daily scheduling, and Qlib/RQAlpha adapters remain pending M2 work and must not start without separate confirmation.
 
 Goal: Provide synchronized, auditable, point-in-time data suitable for A-share research and simulation.
 
