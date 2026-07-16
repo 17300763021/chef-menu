@@ -165,6 +165,7 @@ create or replace function private.cloud_effective_quota_percent(p_row public.cl
 returns numeric
 language sql
 immutable
+set search_path = pg_catalog
 as $$
   select greatest(
     p_row.reported_percent,
