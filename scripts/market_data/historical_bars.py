@@ -36,6 +36,7 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 
 
 SHARD_SIZE = 10
+SMOKE_SYMBOLS = 20
 PREFLIGHT_SYMBOLS = 100
 SYMBOL_DEADLINE_SECONDS = 90
 
@@ -134,8 +135,8 @@ def run(
     shard_index: int = 0,
     shard_count: int = 1,
     symbol_attempts: int = 2,
-) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference]]:
-    start = HISTORY_START if mode in {"preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
+) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
+    start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
     primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
     secondary_calendar = BaostockCalendarSource().fetch(HISTORY_START, end)
@@ -156,7 +157,8 @@ def run(
     if mode == "sample":
         expected = {key: value for key, value in expected.items() if key[0] in SAMPLE_SYMBOLS}
     all_symbols = sorted({symbol for symbol, _ in expected})
-    selected_symbols = bounded_symbols(all_symbols, PREFLIGHT_SYMBOLS if mode == "preflight" else None)
+    symbol_limit = SMOKE_SYMBOLS if mode == "smoke" else PREFLIGHT_SYMBOLS if mode == "preflight" else None
+    selected_symbols = bounded_symbols(all_symbols, symbol_limit)
     selected_set = set(selected_symbols)
     expected = {key: value for key, value in expected.items() if key[0] in selected_set}
     global_expected_key_count = len(expected)
@@ -271,28 +273,42 @@ def run(
     historical_gates = evaluate_historical(
         expected_keys=set(expected), calendar_dates=set(sessions), bars=bars, facts=facts,
         adjustments=adjustments, close_checks=close_checks, verification_expected=verification_expected,
+        cross_source_critical=shard_count == 1,
     )
     gates = [*calendar_gates, *universe_gates, *historical_gates]
     canonical_bars = [row.canonical() for row in sorted(bars, key=lambda value: value.key)]
     canonical_facts = [row.canonical() for row in sorted(facts, key=lambda value: (value.symbol, value.business_date))]
     canonical_adjustments = [row.canonical() for row in sorted(adjustments, key=lambda value: (value.symbol, value.effective_date))]
+    canonical_close_checks = [
+        {
+            "symbol": symbol, "business_date": business_date.isoformat(),
+            "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
+        }
+        for symbol, business_date, primary, verification in sorted(close_checks)
+    ]
     manifest = {
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
         "business_end": current.as_of_date.isoformat(), "symbol_count": len(symbols),
         "global_symbol_count": len(selected_symbols), "global_expected_key_count": global_expected_key_count,
         "shard_index": shard_index, "shard_count": shard_count,
+        "global_verification_symbol_count": len(global_verification_targets),
+        "global_verification_symbols_sha256": sha256(global_verification_targets),
         "verification_symbol_count": len(verification_targets),
+        "verification_symbols": verification_targets,
+        "verification_expected_count": verification_expected,
+        "verification_check_count": len(close_checks),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
         "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina",
         "verification_failures": dict(sorted(verification_failures.items())),
         "primary_failures": dict(sorted(secondary_failures.items())),
         "source_versions": {"akshare": version("akshare"), "baostock": version("baostock")},
         "bars_sha256": sha256(canonical_bars), "tradeability_sha256": sha256(canonical_facts),
-        "adjustments_sha256": sha256(canonical_adjustments), "accepted": accepted(gates),
+        "adjustments_sha256": sha256(canonical_adjustments),
+        "verification_checks_sha256": sha256(canonical_close_checks), "accepted": accepted(gates),
         "gates": [gate.canonical() for gate in gates],
     }
-    return manifest, bars, facts, adjustments, references
+    return manifest, bars, facts, adjustments, references, close_checks
 
 
 def build_plan(end: date, mode: str) -> dict[str, Any]:
@@ -307,7 +323,8 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         snapshots = reconstruct(current, events)
         sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
         symbols = sorted({symbol for symbol, _ in membership_keys(sessions, snapshots)})
-        symbol_limit = min(len(symbols), PREFLIGHT_SYMBOLS) if mode == "preflight" else len(symbols)
+        requested_limit = SMOKE_SYMBOLS if mode == "smoke" else PREFLIGHT_SYMBOLS if mode == "preflight" else len(symbols)
+        symbol_limit = min(len(symbols), requested_limit)
         shard_count = (symbol_limit + SHARD_SIZE - 1) // SHARD_SIZE
     return {
         "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
@@ -323,11 +340,28 @@ def _write_gzip(path: Path, value: Any) -> None:
             stream.write(payload)
 
 
-def write_outputs(output_dir: Path, manifest: dict[str, Any], bars: list[HistoricalBar], facts: list[TradeabilityFact], adjustments: list[AdjustmentEvent], references: list[SecurityReference]) -> None:
+def write_outputs(
+    output_dir: Path,
+    manifest: dict[str, Any],
+    bars: list[HistoricalBar],
+    facts: list[TradeabilityFact],
+    adjustments: list[AdjustmentEvent],
+    references: list[SecurityReference],
+    close_checks: list[tuple[str, date, Decimal, Decimal]],
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_gzip(output_dir / "historical-bars.json.gz", [row.canonical() for row in sorted(bars, key=lambda value: value.key)])
     _write_gzip(output_dir / "tradeability.json.gz", [row.canonical() for row in sorted(facts, key=lambda value: (value.symbol, value.business_date))])
     _write_gzip(output_dir / "adjustment-events.json.gz", [row.canonical() for row in sorted(adjustments, key=lambda value: (value.symbol, value.effective_date))])
+    _write_gzip(output_dir / "verification-checks.json.gz", [
+        {
+            "symbol": symbol,
+            "business_date": business_date.isoformat(),
+            "primary_close": format(primary, "f"),
+            "verification_close": format(verification, "f"),
+        }
+        for symbol, business_date, primary, verification in sorted(close_checks)
+    ])
     (output_dir / "security-references.json").write_text(json.dumps([row.canonical() for row in sorted(references, key=lambda value: value.symbol)], ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -335,7 +369,7 @@ def write_outputs(output_dir: Path, manifest: dict[str, Any], bars: list[Histori
 def main() -> int:
     parser = argparse.ArgumentParser(description="M2.3 historical market-data acceptance")
     parser.add_argument("--end-date", type=date.fromisoformat, default=date.today() - timedelta(days=1))
-    parser.add_argument("--mode", choices=("sample", "preflight", "full"), default="sample")
+    parser.add_argument("--mode", choices=("sample", "smoke", "preflight", "full"), default="sample")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)

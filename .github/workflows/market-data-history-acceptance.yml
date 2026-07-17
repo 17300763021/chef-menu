@@ -8,11 +8,11 @@ on:
         required: false
         type: string
       mode:
-        description: "preflight uses 100 representative symbols; full requires explicit manual selection"
+        description: "smoke uses 20 symbols/2 shards; preflight uses 100; full is the formal universe acceptance"
         required: true
         default: preflight
         type: choice
-        options: [preflight, full, sample]
+        options: [smoke, preflight, full, sample]
   push:
     branches: [main]
     paths:
@@ -171,6 +171,7 @@ jobs:
           retention-days: 30
 
   merge:
+    if: always() && needs.plan.result == 'success'
     needs: [plan, shard]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -187,7 +188,7 @@ jobs:
         with:
           pattern: m2-history-shard-${{ github.run_id }}-*
           path: downloaded-shards
-      - name: Merge and reconcile every shard
+      - name: Merge available checkpoints and enforce global gates
         run: >-
           python -u -m scripts.market_data.merge_historical_shards
           --input-dir downloaded-shards

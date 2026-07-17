@@ -12,6 +12,40 @@ from scripts.market_data.quality_gates import GateResult
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 
 
+def evaluate_cross_source(
+    close_checks: Iterable[tuple[str, date, Decimal, Decimal]],
+    verification_expected: int,
+    *,
+    critical: bool = True,
+) -> list[GateResult]:
+    """Evaluate a preregistered cross-vendor sample at shard or merged scope."""
+    close_rows = list(close_checks)
+    close_mismatches = []
+    for symbol, business_date, primary, secondary in close_rows:
+        tolerance = max(Decimal("0.01"), abs(primary) * Decimal("0.0005"))
+        if abs(primary - secondary) > tolerance:
+            close_mismatches.append(f"{symbol}:{business_date}:{primary}:{secondary}")
+    close_bps = (len(close_rows) - len(close_mismatches)) * 10000 // max(1, len(close_rows))
+    verification_coverage_bps = len(close_rows) * 10000 // max(1, verification_expected)
+    return [
+        GateResult(
+            "historical_cross_source_coverage",
+            verification_expected > 0 and verification_coverage_bps >= 9500,
+            f"{len(close_rows)}/{verification_expected} ({verification_coverage_bps / 100:.2f}%)",
+            ">= 95.00%",
+            critical=critical,
+        ),
+        GateResult(
+            "historical_cross_source_close",
+            bool(close_rows) and close_bps >= 9950,
+            f"{close_bps / 100:.2f}%",
+            ">= 99.50%",
+            critical=critical,
+            details=tuple(close_mismatches[:20]),
+        ),
+    ]
+
+
 def evaluate_historical(
     *,
     expected_keys: set[tuple[str, date]],
@@ -21,6 +55,7 @@ def evaluate_historical(
     adjustments: Iterable[AdjustmentEvent],
     close_checks: Iterable[tuple[str, date, Decimal, Decimal]],
     verification_expected: int,
+    cross_source_critical: bool = True,
 ) -> list[GateResult]:
     bar_rows = list(bars)
     fact_rows = list(facts)
@@ -52,20 +87,11 @@ def evaluate_historical(
     fact_coverage_bps = len(set(fact_map) & expected_keys) * 10000 // max(1, len(expected_keys))
     results.append(GateResult("tradeability_fact_coverage", fact_coverage_bps == 10000, f"{fact_coverage_bps / 100:.2f}%", "= 100.00%"))
 
-    close_mismatches = []
-    for symbol, business_date, primary, secondary in close_rows:
-        tolerance = max(Decimal("0.01"), abs(primary) * Decimal("0.0005"))
-        if abs(primary - secondary) > tolerance:
-            close_mismatches.append(f"{symbol}:{business_date}:{primary}:{secondary}")
-    close_bps = (len(close_rows) - len(close_mismatches)) * 10000 // max(1, len(close_rows))
-    verification_coverage_bps = len(close_rows) * 10000 // max(1, verification_expected)
-    results.append(GateResult(
-        "historical_cross_source_coverage",
-        verification_expected > 0 and verification_coverage_bps >= 9500,
-        f"{len(close_rows)}/{verification_expected} ({verification_coverage_bps / 100:.2f}%)",
-        ">= 95.00%",
+    results.extend(evaluate_cross_source(
+        close_rows,
+        verification_expected,
+        critical=cross_source_critical,
     ))
-    results.append(GateResult("historical_cross_source_close", bool(close_rows) and close_bps >= 9950, f"{close_bps / 100:.2f}%", ">= 99.50%", details=tuple(close_mismatches[:20])))
 
     invalid_adjusted = [
         f"{row.symbol}:{row.business_date}"

@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
 from scripts.market_data.historical_quality_gates import evaluate_historical
+from scripts.market_data.quality_gates import accepted
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 
 
@@ -62,6 +63,20 @@ class HistoricalQualityGateTests(unittest.TestCase):
         gate = next(value for value in gates if value.name == "corporate_action_adjustment_spot_check")
         self.assertTrue(gate.passed)
         self.assertEqual(gate.actual, "1/1 (100.00%)")
+
+    def test_shard_defers_empty_cross_source_sample_to_merge(self) -> None:
+        days = (date(2026, 6, 11), date(2026, 6, 12))
+        rows = [bar(days[0], "100", "100"), bar(days[1], "95", "100")]
+        gates = evaluate_historical(
+            expected_keys={("600519", day) for day in days}, calendar_dates=set(days),
+            bars=rows, facts=[fact(day) for day in days],
+            adjustments=[AdjustmentEvent.build("600519", days[1], "0.95", "1.05")],
+            close_checks=[], verification_expected=0, cross_source_critical=False,
+        )
+        by_name = {gate.name: gate for gate in gates}
+        self.assertFalse(by_name["historical_cross_source_coverage"].passed)
+        self.assertFalse(by_name["historical_cross_source_coverage"].critical)
+        self.assertTrue(accepted(gates))
 
 
 if __name__ == "__main__":

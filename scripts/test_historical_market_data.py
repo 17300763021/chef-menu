@@ -41,6 +41,17 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(sorted([item for shard in shards for item in shard]), bounded)
         self.assertFalse(set(shards[0]) & set(shards[1]))
 
+    def test_global_verification_targets_partition_without_loss(self) -> None:
+        symbols = [f"{value:06d}" for value in range(100)]
+        targets = verification_symbols(symbols, "full", maximum=40)
+        target_set = set(targets)
+        partitions = [
+            [symbol for symbol in targets if symbol in set(shard_symbols(symbols, index, 10))]
+            for index in range(10)
+        ]
+        self.assertEqual(sorted(symbol for partition in partitions for symbol in partition), targets)
+        self.assertEqual(sum(len(partition) for partition in partitions), len(target_set))
+
     def test_adjusted_prices_do_not_require_volume_or_amount(self) -> None:
         rows = [{
             "date": "2026-07-15", "open": "10", "high": "11", "low": "9", "close": "10.5",
