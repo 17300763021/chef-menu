@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -139,19 +140,33 @@ IDENTIFIER_EVENTS = (
 class CsiIndexSource:
     name = "csi_official"
 
-    def __init__(self, timeout_seconds: float = 30.0) -> None:
+    def __init__(self, timeout_seconds: float = 30.0, attempts: int = 3, backoff_seconds: float = 2.0) -> None:
         try:
             import requests
         except ImportError as error:
             raise RuntimeError("requests is not installed") from error
         self.session = requests.Session()
         self.timeout_seconds = timeout_seconds
+        if attempts < 1:
+            raise ValueError("CSI download attempts must be positive")
+        if backoff_seconds < 0:
+            raise ValueError("CSI retry backoff must be nonnegative")
+        self.attempts = attempts
+        self.backoff_seconds = backoff_seconds
+        self.retryable_errors = (requests.Timeout, requests.ConnectionError)
         self.session.headers.update({"User-Agent": "m2-point-in-time-research/1.0"})
 
     def _get_bytes(self, url: str) -> bytes:
-        response = self.session.get(url, timeout=self.timeout_seconds)
-        response.raise_for_status()
-        return response.content
+        for attempt in range(1, self.attempts + 1):
+            try:
+                response = self.session.get(url, timeout=self.timeout_seconds)
+                response.raise_for_status()
+                return response.content
+            except self.retryable_errors:
+                if attempt == self.attempts:
+                    raise
+                time.sleep(self.backoff_seconds * attempt)
+        raise AssertionError("unreachable CSI download retry state")
 
     def fetch_current(self) -> CurrentUniverse:
         import pandas as pd
