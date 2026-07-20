@@ -153,11 +153,17 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/market_data/requirements.lock.txt
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Download fixed shard plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m2-history-plan-${{ github.run_id }}
+          path: shard-plan
       - name: Build observable shard
         run: >-
           python -u -m scripts.market_data.historical_bars
           --end-date "${{ needs.plan.outputs.end_date }}"
           --mode "${{ needs.plan.outputs.mode }}"
+          --plan-input shard-plan/shard-plan.json
           --shard-index "${{ matrix.shard_index }}"
           --shard-count "${{ matrix.shard_count }}"
           --output-dir "historical-shard-${{ matrix.shard_index }}"

@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import date
 from decimal import Decimal
+from unittest.mock import patch
 
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import bounded_symbols, shard_symbols, verification_symbols
+from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, shard_symbols, verification_symbols
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
+from scripts.market_data.universe_contracts import CurrentUniverse
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
@@ -67,6 +69,48 @@ class HistoricalMarketDataTests(unittest.TestCase):
             "volume": "", "amount": "", "turn": "", "tradestatus": "0", "isST": "0",
         }}
         self.assertEqual(BaostockHistorySource.bars_from_status("600519", rows), {})
+
+    def test_current_universe_canonical_roundtrip(self) -> None:
+        current = CurrentUniverse(
+            as_of_date=date(2026, 7, 16),
+            members={"000300": ("000001",), "000905": ("600519",)},
+            source_urls={"000300": "https://example.test/300.xls", "000905": "https://example.test/500.xls"},
+            source_hashes={"000300": "a" * 64, "000905": "b" * 64},
+        )
+        self.assertEqual(current_universe_from_canonical(current.canonical()), current)
+
+    def test_preflight_plan_freezes_current_snapshot_for_shards(self) -> None:
+        class FakeCalendar:
+            open_dates = tuple(date(2026, 7, day) for day in range(1, 17))
+
+        class FakeCalendarSource:
+            def fetch(self, start: date, end: date) -> FakeCalendar:
+                return FakeCalendar()
+
+        class FakeCsiSource:
+            def fetch_current(self) -> CurrentUniverse:
+                return CurrentUniverse(
+                    as_of_date=date(2026, 7, 16),
+                    members={
+                        "000300": tuple(f"{value:06d}" for value in range(60)),
+                        "000905": tuple(f"{value:06d}" for value in range(60, 120)),
+                    },
+                    source_urls={"000300": "https://example.test/300.xls", "000905": "https://example.test/500.xls"},
+                    source_hashes={"000300": "a" * 64, "000905": "b" * 64},
+                )
+
+            def fetch_events(self, calendar: FakeCalendar, through: date):
+                return [], set()
+
+        with (
+            patch("scripts.market_data.historical_bars.AkshareCalendarSource", FakeCalendarSource),
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+        ):
+            plan = build_plan(date(2026, 7, 16), "preflight")
+        self.assertEqual(plan["shard_count"], 10)
+        self.assertEqual(plan["symbol_count"], 100)
+        self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
+        self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
 
 
 if __name__ == "__main__":

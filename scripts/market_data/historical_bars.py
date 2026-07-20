@@ -33,6 +33,7 @@ from scripts.market_data.sources.baostock_history_source import BaostockHistoryS
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
+from scripts.market_data.universe_contracts import CurrentUniverse, INDEX_SIZES
 
 
 SHARD_SIZE = 10
@@ -93,6 +94,21 @@ def shard_symbols(symbols: list[str], shard_index: int, shard_count: int) -> lis
     return symbols[shard_index::shard_count]
 
 
+def current_universe_from_canonical(value: dict[str, Any]) -> CurrentUniverse:
+    if value.get("schema_version") != "m2-csi800-pit-universe-v1":
+        raise ValueError("unsupported current universe schema")
+    members = {
+        index_code: tuple(sorted(normalized for normalized in (str(item).zfill(6) for item in value["members"][index_code])))
+        for index_code in INDEX_SIZES
+    }
+    return CurrentUniverse(
+        as_of_date=date.fromisoformat(str(value["as_of_date"])),
+        members=members,
+        source_urls={str(key): str(item) for key, item in value["source_urls"].items()},
+        source_hashes={str(key): str(item) for key, item in value["source_hashes"].items()},
+    )
+
+
 def _progress(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, **values}, ensure_ascii=False, sort_keys=True), flush=True)
 
@@ -135,6 +151,7 @@ def run(
     shard_index: int = 0,
     shard_count: int = 1,
     symbol_attempts: int = 2,
+    current_universe: CurrentUniverse | None = None,
 ) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
     start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
@@ -143,7 +160,7 @@ def run(
     _progress("calendars_loaded", primary_sessions=len(primary_calendar.open_dates), secondary_sessions=len(secondary_calendar.open_dates))
     calendar_gates = evaluate_calendars(primary_calendar, secondary_calendar)
     csi = CsiIndexSource()
-    current = csi.fetch_current()
+    current = current_universe or csi.fetch_current()
     if current.as_of_date > end:
         raise ValueError(f"requested end {end} precedes CSI snapshot {current.as_of_date}")
     events, discovered = csi.fetch_events(primary_calendar, current.as_of_date)
@@ -312,6 +329,7 @@ def run(
 
 
 def build_plan(end: date, mode: str) -> dict[str, Any]:
+    current_snapshot: dict[str, object] | None = None
     if mode == "sample":
         shard_count = 1
         symbol_limit = len(SAMPLE_SYMBOLS)
@@ -319,6 +337,8 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
         csi = CsiIndexSource()
         current = csi.fetch_current()
+        if current.as_of_date > end:
+            raise ValueError(f"requested end {end} precedes CSI snapshot {current.as_of_date}")
         events, _ = csi.fetch_events(primary_calendar, current.as_of_date)
         snapshots = reconstruct(current, events)
         sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
@@ -326,9 +346,11 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         requested_limit = SMOKE_SYMBOLS if mode == "smoke" else PREFLIGHT_SYMBOLS if mode == "preflight" else len(symbols)
         symbol_limit = min(len(symbols), requested_limit)
         shard_count = (symbol_limit + SHARD_SIZE - 1) // SHARD_SIZE
+        current_snapshot = current.canonical()
     return {
         "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
         "shard_size": SHARD_SIZE, "shard_count": shard_count,
+        "current_snapshot": current_snapshot,
         "matrix": {"include": [{"shard_index": index, "shard_count": shard_count} for index in range(shard_count)]},
     }
 
@@ -374,6 +396,7 @@ def main() -> int:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--plan-output", type=Path)
+    parser.add_argument("--plan-input", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
     args = parser.parse_args()
     if args.plan_output:
@@ -382,9 +405,20 @@ def main() -> int:
         args.plan_output.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True), flush=True)
         return 0
+    current_universe = None
+    if args.plan_input:
+        plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
+        if plan.get("mode") != args.mode:
+            raise ValueError(f"plan mode {plan.get('mode')} does not match requested mode {args.mode}")
+        if plan.get("business_end") != args.end_date.isoformat():
+            raise ValueError(f"plan end date {plan.get('business_end')} does not match requested end date {args.end_date}")
+        current_snapshot = plan.get("current_snapshot")
+        if current_snapshot:
+            current_universe = current_universe_from_canonical(current_snapshot)
     result = run(
         args.end_date, mode=args.mode, workers=args.workers,
         shard_index=args.shard_index, shard_count=args.shard_count,
+        current_universe=current_universe,
     )
     manifest = result[0]
     write_outputs(args.output_dir, *result)
