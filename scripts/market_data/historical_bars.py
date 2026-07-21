@@ -303,6 +303,10 @@ def run(
         }
         for symbol, business_date, primary, verification in sorted(close_checks)
     ]
+    verification_sources_by_symbol = {
+        symbol: sorted({row.source for row in rows})
+        for symbol, rows in sorted(verification_by_symbol.items())
+    }
     manifest = {
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
@@ -316,7 +320,8 @@ def run(
         "verification_expected_count": verification_expected,
         "verification_check_count": len(close_checks),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
-        "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina",
+        "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina_with_eastmoney_fallback",
+        "verification_sources_by_symbol": verification_sources_by_symbol,
         "verification_failures": dict(sorted(verification_failures.items())),
         "primary_failures": dict(sorted(secondary_failures.items())),
         "source_versions": {"akshare": version("akshare"), "baostock": version("baostock")},

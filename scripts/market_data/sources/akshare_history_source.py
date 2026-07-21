@@ -51,7 +51,15 @@ class AkshareHistorySource:
 
     def fetch_raw(self, symbol: str, start: date, end: date) -> list[DailyBar]:
         code = normalize_symbol(symbol)
-        frame = self._frame(code, start, end)
+        try:
+            frame = self._frame(code, start, end)
+        except RuntimeError as sina_error:
+            from scripts.market_data.sources.akshare_source import AkshareSource
+
+            try:
+                return AkshareSource(timeout_seconds=self.timeout_seconds, attempts=self.attempts).fetch(code, start, end)
+            except Exception as eastmoney_error:
+                raise RuntimeError(f"{sina_error}; Eastmoney fallback failed: {eastmoney_error}") from eastmoney_error
         rows: list[DailyBar] = []
         for raw in frame.to_dict(orient="records"):
             volume = int_value(raw.get("volume"), "volume(shares)")

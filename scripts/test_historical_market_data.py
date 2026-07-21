@@ -5,8 +5,10 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
 
+from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
 from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, shard_symbols, verification_symbols
+from scripts.market_data.sources.akshare_history_source import AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.universe_contracts import CurrentUniverse
 
@@ -111,6 +113,31 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(plan["symbol_count"], 100)
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
         self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
+
+    def test_akshare_history_falls_back_to_eastmoney_when_sina_is_empty(self) -> None:
+        fallback_row = DailyBar(
+            source="akshare_eastmoney", symbol="000413", exchange="SZSE",
+            business_date=date(2024, 8, 14), open=Decimal("1"), high=Decimal("1"),
+            low=Decimal("1"), close=Decimal("1"), previous_close=None,
+            volume_shares=100, amount_cny=Decimal("100"), turnover_percent=Decimal("1"),
+            trade_status="trading", is_st=None,
+        )
+
+        class FakeEastmoneySource:
+            def __init__(self, timeout_seconds: float, attempts: int) -> None:
+                self.timeout_seconds = timeout_seconds
+                self.attempts = attempts
+
+            def fetch(self, symbol: str, start: date, end: date):
+                return [fallback_row]
+
+        with (
+            patch.object(AkshareHistorySource, "_frame", side_effect=RuntimeError("Sina returned no raw rows")),
+            patch("scripts.market_data.sources.akshare_source.AkshareSource", FakeEastmoneySource),
+        ):
+            rows = AkshareHistorySource(attempts=2).fetch_raw("000413", date(2024, 8, 1), date(2024, 8, 14))
+        self.assertEqual(rows, [fallback_row])
+        self.assertEqual(rows[0].source, "akshare_eastmoney")
 
 
 if __name__ == "__main__":
