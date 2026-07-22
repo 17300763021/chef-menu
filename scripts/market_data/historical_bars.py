@@ -152,6 +152,7 @@ def run(
     shard_count: int = 1,
     symbol_attempts: int = 2,
     current_universe: CurrentUniverse | None = None,
+    csi_discovered_notice_ids: set[int] | None = None,
 ) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
     start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
@@ -163,7 +164,7 @@ def run(
     current = current_universe or csi.fetch_current()
     if current.as_of_date > end:
         raise ValueError(f"requested end {end} precedes CSI snapshot {current.as_of_date}")
-    events, discovered = csi.fetch_events(primary_calendar, current.as_of_date)
+    events, discovered, event_index_source = csi.fetch_indexed_events(current.as_of_date, csi_discovered_notice_ids)
     snapshots = reconstruct(current, events)
     _progress("universe_reconstructed", effective_snapshots=len(snapshots), official_events=len(events), as_of_date=current.as_of_date.isoformat())
     universe_gates = evaluate_universe(events, snapshots, discovered, current.as_of_date)
@@ -322,6 +323,7 @@ def run(
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
         "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina_with_eastmoney_fallback",
         "verification_sources_by_symbol": verification_sources_by_symbol,
+        "csi_event_index_source": event_index_source,
         "verification_failures": dict(sorted(verification_failures.items())),
         "primary_failures": dict(sorted(secondary_failures.items())),
         "source_versions": {"akshare": version("akshare"), "baostock": version("baostock")},
@@ -344,7 +346,7 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         current = csi.fetch_current()
         if current.as_of_date > end:
             raise ValueError(f"requested end {end} precedes CSI snapshot {current.as_of_date}")
-        events, _ = csi.fetch_events(primary_calendar, current.as_of_date)
+        events, discovered, event_index_source = csi.fetch_indexed_events(current.as_of_date)
         snapshots = reconstruct(current, events)
         sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
         symbols = sorted({symbol for symbol, _ in membership_keys(sessions, snapshots)})
@@ -356,6 +358,8 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
         "shard_size": SHARD_SIZE, "shard_count": shard_count,
         "current_snapshot": current_snapshot,
+        "csi_discovered_notice_ids": [] if mode == "sample" else sorted(discovered),
+        "csi_event_index_source": None if mode == "sample" else event_index_source,
         "matrix": {"include": [{"shard_index": index, "shard_count": shard_count} for index in range(shard_count)]},
     }
 
@@ -411,6 +415,7 @@ def main() -> int:
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True), flush=True)
         return 0
     current_universe = None
+    csi_discovered_notice_ids = None
     if args.plan_input:
         plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
         if plan.get("mode") != args.mode:
@@ -420,10 +425,14 @@ def main() -> int:
         current_snapshot = plan.get("current_snapshot")
         if current_snapshot:
             current_universe = current_universe_from_canonical(current_snapshot)
+        discovered = plan.get("csi_discovered_notice_ids")
+        if discovered is not None:
+            csi_discovered_notice_ids = {int(value) for value in discovered}
     result = run(
         args.end_date, mode=args.mode, workers=args.workers,
         shard_index=args.shard_index, shard_count=args.shard_count,
         current_universe=current_universe,
+        csi_discovered_notice_ids=csi_discovered_notice_ids,
     )
     manifest = result[0]
     write_outputs(args.output_dir, *result)

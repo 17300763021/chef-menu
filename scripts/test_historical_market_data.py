@@ -102,7 +102,10 @@ class HistoricalMarketDataTests(unittest.TestCase):
                 )
 
             def fetch_events(self, calendar: FakeCalendar, through: date):
-                return [], set()
+                raise AssertionError("plan should not download historical CSI attachments")
+
+            def fetch_indexed_events(self, through: date, discovered_notice_ids=None):
+                return [], {11518}, {"accepted_manifest_event_sha256": "fixture"}
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FakeCalendarSource),
@@ -113,6 +116,8 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(plan["symbol_count"], 100)
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
         self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
+        self.assertEqual(plan["csi_discovered_notice_ids"], [11518])
+        self.assertEqual(plan["csi_event_index_source"]["accepted_manifest_event_sha256"], "fixture")
 
     def test_akshare_history_falls_back_to_eastmoney_when_sina_is_empty(self) -> None:
         fallback_row = DailyBar(

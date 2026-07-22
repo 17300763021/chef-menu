@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_universe import HISTORY_START, reconstruct
-from scripts.market_data.sources.csi_index_source import CsiIndexSource
+from scripts.market_data.sources.csi_index_source import EXPECTED_EVENT_INDEX_SHA256, CsiIndexSource, load_event_index
 from scripts.market_data.universe_contracts import CurrentUniverse, IndexChange, UniverseEvent
 
 
@@ -53,6 +57,29 @@ class PointInTimeUniverseTests(unittest.TestCase):
         with self.assertRaises(timeout_error):
             source._get_bytes("https://official.example/evidence.xlsx")
         self.assertEqual(source.session.get.call_count, 3)
+
+    def test_csi_event_index_is_fixed_and_reproducible(self) -> None:
+        events, source = load_event_index()
+        self.assertEqual(len(events), 26)
+        self.assertEqual(source["accepted_manifest_event_sha256"], EXPECTED_EVENT_INDEX_SHA256)
+        self.assertEqual(sha256([event.canonical() for event in events]), EXPECTED_EVENT_INDEX_SHA256)
+        self.assertEqual(events[0].notice_id, 11518)
+        self.assertEqual(events[-1].notice_id, 3006137)
+
+    def test_csi_event_index_hash_mismatch_fails_closed(self) -> None:
+        events, source = load_event_index()
+        rows = [event.canonical() for event in events]
+        rows[0]["attachment_sha256"] = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            path = f"{temporary}/bad-csi-index.json"
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "schema_version": "m2-csi-pit-event-index-v1",
+                    "source": source,
+                    "events": rows,
+                }, stream)
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                load_event_index(Path(path))
 
 
 if __name__ == "__main__":

@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import normalize_symbol, parse_date
+from scripts.market_data.manifest import sha256
 from scripts.market_data.universe_contracts import CurrentUniverse, INDEX_SIZES, IndexChange, UniverseEvent
 
 
 DETAIL_URL = "https://www.csindex.com.cn/csindex-home/announcement/queryAnnouncementById"
 LIST_URL = "https://www.csindex.com.cn/csindex-home/announcement/queryAnnouncementByVo"
 CURRENT_URL = "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/cons/{index_code}cons.xls"
+EVENT_INDEX_PATH = Path(__file__).resolve().parents[1] / "evidence" / "csi_pit_events_v1.json"
+EVENT_INDEX_SCHEMA_VERSION = "m2-csi-pit-event-index-v1"
+EXPECTED_EVENT_INDEX_SHA256 = "e496fcfe680f463e1b00fe18e747f36c8138bf48a1771414aee2981d5ef60832"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +141,45 @@ IDENTIFIER_EVENTS = (
         "changes": (IndexChange.build("000905", ["300114"], ["302132"]),),
     },
 )
+
+
+def index_change_from_canonical(value: dict[str, Any]) -> IndexChange:
+    return IndexChange.build(str(value["index_code"]), list(value["removed"]), list(value["added"]))
+
+
+def universe_event_from_canonical(value: dict[str, Any]) -> UniverseEvent:
+    return UniverseEvent(
+        notice_id=int(value["notice_id"]),
+        event_type=str(value["event_type"]),
+        announcement_date=date.fromisoformat(str(value["announcement_date"])),
+        effective_session=date.fromisoformat(str(value["effective_session"])),
+        effective_basis=str(value["effective_basis"]),
+        attachment_url=str(value["attachment_url"]),
+        attachment_sha256=str(value["attachment_sha256"]),
+        changes=tuple(index_change_from_canonical(item) for item in value["changes"]),
+    )
+
+
+def load_event_index(path: Path = EVENT_INDEX_PATH) -> tuple[list[UniverseEvent], dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != EVENT_INDEX_SCHEMA_VERSION:
+        raise ValueError("unsupported CSI event index schema")
+    event_rows = list(payload.get("events") or [])
+    source = dict(payload.get("source") or {})
+    actual_hash = sha256(event_rows)
+    expected_hash = str(source.get("accepted_manifest_event_sha256") or "")
+    if actual_hash != expected_hash or actual_hash != EXPECTED_EVENT_INDEX_SHA256:
+        raise ValueError(f"CSI event index hash mismatch: {actual_hash}")
+    events = [universe_event_from_canonical(row) for row in event_rows]
+    indexed_ids = {event.notice_id for event in events}
+    missing = sorted(
+        spec.notice_id
+        for spec in NOTICE_SPECS
+        if spec.notice_id not in indexed_ids
+    )
+    if missing:
+        raise ValueError(f"CSI event index missing notices: {missing}")
+    return sorted(events, key=lambda value: (value.effective_session, value.notice_id)), source
 
 
 class CsiIndexSource:
@@ -298,3 +343,18 @@ class CsiIndexSource:
                     str(item["basis"]), str(item["url"]), hashlib.sha256(payload).hexdigest(), item["changes"],
                 ))
         return sorted(events, key=lambda value: (value.effective_session, value.notice_id)), self.discovered_notice_ids()
+
+    def fetch_indexed_events(self, through: date, discovered_notice_ids: set[int] | None = None) -> tuple[list[UniverseEvent], set[int], dict[str, Any]]:
+        events, source = load_event_index()
+        identifier_effective = {int(item["notice_id"]): item["effective_session"] for item in IDENTIFIER_EVENTS}
+        selected = [
+            event
+            for event in events
+            if (
+                event.notice_id in identifier_effective
+                and identifier_effective[event.notice_id] <= through
+            )
+            or any(spec.notice_id == event.notice_id and spec.stated_date <= through for spec in NOTICE_SPECS)
+        ]
+        discovered = self.discovered_notice_ids() if discovered_notice_ids is None else set(discovered_notice_ids)
+        return selected, discovered, source
