@@ -5,9 +5,10 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
 
+from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, shard_symbols, verification_symbols
+from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, load_calendars, shard_symbols, verification_symbols
 from scripts.market_data.sources.akshare_history_source import AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.universe_contracts import CurrentUniverse
@@ -81,13 +82,40 @@ class HistoricalMarketDataTests(unittest.TestCase):
         )
         self.assertEqual(current_universe_from_canonical(current.canonical()), current)
 
+    def test_frozen_calendars_skip_live_calendar_sources(self) -> None:
+        frozen_primary = TradingCalendar.build("akshare_calendar", date(2026, 7, 1), date(2026, 7, 3), [date(2026, 7, 1), date(2026, 7, 2)])
+        frozen_secondary = TradingCalendar.build("baostock_calendar", date(2026, 7, 1), date(2026, 7, 3), [date(2026, 7, 1), date(2026, 7, 2)])
+
+        class FailingCalendarSource:
+            def fetch(self, start: date, end: date) -> TradingCalendar:
+                raise AssertionError("frozen shard should not fetch live calendars")
+
+        with (
+            patch("scripts.market_data.historical_bars.AkshareCalendarSource", FailingCalendarSource),
+            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FailingCalendarSource),
+        ):
+            primary, secondary, gates, _source = load_calendars(
+                date(2026, 7, 3),
+                primary_calendar=frozen_primary,
+                secondary_calendar=frozen_secondary,
+            )
+        self.assertEqual(primary, frozen_primary)
+        self.assertEqual(secondary, frozen_secondary)
+        self.assertTrue(all(gate.passed for gate in gates))
+
     def test_preflight_plan_freezes_current_snapshot_for_shards(self) -> None:
         class FakeCalendar:
-            open_dates = tuple(date(2026, 7, day) for day in range(1, 17))
+            @staticmethod
+            def build(source: str) -> TradingCalendar:
+                return TradingCalendar.build(source, date(2026, 7, 1), date(2026, 7, 16), tuple(date(2026, 7, day) for day in range(1, 17)))
 
         class FakeCalendarSource:
-            def fetch(self, start: date, end: date) -> FakeCalendar:
-                return FakeCalendar()
+            def fetch(self, start: date, end: date) -> TradingCalendar:
+                return FakeCalendar.build("akshare_calendar")
+
+        class FakeBaostockCalendarSource:
+            def fetch(self, start: date, end: date) -> TradingCalendar:
+                return FakeCalendar.build("baostock_calendar")
 
         class FakeCsiSource:
             def fetch_current(self) -> CurrentUniverse:
@@ -109,6 +137,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FakeCalendarSource),
+            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FakeBaostockCalendarSource),
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
         ):
             plan = build_plan(date(2026, 7, 16), "preflight")
@@ -116,6 +145,9 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(plan["symbol_count"], 100)
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
         self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
+        self.assertEqual(plan["primary_calendar"]["source"], "akshare_calendar")
+        self.assertEqual(plan["secondary_calendar"]["source"], "baostock_calendar")
+        self.assertNotEqual(plan["calendar_source"]["primary_calendar_sha256"], plan["calendar_source"]["secondary_calendar_sha256"])
         self.assertEqual(plan["csi_discovered_notice_ids"], [11518])
         self.assertEqual(plan["csi_event_index_source"]["accepted_manifest_event_sha256"], "fixture")
 

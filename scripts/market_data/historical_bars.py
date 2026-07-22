@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from scripts.market_data.adjustment_engine import AdjustmentTimeline
+from scripts.market_data.calendar_contracts import CALENDAR_SCHEMA_VERSION, TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
 from scripts.market_data.historical_quality_gates import evaluate_historical
 from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_quality_gates import evaluate_calendars, evaluate_universe
 from scripts.market_data.pit_universe import HISTORY_START, reconstruct
-from scripts.market_data.quality_gates import accepted
+from scripts.market_data.quality_gates import GateResult, accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.akshare_calendar_source import AkshareCalendarSource
 from scripts.market_data.sources.akshare_history_source import AkshareHistorySource
@@ -109,6 +110,33 @@ def current_universe_from_canonical(value: dict[str, Any]) -> CurrentUniverse:
     )
 
 
+def trading_calendar_from_canonical(value: dict[str, Any]) -> TradingCalendar:
+    if value.get("schema_version") != CALENDAR_SCHEMA_VERSION:
+        raise ValueError("unsupported trading calendar schema")
+    return TradingCalendar.build(
+        source=str(value["source"]),
+        start_date=date.fromisoformat(str(value["start_date"])),
+        end_date=date.fromisoformat(str(value["end_date"])),
+        values=(date.fromisoformat(str(item)) for item in value["open_dates"]),
+    )
+
+
+def load_calendars(
+    end: date,
+    *,
+    primary_calendar: TradingCalendar | None = None,
+    secondary_calendar: TradingCalendar | None = None,
+) -> tuple[TradingCalendar, TradingCalendar, list[GateResult], dict[str, str]]:
+    primary = primary_calendar or AkshareCalendarSource().fetch(HISTORY_START, end)
+    secondary = secondary_calendar or BaostockCalendarSource().fetch(HISTORY_START, end)
+    calendar_gates = evaluate_calendars(primary, secondary)
+    calendar_source = {
+        "primary_calendar_sha256": sha256(primary.canonical()),
+        "secondary_calendar_sha256": sha256(secondary.canonical()),
+    }
+    return primary, secondary, calendar_gates, calendar_source
+
+
 def _progress(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, **values}, ensure_ascii=False, sort_keys=True), flush=True)
 
@@ -153,13 +181,21 @@ def run(
     symbol_attempts: int = 2,
     current_universe: CurrentUniverse | None = None,
     csi_discovered_notice_ids: set[int] | None = None,
+    primary_calendar: TradingCalendar | None = None,
+    secondary_calendar: TradingCalendar | None = None,
 ) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
     start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
-    primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
-    secondary_calendar = BaostockCalendarSource().fetch(HISTORY_START, end)
-    _progress("calendars_loaded", primary_sessions=len(primary_calendar.open_dates), secondary_sessions=len(secondary_calendar.open_dates))
-    calendar_gates = evaluate_calendars(primary_calendar, secondary_calendar)
+    using_frozen_calendars = primary_calendar is not None and secondary_calendar is not None
+    primary_calendar, secondary_calendar, calendar_gates, calendar_source = load_calendars(
+        end, primary_calendar=primary_calendar, secondary_calendar=secondary_calendar,
+    )
+    _progress(
+        "calendars_loaded",
+        primary_sessions=len(primary_calendar.open_dates),
+        secondary_sessions=len(secondary_calendar.open_dates),
+        frozen=using_frozen_calendars,
+    )
     csi = CsiIndexSource()
     current = current_universe or csi.fetch_current()
     if current.as_of_date > end:
@@ -324,6 +360,7 @@ def run(
         "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina_with_eastmoney_fallback",
         "verification_sources_by_symbol": verification_sources_by_symbol,
         "csi_event_index_source": event_index_source,
+        "calendar_source": calendar_source,
         "verification_failures": dict(sorted(verification_failures.items())),
         "primary_failures": dict(sorted(secondary_failures.items())),
         "source_versions": {"akshare": version("akshare"), "baostock": version("baostock")},
@@ -337,11 +374,17 @@ def run(
 
 def build_plan(end: date, mode: str) -> dict[str, Any]:
     current_snapshot: dict[str, object] | None = None
+    primary_calendar_snapshot: dict[str, object] | None = None
+    secondary_calendar_snapshot: dict[str, object] | None = None
+    calendar_gates: list[GateResult] = []
+    calendar_source: dict[str, str] | None = None
     if mode == "sample":
         shard_count = 1
         symbol_limit = len(SAMPLE_SYMBOLS)
     else:
-        primary_calendar = AkshareCalendarSource().fetch(HISTORY_START, end)
+        primary_calendar, secondary_calendar, calendar_gates, calendar_source = load_calendars(end)
+        if not accepted(calendar_gates):
+            raise RuntimeError("M2.2 calendar prerequisite gates failed")
         csi = CsiIndexSource()
         current = csi.fetch_current()
         if current.as_of_date > end:
@@ -354,10 +397,16 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         symbol_limit = min(len(symbols), requested_limit)
         shard_count = (symbol_limit + SHARD_SIZE - 1) // SHARD_SIZE
         current_snapshot = current.canonical()
+        primary_calendar_snapshot = primary_calendar.canonical()
+        secondary_calendar_snapshot = secondary_calendar.canonical()
     return {
         "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
         "shard_size": SHARD_SIZE, "shard_count": shard_count,
         "current_snapshot": current_snapshot,
+        "primary_calendar": primary_calendar_snapshot,
+        "secondary_calendar": secondary_calendar_snapshot,
+        "calendar_gates": [gate.canonical() for gate in calendar_gates],
+        "calendar_source": calendar_source,
         "csi_discovered_notice_ids": [] if mode == "sample" else sorted(discovered),
         "csi_event_index_source": None if mode == "sample" else event_index_source,
         "matrix": {"include": [{"shard_index": index, "shard_count": shard_count} for index in range(shard_count)]},
@@ -416,6 +465,8 @@ def main() -> int:
         return 0
     current_universe = None
     csi_discovered_notice_ids = None
+    primary_calendar = None
+    secondary_calendar = None
     if args.plan_input:
         plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
         if plan.get("mode") != args.mode:
@@ -428,11 +479,19 @@ def main() -> int:
         discovered = plan.get("csi_discovered_notice_ids")
         if discovered is not None:
             csi_discovered_notice_ids = {int(value) for value in discovered}
+        primary_calendar_snapshot = plan.get("primary_calendar")
+        secondary_calendar_snapshot = plan.get("secondary_calendar")
+        if primary_calendar_snapshot:
+            primary_calendar = trading_calendar_from_canonical(primary_calendar_snapshot)
+        if secondary_calendar_snapshot:
+            secondary_calendar = trading_calendar_from_canonical(secondary_calendar_snapshot)
     result = run(
         args.end_date, mode=args.mode, workers=args.workers,
         shard_index=args.shard_index, shard_count=args.shard_count,
         current_universe=current_universe,
         csi_discovered_notice_ids=csi_discovered_notice_ids,
+        primary_calendar=primary_calendar,
+        secondary_calendar=secondary_calendar,
     )
     manifest = result[0]
     write_outputs(args.output_dir, *result)
