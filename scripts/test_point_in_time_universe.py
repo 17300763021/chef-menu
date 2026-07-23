@@ -54,7 +54,7 @@ class PointInTimeUniverseTests(unittest.TestCase):
     def test_official_attachment_download_fails_after_bounded_attempts(self) -> None:
         source, timeout_error = self.retry_source()
         source.session.get = Mock(side_effect=timeout_error("still unavailable"))
-        with self.assertRaises(timeout_error):
+        with self.assertRaisesRegex(RuntimeError, "CSI official download unavailable after 3 attempts"):
             source._get_bytes("https://official.example/evidence.xlsx")
         self.assertEqual(source.session.get.call_count, 3)
 

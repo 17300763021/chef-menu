@@ -24,6 +24,9 @@ CURRENT_URL = "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/
 EVENT_INDEX_PATH = Path(__file__).resolve().parents[1] / "evidence" / "csi_pit_events_v1.json"
 EVENT_INDEX_SCHEMA_VERSION = "m2-csi-pit-event-index-v1"
 EXPECTED_EVENT_INDEX_SHA256 = "e496fcfe680f463e1b00fe18e747f36c8138bf48a1771414aee2981d5ef60832"
+CSI_DOWNLOAD_TIMEOUT_SECONDS = 45.0
+CSI_DOWNLOAD_ATTEMPTS = 5
+CSI_DOWNLOAD_BACKOFF_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +188,12 @@ def load_event_index(path: Path = EVENT_INDEX_PATH) -> tuple[list[UniverseEvent]
 class CsiIndexSource:
     name = "csi_official"
 
-    def __init__(self, timeout_seconds: float = 30.0, attempts: int = 3, backoff_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        timeout_seconds: float = CSI_DOWNLOAD_TIMEOUT_SECONDS,
+        attempts: int = CSI_DOWNLOAD_ATTEMPTS,
+        backoff_seconds: float = CSI_DOWNLOAD_BACKOFF_SECONDS,
+    ) -> None:
         try:
             import requests
         except ImportError as error:
@@ -202,14 +210,16 @@ class CsiIndexSource:
         self.session.headers.update({"User-Agent": "m2-point-in-time-research/1.0"})
 
     def _get_bytes(self, url: str) -> bytes:
+        failures: list[str] = []
         for attempt in range(1, self.attempts + 1):
             try:
                 response = self.session.get(url, timeout=self.timeout_seconds)
                 response.raise_for_status()
                 return response.content
-            except self.retryable_errors:
+            except self.retryable_errors as error:
+                failures.append(f"attempt {attempt}: {type(error).__name__}: {error}")
                 if attempt == self.attempts:
-                    raise
+                    raise RuntimeError(f"CSI official download unavailable after {self.attempts} attempts for {url}: {'; '.join(failures)}") from error
                 time.sleep(self.backoff_seconds * attempt)
         raise AssertionError("unreachable CSI download retry state")
 
