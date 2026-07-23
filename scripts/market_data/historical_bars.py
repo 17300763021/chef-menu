@@ -17,7 +17,6 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
-from scripts.market_data.adjustment_engine import AdjustmentTimeline
 from scripts.market_data.calendar_contracts import CALENDAR_SCHEMA_VERSION, TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
@@ -28,9 +27,8 @@ from scripts.market_data.pit_universe import HISTORY_START, reconstruct
 from scripts.market_data.quality_gates import GateResult, accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.akshare_calendar_source import AkshareCalendarSource
-from scripts.market_data.sources.akshare_history_source import AkshareHistorySource
+from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
 from scripts.market_data.sources.baostock_calendar_source import BaostockCalendarSource
-from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -41,8 +39,8 @@ SHARD_SIZE = 10
 SMOKE_SYMBOLS = 20
 PREFLIGHT_SYMBOLS = 100
 SYMBOL_DEADLINE_SECONDS = 90
-FULL_HISTORY_LOGIN_STAGGER_SECONDS = 10
-FULL_HISTORY_LOGIN_STAGGER_BUCKETS = 6
+FULL_HISTORY_ACQUISITION_STAGGER_SECONDS = 10
+FULL_HISTORY_ACQUISITION_STAGGER_BUCKETS = 6
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -100,7 +98,7 @@ def shard_symbols(symbols: list[str], shard_index: int, shard_count: int) -> lis
 def history_stagger_seconds(mode: str, shard_index: int) -> int:
     if mode != "full":
         return 0
-    return (shard_index % FULL_HISTORY_LOGIN_STAGGER_BUCKETS) * FULL_HISTORY_LOGIN_STAGGER_SECONDS
+    return (shard_index % FULL_HISTORY_ACQUISITION_STAGGER_BUCKETS) * FULL_HISTORY_ACQUISITION_STAGGER_SECONDS
 
 
 def current_universe_from_canonical(value: dict[str, Any]) -> CurrentUniverse:
@@ -250,62 +248,65 @@ def run(
         _progress("history_stagger", delay_seconds=history_delay)
         time.sleep(history_delay)
 
-    secondary_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
+    status_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
     raw_by_symbol: dict[str, dict[date, DailyBar]] = {}
     qfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
     hfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
+    factors_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal]]] = {}
     references: list[SecurityReference] = []
     adjustments: list[AdjustmentEvent] = []
-    secondary_failures: dict[str, str] = {}
+    primary_sources_by_symbol: dict[str, str] = {}
+    primary_failures: dict[str, str] = {}
     started_at = time.monotonic()
-    with BaostockHistorySource(timeout_seconds=30) as source:
-        for position, symbol in enumerate(symbols, start=1):
-            last_error: Exception | None = None
-            for attempt in range(1, symbol_attempts + 1):
-                try:
-                    with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
-                        status = source.fetch_status(symbol, *ranges[symbol])
-                        raw = source.bars_from_status(symbol, status)
-                        qfq = source.fetch_adjusted_prices(symbol, *ranges[symbol], "2")
-                        hfq = source.fetch_adjusted_prices(symbol, *ranges[symbol], "1")
-                        reference = source.fetch_reference(symbol)
-                        events_for_symbol = source.fetch_adjustments(symbol, end)
-                    secondary_by_symbol[symbol] = status
-                    raw_by_symbol[symbol] = raw
-                    qfq_by_symbol[symbol] = qfq
-                    hfq_by_symbol[symbol] = hfq
-                    references.append(reference)
-                    adjustments.extend(events_for_symbol)
-                    last_error = None
-                    break
-                except Exception as error:
-                    last_error = error
-                    _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"{type(error).__name__}: {error}")
-                    if attempt < symbol_attempts:
-                        time.sleep(2 ** (attempt - 1))
-            if last_error is not None:
-                secondary_failures[symbol] = f"{type(last_error).__name__}: {last_error}"
-            elapsed = max(time.monotonic() - started_at, 0.001)
-            _progress(
-                "symbol_completed", symbol=symbol, completed=position, total=len(symbols),
-                succeeded=position - len(secondary_failures), failed=len(secondary_failures),
-                elapsed_seconds=round(elapsed, 1), estimated_remaining_seconds=round(elapsed / position * (len(symbols) - position), 1),
-            )
+    source = AkshareEastmoneyHistorySource(timeout_seconds=30, attempts=5)
+    for position, symbol in enumerate(symbols, start=1):
+        last_error: Exception | None = None
+        for attempt in range(1, symbol_attempts + 1):
+            try:
+                with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
+                    raw, qfq, hfq, events_for_symbol, reference, status, primary_source_name = source.fetch_bundle(symbol, *ranges[symbol])
+                    factors = {
+                        business_date: (
+                            source._factor(qfq[business_date][3], raw[business_date].close),
+                            source._factor(hfq[business_date][3], raw[business_date].close),
+                        )
+                        for business_date in set(raw) & set(qfq) & set(hfq)
+                    }
+                status_by_symbol[symbol] = status
+                raw_by_symbol[symbol] = raw
+                qfq_by_symbol[symbol] = qfq
+                hfq_by_symbol[symbol] = hfq
+                factors_by_symbol[symbol] = factors
+                primary_sources_by_symbol[symbol] = primary_source_name
+                references.append(reference)
+                adjustments.extend(events_for_symbol)
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"{type(error).__name__}: {error}")
+                if attempt < symbol_attempts:
+                    time.sleep(2 ** (attempt - 1))
+        if last_error is not None:
+            primary_failures[symbol] = f"{type(last_error).__name__}: {last_error}"
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        _progress(
+            "symbol_completed", symbol=symbol, completed=position, total=len(symbols),
+            succeeded=position - len(primary_failures), failed=len(primary_failures),
+            elapsed_seconds=round(elapsed, 1), estimated_remaining_seconds=round(elapsed / position * (len(symbols) - position), 1),
+        )
 
     primary_map = {(symbol, day): row for symbol, rows in raw_by_symbol.items() for day, row in rows.items() if (symbol, day) in expected}
     verification_map = {row.key: row for rows in verification_by_symbol.values() for row in rows if row.key in expected}
     reference_map = {row.symbol: row for row in references}
-    adjustment_map: dict[str, list[AdjustmentEvent]] = {symbol: [] for symbol in symbols}
-    for event in adjustments:
-        adjustment_map.setdefault(event.symbol, []).append(event)
-    timeline_map = {symbol: AdjustmentTimeline(adjustment_map.get(symbol, [])) for symbol in symbols}
+    factor_map = {(symbol, day): factors for symbol, rows in factors_by_symbol.items() for day, factors in rows.items()}
 
     bars: list[HistoricalBar] = []
     facts: list[TradeabilityFact] = []
     close_checks: list[tuple[str, date, Decimal, Decimal]] = []
     for (symbol, business_date), index_code in sorted(expected.items()):
         raw = primary_map.get((symbol, business_date))
-        secondary = secondary_by_symbol.get(symbol, {}).get(business_date)
+        secondary = status_by_symbol.get(symbol, {}).get(business_date)
         reference = reference_map.get(symbol)
         age = listing_age(reference, business_date, primary_calendar.open_dates) if reference else 0
         fact = derive_tradeability(
@@ -315,7 +316,10 @@ def run(
         facts.append(fact)
         if raw is None:
             continue
-        qfq_factor, hfq_factor = timeline_map[symbol].factors_on(business_date)
+        factors = factor_map.get((symbol, business_date))
+        if factors is None:
+            continue
+        qfq_factor, hfq_factor = factors
         qfq = qfq_by_symbol.get(symbol, {}).get(business_date)
         hfq = hfq_by_symbol.get(symbol, {}).get(business_date)
         if qfq is None or hfq is None:
@@ -326,7 +330,7 @@ def run(
             open_price=raw.open, high=raw.high, low=raw.low, close=raw.close, previous_close=previous_close,
             volume_shares=raw.volume_shares, amount_cny=raw.amount_cny, turnover_percent=raw.turnover_percent,
             qfq_factor=qfq_factor, hfq_factor=hfq_factor,
-            qfq_prices=qfq, hfq_prices=hfq, primary_source="baostock",
+            qfq_prices=qfq, hfq_prices=hfq, primary_source=primary_sources_by_symbol.get(symbol, "unknown"),
         ))
         verification = verification_map.get((symbol, business_date))
         if verification:
@@ -357,6 +361,10 @@ def run(
         symbol: sorted({row.source for row in rows})
         for symbol, rows in sorted(verification_by_symbol.items())
     }
+    verification_source_overlap_symbols = sorted(
+        symbol for symbol, sources in verification_sources_by_symbol.items()
+        if primary_sources_by_symbol.get(symbol) in sources
+    )
     manifest = {
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
@@ -370,13 +378,19 @@ def run(
         "verification_expected_count": verification_expected,
         "verification_check_count": len(close_checks),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
-        "adjustment_event_count": len(adjustments), "verification_source": "akshare_sina_with_eastmoney_fallback",
+        "adjustment_event_count": len(adjustments),
+        "primary_source": "akshare_historical_bundle",
+        "primary_source_role": "per-symbol single-mouth historical raw/qfq/hfq source",
+        "primary_sources_by_symbol": dict(sorted(primary_sources_by_symbol.items())),
+        "tradeability_status_source": "akshare_observed_raw_fail_closed",
+        "verification_source": "akshare_sina_with_eastmoney_fallback",
         "verification_sources_by_symbol": verification_sources_by_symbol,
+        "verification_source_overlap_symbols": verification_source_overlap_symbols,
         "csi_event_index_source": event_index_source,
         "calendar_source": calendar_source,
         "verification_failures": dict(sorted(verification_failures.items())),
-        "primary_failures": dict(sorted(secondary_failures.items())),
-        "source_versions": {"akshare": version("akshare"), "baostock": version("baostock")},
+        "primary_failures": dict(sorted(primary_failures.items())),
+        "source_versions": {"akshare": version("akshare")},
         "bars_sha256": sha256(canonical_bars), "tradeability_sha256": sha256(canonical_facts),
         "adjustments_sha256": sha256(canonical_adjustments),
         "verification_checks_sha256": sha256(canonical_close_checks), "accepted": accepted(gates),
