@@ -8,7 +8,7 @@ from unittest.mock import patch
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, load_calendars, shard_symbols, verification_symbols
+from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, history_stagger_seconds, load_calendars, shard_symbols, verification_symbols
 from scripts.market_data.sources.akshare_history_source import AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.universe_contracts import CurrentUniverse
@@ -56,6 +56,13 @@ class HistoricalMarketDataTests(unittest.TestCase):
         ]
         self.assertEqual(sorted(symbol for partition in partitions for symbol in partition), targets)
         self.assertEqual(sum(len(partition) for partition in partitions), len(target_set))
+
+    def test_history_stagger_applies_only_to_full_mode(self) -> None:
+        self.assertEqual(history_stagger_seconds("preflight", 5), 0)
+        self.assertEqual(history_stagger_seconds("sample", 5), 0)
+        self.assertEqual(history_stagger_seconds("full", 0), 0)
+        self.assertEqual(history_stagger_seconds("full", 5), 50)
+        self.assertEqual(history_stagger_seconds("full", 6), 0)
 
     def test_adjusted_prices_do_not_require_volume_or_amount(self) -> None:
         rows = [{

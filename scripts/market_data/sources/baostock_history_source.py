@@ -14,6 +14,7 @@ from scripts.market_data.historical_contracts import AdjustmentEvent, SecurityRe
 
 STATUS_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,isST"
 AdjustedOHLC = tuple[Decimal, Decimal, Decimal, Decimal]
+BLACKLIST_ERROR_CODES = {"10001011"}
 
 
 class BaostockHistorySource:
@@ -37,6 +38,9 @@ class BaostockHistorySource:
             result = bs.login()
             if result.error_code == "0":
                 return self
+            if str(result.error_code) in BLACKLIST_ERROR_CODES:
+                socket.setdefaulttimeout(self._previous_socket_timeout)
+                raise RuntimeError(f"BaoStock login blocked: {result.error_code} {result.error_msg}")
             if attempt < self.attempts:
                 time.sleep(2 ** (attempt - 1))
         socket.setdefaulttimeout(self._previous_socket_timeout)

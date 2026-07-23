@@ -41,6 +41,8 @@ SHARD_SIZE = 10
 SMOKE_SYMBOLS = 20
 PREFLIGHT_SYMBOLS = 100
 SYMBOL_DEADLINE_SECONDS = 90
+FULL_HISTORY_LOGIN_STAGGER_SECONDS = 10
+FULL_HISTORY_LOGIN_STAGGER_BUCKETS = 6
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -93,6 +95,12 @@ def shard_symbols(symbols: list[str], shard_index: int, shard_count: int) -> lis
     if shard_count < 1 or not 0 <= shard_index < shard_count:
         raise ValueError("invalid shard coordinates")
     return symbols[shard_index::shard_count]
+
+
+def history_stagger_seconds(mode: str, shard_index: int) -> int:
+    if mode != "full":
+        return 0
+    return (shard_index % FULL_HISTORY_LOGIN_STAGGER_BUCKETS) * FULL_HISTORY_LOGIN_STAGGER_SECONDS
 
 
 def current_universe_from_canonical(value: dict[str, Any]) -> CurrentUniverse:
@@ -236,6 +244,11 @@ def run(
     _progress("verification_started", symbols=len(verification_targets))
     verification_by_symbol, verification_failures = fetch_primary(verification_targets, ranges, 1)
     _progress("verification_completed", succeeded=len(verification_by_symbol), failed=len(verification_failures))
+
+    history_delay = history_stagger_seconds(mode, shard_index)
+    if history_delay:
+        _progress("history_stagger", delay_seconds=history_delay)
+        time.sleep(history_delay)
 
     secondary_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
     raw_by_symbol: dict[str, dict[date, DailyBar]] = {}

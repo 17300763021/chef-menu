@@ -56,6 +56,8 @@ jobs:
           python -m scripts.test_merge_historical_shards
           python -m scripts.test_adjustment_engine
           python -m scripts.test_tradeability
+          python -m scripts.test_baostock_calendar_source
+          python -m scripts.test_baostock_history_source
 
   sample:
     if: github.event_name == 'push' || inputs.mode == 'sample'
@@ -141,7 +143,7 @@ jobs:
     needs: plan
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
