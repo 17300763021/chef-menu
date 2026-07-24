@@ -38,7 +38,7 @@ from scripts.market_data.universe_contracts import CurrentUniverse, INDEX_SIZES
 SHARD_SIZE = 10
 SMOKE_SYMBOLS = 20
 PREFLIGHT_SYMBOLS = 100
-SYMBOL_DEADLINE_SECONDS = 90
+SYMBOL_DEADLINE_SECONDS = 60
 FULL_HISTORY_ACQUISITION_STAGGER_SECONDS = 10
 FULL_HISTORY_ACQUISITION_STAGGER_BUCKETS = 6
 
@@ -58,7 +58,7 @@ def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, 
 
 
 def fetch_primary(symbols: list[str], ranges: dict[str, tuple[date, date]], workers: int) -> tuple[dict[str, list[DailyBar]], dict[str, str]]:
-    source = AkshareHistorySource(attempts=5)
+    source = AkshareHistorySource(timeout_seconds=15, attempts=2)
     output: dict[str, list[DailyBar]] = {}
     failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -184,7 +184,7 @@ def run(
     workers: int = 4,
     shard_index: int = 0,
     shard_count: int = 1,
-    symbol_attempts: int = 2,
+    symbol_attempts: int = 1,
     current_universe: CurrentUniverse | None = None,
     csi_discovered_notice_ids: set[int] | None = None,
     primary_calendar: TradingCalendar | None = None,
@@ -258,7 +258,7 @@ def run(
     primary_sources_by_symbol: dict[str, str] = {}
     primary_failures: dict[str, str] = {}
     started_at = time.monotonic()
-    source = AkshareEastmoneyHistorySource(timeout_seconds=30, attempts=5)
+    source = AkshareEastmoneyHistorySource(timeout_seconds=20, attempts=2)
     for position, symbol in enumerate(symbols, start=1):
         last_error: Exception | None = None
         for attempt in range(1, symbol_attempts + 1):
@@ -483,6 +483,7 @@ def main() -> int:
     parser.add_argument("--plan-output", type=Path)
     parser.add_argument("--plan-input", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
+    parser.add_argument("--symbol-attempts", type=int, default=1)
     args = parser.parse_args()
     if args.plan_output:
         plan = build_plan(args.end_date, args.mode)
@@ -514,6 +515,7 @@ def main() -> int:
             secondary_calendar = trading_calendar_from_canonical(secondary_calendar_snapshot)
     result = run(
         args.end_date, mode=args.mode, workers=args.workers,
+        symbol_attempts=args.symbol_attempts,
         shard_index=args.shard_index, shard_count=args.shard_count,
         current_universe=current_universe,
         csi_discovered_notice_ids=csi_discovered_notice_ids,
