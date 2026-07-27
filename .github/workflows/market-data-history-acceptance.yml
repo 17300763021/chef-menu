@@ -10,13 +10,13 @@ on:
       mode:
         description: "smoke uses 20 symbols/2 shards; preflight uses 100; full is the formal universe acceptance"
         required: true
-        default: preflight
+        default: sample
         type: choice
         options: [smoke, preflight, full, sample]
       publish_tidb:
         description: "Publish completed evidence/checkpoints to TiDB using repository secrets"
         required: false
-        default: false
+        default: true
         type: boolean
   push:
     branches: [main]
@@ -85,14 +85,42 @@ jobs:
           INPUT_END_DATE: ${{ inputs.end_date }}
         run: echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
       - name: Build observable sample evidence
+        id: capture
+        continue-on-error: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_tidb }}
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_tidb && format('gh-{0}-sample-{1}', github.run_id, steps.acceptance.outputs.end_date) || '' }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.historical_bars
           --end-date "${{ steps.acceptance.outputs.end_date }}"
           --mode sample
           --output-dir historical-market-sample
-      - name: Publish sample checkpoint to TiDB
-        if: github.event_name == 'workflow_dispatch' && inputs.publish_tidb
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Retry only failed or missing sample symbols from TiDB checkpoint
+        if: steps.capture.outcome == 'failure' && github.event_name == 'workflow_dispatch' && inputs.publish_tidb
         env:
+          TIDB_CHECKPOINT_DATASET_ID: gh-${{ github.run_id }}-sample-${{ steps.acceptance.outputs.end_date }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ steps.acceptance.outputs.end_date }}"
+          --mode sample
+          --output-dir historical-market-sample
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Publish sample checkpoint to TiDB
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.publish_tidb
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: gh-${{ github.run_id }}-sample-${{ steps.acceptance.outputs.end_date }}
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
           TIDB_USER: ${{ secrets.TIDB_USER }}
@@ -102,8 +130,10 @@ jobs:
         run: >-
           python -u -m scripts.market_data.publish_historical_to_tidb
           --input-dir historical-market-sample
-          --dataset-id "gh-${{ github.run_id }}-sample-${{ steps.acceptance.outputs.end_date }}"
+          --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
           --init-schema
+          --allow-unaccepted-checkpoint
+          --missing-input-ok
       - name: Upload sample evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -122,6 +152,7 @@ jobs:
       matrix: ${{ steps.export.outputs.matrix }}
       mode: ${{ steps.export.outputs.mode }}
       end_date: ${{ steps.export.outputs.end_date }}
+      checkpoint_scope_sha256: ${{ steps.export.outputs.checkpoint_scope_sha256 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -153,6 +184,7 @@ jobs:
               stream.write("matrix=" + json.dumps(plan["matrix"], separators=(",", ":")) + "\n")
               stream.write("mode=" + plan["mode"] + "\n")
               stream.write("end_date=" + os.environ["END_DATE"] + "\n")
+              stream.write("checkpoint_scope_sha256=" + plan["checkpoint_scope_sha256"] + "\n")
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -182,6 +214,16 @@ jobs:
           name: m2-history-plan-${{ github.run_id }}
           path: shard-plan
       - name: Build observable shard
+        id: capture
+        continue-on-error: ${{ inputs.publish_tidb }}
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: ${{ inputs.publish_tidb && format('m2-{0}-{1}-{2}-shard-{3}-of-{4}', needs.plan.outputs.mode, needs.plan.outputs.end_date, needs.plan.outputs.checkpoint_scope_sha256, matrix.shard_index, matrix.shard_count) || '' }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.historical_bars
           --end-date "${{ needs.plan.outputs.end_date }}"
@@ -190,9 +232,30 @@ jobs:
           --shard-index "${{ matrix.shard_index }}"
           --shard-count "${{ matrix.shard_count }}"
           --output-dir "historical-shard-${{ matrix.shard_index }}"
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Retry only failed or missing symbols from TiDB checkpoint
+        if: steps.capture.outcome == 'failure' && inputs.publish_tidb
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ needs.plan.outputs.end_date }}"
+          --mode "${{ needs.plan.outputs.mode }}"
+          --plan-input shard-plan/shard-plan.json
+          --shard-index "${{ matrix.shard_index }}"
+          --shard-count "${{ matrix.shard_count }}"
+          --output-dir "historical-shard-${{ matrix.shard_index }}"
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
       - name: Publish shard checkpoint to TiDB
         if: always() && inputs.publish_tidb
         env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
           TIDB_USER: ${{ secrets.TIDB_USER }}
@@ -202,7 +265,7 @@ jobs:
         run: >-
           python -u -m scripts.market_data.publish_historical_to_tidb
           --input-dir "historical-shard-${{ matrix.shard_index }}"
-          --dataset-id "gh-${{ github.run_id }}-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}"
+          --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
           --init-schema
           --allow-unaccepted-checkpoint
           --missing-input-ok
@@ -239,8 +302,9 @@ jobs:
           --input-dir downloaded-shards
           --output-dir historical-market-acceptance
       - name: Publish merged accepted evidence to TiDB
-        if: inputs.publish_tidb
+        if: always() && inputs.publish_tidb
         env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-merged
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
           TIDB_USER: ${{ secrets.TIDB_USER }}
@@ -250,8 +314,10 @@ jobs:
         run: >-
           python -u -m scripts.market_data.publish_historical_to_tidb
           --input-dir historical-market-acceptance
-          --dataset-id "gh-${{ github.run_id }}-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-merged"
+          --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
           --init-schema
+          --allow-unaccepted-checkpoint
+          --missing-input-ok
       - name: Upload merged non-authoritative evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

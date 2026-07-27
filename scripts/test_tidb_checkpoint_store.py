@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from scripts.market_data.historical_bars import _write_gzip
@@ -15,7 +16,9 @@ from scripts.market_data.tidb_checkpoint_store import (
     default_dataset_id,
     ensure_schema,
     load_historical_evidence,
+    load_resumable_evidence,
     publish_historical_evidence,
+    publish_symbol_checkpoint,
     symbol_checkpoint_rows,
 )
 
@@ -36,6 +39,9 @@ class FakeCursor:
     def executemany(self, sql: str, rows) -> None:
         self.connection.executed_many.append((sql, list(rows)))
 
+    def fetchall(self):
+        return self.connection.query_result(self.connection.executed[-1][0])
+
 
 class FakeConnection:
     def __init__(self) -> None:
@@ -48,6 +54,9 @@ class FakeConnection:
 
     def commit(self) -> None:
         self.commits += 1
+
+    def query_result(self, sql: str):
+        return []
 
 
 def sample_evidence(*, accepted: bool = True) -> HistoricalEvidence:
@@ -180,6 +189,57 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertFalse(result["accepted"])
         self.assertEqual(result["counts"]["symbol_checkpoints"], 2)
         self.assertEqual(connection.commits, 1)
+
+    def test_symbol_checkpoint_does_not_publish_incomplete_run_row(self) -> None:
+        connection = FakeConnection()
+        evidence = sample_evidence(accepted=False)
+        one_symbol = HistoricalEvidence(
+            manifest={**evidence.manifest, "primary_failures": {}},
+            bars=evidence.bars,
+            tradeability=evidence.tradeability[:1],
+            adjustments=evidence.adjustments,
+            references=evidence.references,
+            verification_checks=evidence.verification_checks,
+        )
+        counts = publish_symbol_checkpoint(connection, one_symbol, dataset_id="stable-dataset")
+        self.assertEqual(counts["symbol_checkpoints"], 1)
+        self.assertEqual(connection.commits, 1)
+        self.assertFalse(any("m2_history_runs" in sql for sql, _params in connection.executed))
+
+    def test_load_resumable_evidence_reads_only_succeeded_symbols(self) -> None:
+        class ResumeConnection(FakeConnection):
+            def query_result(self, sql: str):
+                if "FROM m2_history_symbol_checkpoints" in sql:
+                    return [("000001",)]
+                if "FROM m2_historical_bars" in sql:
+                    return [(
+                        "000001", "2026-07-15", "SZSE", "000300",
+                        Decimal("10.0000"), Decimal("11.0000"), Decimal("9.0000"), Decimal("10.5000"),
+                        Decimal("10.0000"), 1000, Decimal("10500.00"), Decimal("1.000000"),
+                        Decimal("1.000000"), Decimal("1.000000"), Decimal("10.0000"), Decimal("11.0000"),
+                        Decimal("9.0000"), Decimal("10.5000"), Decimal("10.0000"), Decimal("11.0000"),
+                        Decimal("9.0000"), Decimal("10.5000"), "akshare_eastmoney", "akshare_eastmoney",
+                        "m2-historical-market-v1",
+                    )]
+                if "FROM m2_tradeability_facts" in sql:
+                    return [(
+                        "000001", "2026-07-15", "000300", 1, 1, 0, 0, 200,
+                        Decimal("0.100000"), Decimal("11.0000"), Decimal("9.0000"),
+                        0, 0, 0, 0, 1, 1, "[]", "m2-tradeability-v1",
+                    )]
+                if "FROM m2_adjustment_events" in sql:
+                    return [("000001", "2026-07-15", Decimal("1.000000"), Decimal("1.000000"), "akshare_eastmoney")]
+                if "FROM m2_security_references" in sql:
+                    return [("000001", "SZSE", "Ping An Bank", "1991-04-03", None, "akshare_eastmoney")]
+                if "FROM m2_history_verification_checks" in sql:
+                    return [("000001", "2026-07-15", Decimal("10.5000"), Decimal("10.5000"))]
+                return []
+
+        loaded = load_resumable_evidence(ResumeConnection(), "stable-dataset")
+        self.assertEqual(loaded.manifest["resumed_symbols"], ["000001"])
+        self.assertEqual(loaded.bars[0]["close"], "10.5000")
+        self.assertEqual(loaded.tradeability[0]["block_reasons"], [])
+        self.assertEqual(loaded.verification_checks[0]["verification_close"], "10.5000")
 
     def test_schema_creation_is_idempotent_sql_only(self) -> None:
         connection = FakeConnection()

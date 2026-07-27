@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping
 from scripts.market_data.manifest import sha256
 
 
-TIDB_SCHEMA_VERSION = "m2-tidb-market-checkpoint-v1"
+TIDB_SCHEMA_VERSION = "m2-tidb-market-checkpoint-v2"
 DEFAULT_ENV_FILE = Path(".env.local")
 
 
@@ -307,6 +307,20 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS m2_history_verification_checks (
+      dataset_id VARCHAR(160) NOT NULL,
+      symbol CHAR(6) NOT NULL,
+      business_date DATE NOT NULL,
+      primary_close DECIMAL(18,4) NOT NULL,
+      verification_close DECIMAL(18,4) NOT NULL,
+      row_sha256 CHAR(64) NOT NULL,
+      published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      PRIMARY KEY (dataset_id, symbol, business_date),
+      KEY idx_m2_verification_business_date (business_date),
+      KEY idx_m2_verification_symbol (symbol)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS m2_adjustment_events (
       dataset_id VARCHAR(160) NOT NULL,
       symbol CHAR(6) NOT NULL,
@@ -448,6 +462,16 @@ ON DUPLICATE KEY UPDATE
 """
 
 
+VERIFICATION_UPSERT = """
+INSERT INTO m2_history_verification_checks (
+  dataset_id, symbol, business_date, primary_close, verification_close, row_sha256
+) VALUES (%s, %s, %s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  primary_close=VALUES(primary_close), verification_close=VALUES(verification_close),
+  row_sha256=VALUES(row_sha256)
+"""
+
+
 CHECKPOINT_UPSERT = """
 INSERT INTO m2_history_symbol_checkpoints (
   dataset_id, symbol, schema_version, mode, shard_index, shard_count, business_start,
@@ -561,6 +585,17 @@ def _reference_rows(dataset_id: str, references: Iterable[Mapping[str, Any]]) ->
     ]
 
 
+def _verification_rows(dataset_id: str, checks: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    return [
+        (
+            dataset_id, row["symbol"], row["business_date"],
+            _decimal_text(row.get("primary_close")), _decimal_text(row.get("verification_close")),
+            sha256(row),
+        )
+        for row in checks
+    ]
+
+
 def _by_symbol(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
     output: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -644,6 +679,7 @@ def publish_historical_evidence(
         "tradeability": _upsert_many(connection, TRADEABILITY_UPSERT, _tradeability_rows(resolved_dataset_id, evidence.tradeability)),
         "adjustments": _upsert_many(connection, ADJUSTMENT_UPSERT, _adjustment_rows(resolved_dataset_id, evidence.adjustments)),
         "references": _upsert_many(connection, REFERENCE_UPSERT, _reference_rows(resolved_dataset_id, evidence.references)),
+        "verification_checks": _upsert_many(connection, VERIFICATION_UPSERT, _verification_rows(resolved_dataset_id, evidence.verification_checks)),
         "symbol_checkpoints": _upsert_many(connection, CHECKPOINT_UPSERT, symbol_checkpoint_rows(resolved_dataset_id, evidence)),
     }
     connection.commit()
@@ -656,3 +692,135 @@ def publish_historical_evidence(
         "counts": counts,
         "simulation_orders_allowed": False,
     }
+
+
+def publish_symbol_checkpoint(
+    connection: Any,
+    evidence: HistoricalEvidence,
+    *,
+    dataset_id: str,
+) -> dict[str, int]:
+    """Atomically persist exactly one fail-closed symbol capture.
+
+    The aggregate run row is intentionally not written here.  A cloud runner may
+    disappear between symbols; the final artifact publisher writes the aggregate
+    manifest only after it exists, while these rows remain resumable checkpoints.
+    """
+    manifest = evidence.manifest
+    if manifest.get("simulation_orders_allowed") is not False:
+        raise RuntimeError("refusing symbol checkpoint without simulation_orders_allowed=false")
+    if manifest.get("authoritative") is not False:
+        raise RuntimeError("refusing authoritative symbol checkpoint")
+    checkpoints = symbol_checkpoint_rows(dataset_id, evidence)
+    if len(checkpoints) != 1:
+        raise ValueError(f"symbol checkpoint requires exactly one symbol, got {len(checkpoints)}")
+    counts = {
+        "bars": _upsert_many(connection, BAR_UPSERT, _bar_rows(dataset_id, evidence.bars)),
+        "tradeability": _upsert_many(connection, TRADEABILITY_UPSERT, _tradeability_rows(dataset_id, evidence.tradeability)),
+        "adjustments": _upsert_many(connection, ADJUSTMENT_UPSERT, _adjustment_rows(dataset_id, evidence.adjustments)),
+        "references": _upsert_many(connection, REFERENCE_UPSERT, _reference_rows(dataset_id, evidence.references)),
+        "verification_checks": _upsert_many(connection, VERIFICATION_UPSERT, _verification_rows(dataset_id, evidence.verification_checks)),
+        "symbol_checkpoints": _upsert_many(connection, CHECKPOINT_UPSERT, checkpoints),
+    }
+    connection.commit()
+    return counts
+
+
+def _query_all(connection: Any, sql: str, params: tuple[Any, ...]) -> list[tuple[Any, ...]]:
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        return list(cursor.fetchall())
+
+
+def _date_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _number_text(value: Any) -> str | None:
+    return None if value is None else format(value, "f")
+
+
+def load_resumable_evidence(connection: Any, dataset_id: str) -> HistoricalEvidence:
+    """Rebuild canonical evidence for successfully captured symbols only."""
+    succeeded_rows = _query_all(
+        connection,
+        "SELECT symbol FROM m2_history_symbol_checkpoints WHERE dataset_id=%s AND status='succeeded' ORDER BY symbol",
+        (dataset_id,),
+    )
+    succeeded = {str(row[0]) for row in succeeded_rows}
+    if not succeeded:
+        return HistoricalEvidence(
+            manifest={"dataset_id": dataset_id, "resumed_symbols": []},
+            bars=[], tradeability=[], adjustments=[], references=[], verification_checks=[],
+        )
+
+    def retained(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+        return [row for row in rows if str(row[0]) in succeeded]
+
+    bars = retained(_query_all(connection, """
+        SELECT symbol, business_date, exchange, index_code, open_price, high, low, close_price,
+               previous_close, volume_shares, amount_cny, turnover_percent, qfq_factor, hfq_factor,
+               qfq_open, qfq_high, qfq_low, qfq_close, hfq_open, hfq_high, hfq_low, hfq_close,
+               primary_source, factor_source, source_schema_version
+        FROM m2_historical_bars WHERE dataset_id=%s ORDER BY symbol, business_date
+    """, (dataset_id,)))
+    facts = retained(_query_all(connection, """
+        SELECT symbol, business_date, index_code, has_primary_bar, has_secondary_status,
+               is_suspended, is_st, listing_age_sessions, limit_rate, limit_up, limit_down,
+               at_limit_up, at_limit_down, one_price_limit_up, one_price_limit_down,
+               can_buy, can_sell, block_reasons_json, source_schema_version
+        FROM m2_tradeability_facts WHERE dataset_id=%s ORDER BY symbol, business_date
+    """, (dataset_id,)))
+    adjustments = retained(_query_all(connection, """
+        SELECT symbol, effective_date, qfq_factor, hfq_factor, source
+        FROM m2_adjustment_events WHERE dataset_id=%s ORDER BY symbol, effective_date
+    """, (dataset_id,)))
+    references = retained(_query_all(connection, """
+        SELECT symbol, exchange, name, ipo_date, out_date, source
+        FROM m2_security_references WHERE dataset_id=%s ORDER BY symbol
+    """, (dataset_id,)))
+    checks = retained(_query_all(connection, """
+        SELECT symbol, business_date, primary_close, verification_close
+        FROM m2_history_verification_checks WHERE dataset_id=%s ORDER BY symbol, business_date
+    """, (dataset_id,)))
+    return HistoricalEvidence(
+        manifest={"dataset_id": dataset_id, "resumed_symbols": sorted(succeeded)},
+        bars=[{
+            "symbol": str(row[0]), "business_date": _date_text(row[1]), "exchange": row[2],
+            "index_code": row[3], "open": _number_text(row[4]), "high": _number_text(row[5]),
+            "low": _number_text(row[6]), "close": _number_text(row[7]),
+            "previous_close": _number_text(row[8]), "volume_shares": int(row[9]),
+            "amount_cny": _number_text(row[10]), "turnover_percent": _number_text(row[11]),
+            "qfq_factor": _number_text(row[12]), "hfq_factor": _number_text(row[13]),
+            "qfq_open": _number_text(row[14]), "qfq_high": _number_text(row[15]),
+            "qfq_low": _number_text(row[16]), "qfq_close": _number_text(row[17]),
+            "hfq_open": _number_text(row[18]), "hfq_high": _number_text(row[19]),
+            "hfq_low": _number_text(row[20]), "hfq_close": _number_text(row[21]),
+            "primary_source": row[22], "factor_source": row[23], "schema_version": row[24],
+        } for row in bars],
+        tradeability=[{
+            "symbol": str(row[0]), "business_date": _date_text(row[1]), "index_code": row[2],
+            "has_primary_bar": bool(row[3]), "has_secondary_status": bool(row[4]),
+            "is_suspended": bool(row[5]), "is_st": None if row[6] is None else bool(row[6]),
+            "listing_age_sessions": int(row[7]), "limit_rate": _number_text(row[8]),
+            "limit_up": _number_text(row[9]), "limit_down": _number_text(row[10]),
+            "at_limit_up": bool(row[11]), "at_limit_down": bool(row[12]),
+            "one_price_limit_up": bool(row[13]), "one_price_limit_down": bool(row[14]),
+            "can_buy": bool(row[15]), "can_sell": bool(row[16]),
+            "block_reasons": json.loads(row[17]), "schema_version": row[18],
+        } for row in facts],
+        adjustments=[{
+            "symbol": str(row[0]), "effective_date": _date_text(row[1]),
+            "qfq_factor": _number_text(row[2]), "hfq_factor": _number_text(row[3]), "source": row[4],
+        } for row in adjustments],
+        references=[{
+            "symbol": str(row[0]), "exchange": row[1], "name": row[2],
+            "ipo_date": _date_text(row[3]), "out_date": _date_text(row[4]), "source": row[5],
+        } for row in references],
+        verification_checks=[{
+            "symbol": str(row[0]), "business_date": _date_text(row[1]),
+            "primary_close": _number_text(row[2]), "verification_close": _number_text(row[3]),
+        } for row in checks],
+    )

@@ -11,6 +11,7 @@ from scripts.market_data.historical_contracts import HistoricalBar, SecurityRefe
 from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
 from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
+from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
 
@@ -148,6 +149,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
         ):
             plan = build_plan(date(2026, 7, 16), "preflight")
+            repeated_plan = build_plan(date(2026, 7, 16), "preflight")
         self.assertEqual(plan["shard_count"], 10)
         self.assertEqual(plan["symbol_count"], 100)
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
@@ -157,6 +159,8 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertNotEqual(plan["calendar_source"]["primary_calendar_sha256"], plan["calendar_source"]["secondary_calendar_sha256"])
         self.assertEqual(plan["csi_discovered_notice_ids"], [11518])
         self.assertEqual(plan["csi_event_index_source"]["accepted_manifest_event_sha256"], "fixture")
+        self.assertEqual(len(plan["checkpoint_scope_sha256"]), 64)
+        self.assertEqual(plan["checkpoint_scope_sha256"], repeated_plan["checkpoint_scope_sha256"])
 
     def test_akshare_history_falls_back_to_eastmoney_when_sina_is_empty(self) -> None:
         fallback_row = DailyBar(
@@ -317,6 +321,68 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(len(adjustments), 1)
         self.assertEqual(len(references), 1)
         self.assertEqual(len(close_checks), 3)
+
+        resume_evidence = HistoricalEvidence(
+            manifest={"resumed_symbols": ["600519"]},
+            bars=[row.canonical() for row in bars],
+            tradeability=[row.canonical() for row in facts],
+            adjustments=[row.canonical() for row in adjustments],
+            references=[row.canonical() for row in references],
+            verification_checks=[{
+                "symbol": symbol, "business_date": business_date.isoformat(),
+                "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
+            } for symbol, business_date, primary, verification in close_checks],
+        )
+
+        class ResumeMustNotFetchPrimary:
+            def __init__(self, timeout_seconds: float = 30.0, attempts: int = 5) -> None:
+                pass
+
+            def fetch_bundle(self, symbol: str, start: date, end: date):
+                raise AssertionError("successfully checkpointed symbol must not be fetched again")
+
+        with (
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+            patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", ResumeMustNotFetchPrimary),
+            patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("complete verification checkpoint must be reused")),
+        ):
+            resumed_manifest, resumed_bars, resumed_facts, resumed_adjustments, resumed_references, resumed_checks = run(
+                date(2026, 7, 22), mode="sample", current_universe=current,
+                primary_calendar=calendar, secondary_calendar=calendar,
+                resume_evidence=resume_evidence,
+            )
+        self.assertEqual(resumed_manifest["resumed_symbol_count"], 1)
+        self.assertEqual(resumed_manifest["acquired_symbol_count"], 0)
+        self.assertEqual([row.canonical() for row in resumed_bars], [row.canonical() for row in bars])
+        self.assertEqual([row.canonical() for row in resumed_facts], [row.canonical() for row in facts])
+        self.assertEqual([row.canonical() for row in resumed_adjustments], [row.canonical() for row in adjustments])
+        self.assertEqual([row.canonical() for row in resumed_references], [row.canonical() for row in references])
+        self.assertEqual(resumed_checks, close_checks)
+
+        incomplete_verification = HistoricalEvidence(
+            manifest=resume_evidence.manifest,
+            bars=resume_evidence.bars,
+            tradeability=resume_evidence.tradeability,
+            adjustments=resume_evidence.adjustments,
+            references=resume_evidence.references,
+            verification_checks=resume_evidence.verification_checks[:1],
+        )
+        verification_rows = list(FakePrimarySource().fetch_raw("600519", date(2026, 7, 20), date(2026, 7, 22)))
+        with (
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+            patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", ResumeMustNotFetchPrimary),
+            patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows}, {})),
+        ):
+            refreshed_manifest, _bars, _facts, _adjustments, _references, refreshed_checks = run(
+                date(2026, 7, 22), mode="sample", current_universe=current,
+                primary_calendar=calendar, secondary_calendar=calendar,
+                resume_evidence=incomplete_verification,
+            )
+        cross_source_gate = next(gate for gate in refreshed_manifest["gates"] if gate["name"] == "historical_cross_source_coverage")
+        self.assertTrue(cross_source_gate["passed"])
+        self.assertEqual(refreshed_checks, close_checks)
 
 
 if __name__ == "__main__":
