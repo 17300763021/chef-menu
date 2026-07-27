@@ -12,6 +12,80 @@ from scripts.market_data.quality_gates import GateResult
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 
 
+def evaluate_active_coverage(
+    expected_keys: set[tuple[str, date]],
+    observed_keys: set[tuple[str, date]],
+    suspended_keys: set[tuple[str, date]],
+    *,
+    critical: bool = True,
+) -> GateResult:
+    """Evaluate coverage over the complete business scope, excluding confirmed suspensions only."""
+    active_expected = expected_keys - suspended_keys
+    observed_active = observed_keys & active_expected
+    coverage_bps = len(observed_active) * 10000 // max(1, len(active_expected))
+    missing = sorted(active_expected - observed_keys)
+    return GateResult(
+        "historical_active_coverage",
+        bool(active_expected) and coverage_bps >= 9800,
+        f"{len(observed_active)}/{len(active_expected)} ({coverage_bps / 100:.2f}%)",
+        ">= 98.00%",
+        critical=critical,
+        details=tuple(f"{symbol}:{business_date}" for symbol, business_date in missing[:20]),
+    )
+
+
+def evaluate_adjustment_alignment(
+    bars: Iterable[tuple[str, date, Decimal, Decimal, Decimal]],
+    adjustments: Iterable[tuple[str, date, Decimal, Decimal]],
+    *,
+    critical: bool = True,
+) -> GateResult:
+    """Evaluate corporate-action adjustment continuity at shard or merged scope."""
+    bars_by_symbol: dict[str, list[tuple[date, Decimal, Decimal, Decimal]]] = {}
+    for symbol, business_date, raw_close, qfq_close, hfq_close in bars:
+        bars_by_symbol.setdefault(symbol, []).append((business_date, raw_close, qfq_close, hfq_close))
+    for rows in bars_by_symbol.values():
+        rows.sort(key=lambda value: value[0])
+
+    factor_change_events: list[tuple[str, date, Decimal, Decimal]] = []
+    previous_factors: dict[str, tuple[Decimal, Decimal]] = {}
+    for symbol, effective_date, qfq_factor, hfq_factor in sorted(adjustments, key=lambda value: (value[0], value[1])):
+        factors = (qfq_factor, hfq_factor)
+        previous = previous_factors.get(symbol)
+        if previous is None or factors != previous:
+            factor_change_events.append((symbol, effective_date, qfq_factor, hfq_factor))
+        previous_factors[symbol] = factors
+
+    eligible_events = 0
+    aligned_events = 0
+    unaligned_events: list[str] = []
+    for symbol, effective_date, _, _ in factor_change_events:
+        rows = bars_by_symbol.get(symbol, [])
+        if len(rows) < 2 or not (rows[0][0] < effective_date <= rows[-1][0]):
+            continue
+        position = next((index for index, row in enumerate(rows) if row[0] >= effective_date), None)
+        if position is None or position == 0:
+            continue
+        eligible_events += 1
+        previous, current = rows[position - 1], rows[position]
+        raw_return = current[1] / previous[1] - Decimal("1")
+        qfq_return = current[2] / previous[2] - Decimal("1")
+        hfq_return = current[3] / previous[3] - Decimal("1")
+        if max(abs(qfq_return - raw_return), abs(hfq_return - raw_return)) > Decimal("0.00001"):
+            aligned_events += 1
+        else:
+            unaligned_events.append(f"{symbol}:{effective_date}")
+    event_alignment_bps = aligned_events * 10000 // max(1, eligible_events)
+    return GateResult(
+        "corporate_action_adjustment_spot_check",
+        eligible_events > 0 and event_alignment_bps >= 9500,
+        f"{aligned_events}/{eligible_events} ({event_alignment_bps / 100:.2f}%)",
+        ">= 95.00% factor-change action dates show adjusted/raw discontinuity correction",
+        critical=critical,
+        details=tuple(unaligned_events[:20]),
+    )
+
+
 def evaluate_cross_source(
     close_checks: Iterable[tuple[str, date, Decimal, Decimal]],
     verification_expected: int,
@@ -56,6 +130,7 @@ def evaluate_historical(
     close_checks: Iterable[tuple[str, date, Decimal, Decimal]],
     verification_expected: int,
     cross_source_critical: bool = True,
+    aggregate_critical: bool = True,
 ) -> list[GateResult]:
     bar_rows = list(bars)
     fact_rows = list(facts)
@@ -79,11 +154,14 @@ def evaluate_historical(
     results.append(GateResult("historical_nonnegative_units", not invalid_units, len(invalid_units), "= 0", details=tuple(invalid_units[:20])))
 
     fact_map = {(row.symbol, row.business_date): row for row in fact_rows}
-    active_expected = {key for key in expected_keys if not fact_map.get(key) or not fact_map[key].is_suspended}
     observed = {row.key for row in bar_rows}
-    coverage_bps = len(observed & active_expected) * 10000 // max(1, len(active_expected))
-    missing = sorted(active_expected - observed)
-    results.append(GateResult("historical_active_coverage", coverage_bps >= 9800, f"{coverage_bps / 100:.2f}%", ">= 98.00%", details=tuple(f"{s}:{d}" for s, d in missing[:20])))
+    suspended = {key for key, row in fact_map.items() if row.is_suspended}
+    results.append(evaluate_active_coverage(
+        expected_keys,
+        observed,
+        suspended,
+        critical=aggregate_critical,
+    ))
     fact_coverage_bps = len(set(fact_map) & expected_keys) * 10000 // max(1, len(expected_keys))
     results.append(GateResult("tradeability_fact_coverage", fact_coverage_bps == 10000, f"{fact_coverage_bps / 100:.2f}%", "= 100.00%"))
 
@@ -107,45 +185,16 @@ def evaluate_historical(
         details=tuple(invalid_adjusted[:20]),
     ))
 
-    bars_by_symbol: dict[str, list[HistoricalBar]] = {}
-    for row in bar_rows:
-        bars_by_symbol.setdefault(row.symbol, []).append(row)
-    for rows in bars_by_symbol.values():
-        rows.sort(key=lambda value: value.business_date)
-    eligible_events = 0
-    aligned_events = 0
-    unaligned_events: list[str] = []
-    factor_change_events: list[AdjustmentEvent] = []
-    previous_factors: dict[str, tuple[Decimal, Decimal]] = {}
-    for event in sorted(adjustment_rows, key=lambda value: (value.symbol, value.effective_date)):
-        factors = (event.qfq_factor, event.hfq_factor)
-        previous = previous_factors.get(event.symbol)
-        if previous is None or factors != previous:
-            factor_change_events.append(event)
-        previous_factors[event.symbol] = factors
-    for event in factor_change_events:
-        rows = bars_by_symbol.get(event.symbol, [])
-        if len(rows) < 2 or not (rows[0].business_date < event.effective_date <= rows[-1].business_date):
-            continue
-        position = next((index for index, row in enumerate(rows) if row.business_date >= event.effective_date), None)
-        if position is None or position == 0:
-            continue
-        eligible_events += 1
-        previous, current = rows[position - 1], rows[position]
-        raw_return = current.close / previous.close - Decimal("1")
-        qfq_return = current.qfq_close / previous.qfq_close - Decimal("1")
-        hfq_return = current.hfq_close / previous.hfq_close - Decimal("1")
-        if max(abs(qfq_return - raw_return), abs(hfq_return - raw_return)) > Decimal("0.00001"):
-            aligned_events += 1
-        else:
-            unaligned_events.append(f"{event.symbol}:{event.effective_date}")
-    event_alignment_bps = aligned_events * 10000 // max(1, eligible_events)
-    results.append(GateResult(
-        "corporate_action_adjustment_spot_check",
-        eligible_events > 0 and event_alignment_bps >= 9500,
-        f"{aligned_events}/{eligible_events} ({event_alignment_bps / 100:.2f}%)",
-        ">= 95.00% factor-change action dates show adjusted/raw discontinuity correction",
-        details=tuple(unaligned_events[:20]),
+    results.append(evaluate_adjustment_alignment(
+        (
+            (row.symbol, row.business_date, row.close, row.qfq_close, row.hfq_close)
+            for row in bar_rows
+        ),
+        (
+            (event.symbol, event.effective_date, event.qfq_factor, event.hfq_factor)
+            for event in adjustment_rows
+        ),
+        critical=aggregate_critical,
     ))
 
     common_blocks = {"missing_primary_bar", "missing_secondary_status", "suspended", "unknown_st_status"}

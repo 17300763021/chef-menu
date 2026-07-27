@@ -486,6 +486,7 @@ def run(
         expected_keys=set(expected), calendar_dates=set(sessions), bars=bars, facts=facts,
         adjustments=adjustments, close_checks=close_checks, verification_expected=verification_expected,
         cross_source_critical=shard_count == 1,
+        aggregate_critical=shard_count == 1,
     )
     gates = [*calendar_gates, *universe_gates, *historical_gates]
     if checkpoint_callback is not None:

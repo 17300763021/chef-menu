@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from scripts.market_data.historical_bars import _write_gzip
-from scripts.market_data.historical_quality_gates import evaluate_cross_source
+from scripts.market_data.historical_quality_gates import (
+    evaluate_active_coverage,
+    evaluate_adjustment_alignment,
+    evaluate_cross_source,
+)
 from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted as gates_accepted
 
@@ -84,6 +88,44 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         and len(verification_symbols) == len(set(verification_symbols))
         and sha256(verification_symbols) == manifests[0].get("global_verification_symbols_sha256")
     )
+    expected_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in facts
+    }
+    observed_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in bars
+    }
+    suspended_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in facts
+        if row.get("is_suspended", False)
+    }
+    aggregate_gates = [
+        evaluate_active_coverage(expected_scope, observed_scope, suspended_scope),
+        evaluate_adjustment_alignment(
+            (
+                (
+                    row["symbol"],
+                    date.fromisoformat(row["business_date"]),
+                    Decimal(row["close"]),
+                    Decimal(row["qfq_close"]),
+                    Decimal(row["hfq_close"]),
+                )
+                for row in bars
+            ),
+            (
+                (
+                    row["symbol"],
+                    date.fromisoformat(row["effective_date"]),
+                    Decimal(row["qfq_factor"]),
+                    Decimal(row["hfq_factor"]),
+                )
+                for row in adjustments
+            ),
+        ),
+    ]
+    aggregate_accepted = gates_accepted(aggregate_gates)
     cross_source_gates = evaluate_cross_source(
         [
             (
@@ -95,15 +137,26 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         verification_expected,
     )
     cross_source_accepted = verification_reconciles and verification_inventory_ok and gates_accepted(cross_source_gates)
-    accepted = consistent and inventory_ok and all_shards_accepted and no_duplicates and expected_reconciles and cross_source_accepted
+    accepted = (
+        consistent
+        and inventory_ok
+        and all_shards_accepted
+        and no_duplicates
+        and expected_reconciles
+        and aggregate_accepted
+        and cross_source_accepted
+    )
     result = {
-        "manifest_version": "m2-historical-market-merged-manifest-v1",
+        "manifest_version": "m2-historical-market-merged-manifest-v2",
         "authoritative": False, "simulation_orders_allowed": False,
         "mode": manifests[0]["mode"], "business_end": manifests[0]["business_end"],
         "shard_count": shard_count, "global_symbol_count": manifests[0]["global_symbol_count"],
         "global_expected_key_count": manifests[0]["global_expected_key_count"],
         "bar_count": len(bars), "tradeability_count": len(facts),
         "adjustment_event_count": len(adjustments), "reference_count": len(references),
+        "confirmed_suspension_count": len(suspended_scope),
+        "unknown_status_count": sum(not row.get("has_secondary_status", False) for row in facts),
+        "missing_active_bar_count": len((expected_scope - suspended_scope) - observed_scope),
         "verification_expected_count": verification_expected,
         "verification_check_count": len(verification_checks),
         "bars_sha256": sha256(bars), "tradeability_sha256": sha256(facts),
@@ -114,10 +167,12 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
             "consistent_shard_metadata": consistent, "complete_shard_inventory": inventory_ok,
             "all_shards_accepted": all_shards_accepted, "no_cross_shard_duplicates": no_duplicates,
             "expected_counts_reconcile": expected_reconciles,
+            "global_aggregate_accepted": aggregate_accepted,
             "verification_counts_reconcile": verification_reconciles,
             "verification_symbol_inventory_reconciles": verification_inventory_ok,
             "cross_source_accepted": cross_source_accepted,
         },
+        "global_aggregate_gates": [gate.canonical() for gate in aggregate_gates],
         "cross_source_gates": [gate.canonical() for gate in cross_source_gates],
         "shard_manifests": manifests,
     }

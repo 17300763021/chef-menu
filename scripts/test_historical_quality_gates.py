@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
-from scripts.market_data.historical_quality_gates import evaluate_historical
+from scripts.market_data.historical_quality_gates import evaluate_active_coverage, evaluate_historical
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 
@@ -64,19 +64,44 @@ class HistoricalQualityGateTests(unittest.TestCase):
         self.assertTrue(gate.passed)
         self.assertEqual(gate.actual, "1/1 (100.00%)")
 
-    def test_shard_defers_empty_cross_source_sample_to_merge(self) -> None:
+    def test_shard_defers_aggregate_and_cross_source_gates_to_merge(self) -> None:
         days = (date(2026, 6, 11), date(2026, 6, 12))
-        rows = [bar(days[0], "100", "100"), bar(days[1], "95", "100")]
+        rows = [bar(days[0], "100", "100")]
         gates = evaluate_historical(
             expected_keys={("600519", day) for day in days}, calendar_dates=set(days),
             bars=rows, facts=[fact(day) for day in days],
-            adjustments=[AdjustmentEvent.build("600519", days[1], "0.95", "1.05")],
-            close_checks=[], verification_expected=0, cross_source_critical=False,
+            adjustments=[], close_checks=[], verification_expected=0,
+            cross_source_critical=False, aggregate_critical=False,
         )
         by_name = {gate.name: gate for gate in gates}
+        self.assertFalse(by_name["historical_active_coverage"].passed)
+        self.assertFalse(by_name["historical_active_coverage"].critical)
+        self.assertFalse(by_name["corporate_action_adjustment_spot_check"].passed)
+        self.assertFalse(by_name["corporate_action_adjustment_spot_check"].critical)
         self.assertFalse(by_name["historical_cross_source_coverage"].passed)
         self.assertFalse(by_name["historical_cross_source_coverage"].critical)
         self.assertTrue(accepted(gates))
+
+    def test_active_coverage_excludes_only_confirmed_suspensions(self) -> None:
+        start = date(2026, 1, 1)
+        expected = {("600519", start + timedelta(days=offset)) for offset in range(100)}
+        confirmed_suspension = ("600519", start + timedelta(days=98))
+        unknown_status = ("600519", start + timedelta(days=99))
+        observed = expected - {confirmed_suspension, unknown_status}
+
+        gate = evaluate_active_coverage(expected, observed, {confirmed_suspension})
+
+        self.assertTrue(gate.passed)
+        self.assertEqual(gate.actual, "98/99 (98.98%)")
+        self.assertEqual(gate.details, (f"{unknown_status[0]}:{unknown_status[1]}",))
+
+    def test_active_coverage_enforces_exact_global_threshold(self) -> None:
+        start = date(2026, 1, 1)
+        expected = {("600519", start + timedelta(days=offset)) for offset in range(100)}
+        ordered = sorted(expected)
+
+        self.assertTrue(evaluate_active_coverage(expected, set(ordered[:98]), set()).passed)
+        self.assertFalse(evaluate_active_coverage(expected, set(ordered[:97]), set()).passed)
 
 
 if __name__ == "__main__":
