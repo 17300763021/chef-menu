@@ -302,7 +302,7 @@ jobs:
           --input-dir downloaded-shards
           --output-dir historical-market-acceptance
       - name: Publish merged accepted evidence to TiDB
-        if: always() && inputs.publish_tidb
+        if: success() && inputs.publish_tidb
         env:
           TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-merged
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
@@ -316,13 +316,12 @@ jobs:
           --input-dir historical-market-acceptance
           --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
           --init-schema
-          --allow-unaccepted-checkpoint
-          --missing-input-ok
+          --manifest-only
       - name: Upload merged non-authoritative evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: m2-history-merged-${{ github.run_id }}-${{ needs.plan.outputs.mode }}
-          path: historical-market-acceptance/*
+          path: historical-market-acceptance/manifest.json
           if-no-files-found: warn
           retention-days: 30

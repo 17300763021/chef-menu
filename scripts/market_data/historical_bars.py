@@ -497,6 +497,7 @@ def run(
     canonical_bars = [row.canonical() for row in sorted(bars, key=lambda value: value.key)]
     canonical_facts = [row.canonical() for row in sorted(facts, key=lambda value: (value.symbol, value.business_date))]
     canonical_adjustments = [row.canonical() for row in sorted(adjustments, key=lambda value: (value.symbol, value.effective_date))]
+    canonical_references = [row.canonical() for row in sorted(references, key=lambda value: value.symbol)]
     canonical_close_checks = [
         {
             "symbol": symbol, "business_date": business_date.isoformat(),
@@ -525,7 +526,7 @@ def run(
         "verification_expected_count": verification_expected,
         "verification_check_count": len(close_checks),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
-        "adjustment_event_count": len(adjustments),
+        "adjustment_event_count": len(adjustments), "reference_count": len(references),
         "primary_source": "akshare_historical_bundle",
         "primary_source_role": "per-symbol single-mouth historical raw/qfq/hfq source",
         "primary_sources_by_symbol": dict(sorted(primary_sources_by_symbol.items())),
@@ -544,6 +545,7 @@ def run(
         "source_versions": {"akshare": version("akshare")},
         "bars_sha256": sha256(canonical_bars), "tradeability_sha256": sha256(canonical_facts),
         "adjustments_sha256": sha256(canonical_adjustments),
+        "references_sha256": sha256(canonical_references),
         "verification_checks_sha256": sha256(canonical_close_checks), "accepted": accepted(gates),
         "gates": [gate.canonical() for gate in gates],
     }

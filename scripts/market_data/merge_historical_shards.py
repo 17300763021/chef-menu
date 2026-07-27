@@ -52,13 +52,32 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
     adjustments: list[dict[str, Any]] = []
     references: list[dict[str, Any]] = []
     verification_checks: list[dict[str, Any]] = []
+    shard_content_hashes_reconcile = True
     for manifest_path in sorted(input_dir.rglob("manifest.json")):
         parent = manifest_path.parent
-        bars.extend(_read_json(parent / "historical-bars.json.gz"))
-        facts.extend(_read_json(parent / "tradeability.json.gz"))
-        adjustments.extend(_read_json(parent / "adjustment-events.json.gz"))
-        references.extend(_read_json(parent / "security-references.json"))
-        verification_checks.extend(_read_json(parent / "verification-checks.json.gz"))
+        shard_manifest = _read_json(manifest_path)
+        shard_bars = _read_json(parent / "historical-bars.json.gz")
+        shard_facts = _read_json(parent / "tradeability.json.gz")
+        shard_adjustments = _read_json(parent / "adjustment-events.json.gz")
+        shard_references = _read_json(parent / "security-references.json")
+        shard_verifications = _read_json(parent / "verification-checks.json.gz")
+        shard_content_hashes_reconcile = shard_content_hashes_reconcile and all((
+            shard_manifest.get("bar_count") == len(shard_bars),
+            shard_manifest.get("tradeability_count") == len(shard_facts),
+            shard_manifest.get("adjustment_event_count") == len(shard_adjustments),
+            shard_manifest.get("reference_count") == len(shard_references),
+            shard_manifest.get("verification_check_count") == len(shard_verifications),
+            shard_manifest.get("bars_sha256") == sha256(shard_bars),
+            shard_manifest.get("tradeability_sha256") == sha256(shard_facts),
+            shard_manifest.get("adjustments_sha256") == sha256(shard_adjustments),
+            shard_manifest.get("references_sha256") == sha256(shard_references),
+            shard_manifest.get("verification_checks_sha256") == sha256(shard_verifications),
+        ))
+        bars.extend(shard_bars)
+        facts.extend(shard_facts)
+        adjustments.extend(shard_adjustments)
+        references.extend(shard_references)
+        verification_checks.extend(shard_verifications)
 
     bars.sort(key=lambda row: (row["symbol"], row["business_date"]))
     facts.sort(key=lambda row: (row["symbol"], row["business_date"]))
@@ -141,6 +160,7 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         consistent
         and inventory_ok
         and all_shards_accepted
+        and shard_content_hashes_reconcile
         and no_duplicates
         and expected_reconciles
         and aggregate_accepted
@@ -166,6 +186,7 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         "merge_checks": {
             "consistent_shard_metadata": consistent, "complete_shard_inventory": inventory_ok,
             "all_shards_accepted": all_shards_accepted, "no_cross_shard_duplicates": no_duplicates,
+            "shard_content_hashes_reconcile": shard_content_hashes_reconcile,
             "expected_counts_reconcile": expected_reconciles,
             "global_aggregate_accepted": aggregate_accepted,
             "verification_counts_reconcile": verification_reconciles,

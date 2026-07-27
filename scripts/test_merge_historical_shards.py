@@ -101,6 +101,9 @@ def _write_run(
             encoding="utf-8",
         )
         manifest = {
+            "manifest_version": "m2-historical-market-manifest-v1",
+            "authoritative": False,
+            "simulation_orders_allowed": False,
             "accepted": acceptance[index],
             "shard_index": index,
             "shard_count": shard_count,
@@ -110,8 +113,17 @@ def _write_run(
             "mode": "preflight",
             "expected_key_count": expected_count,
             "bar_count": bar_count,
+            "tradeability_count": expected_count,
+            "adjustment_event_count": len(adjustments),
+            "reference_count": 1,
             "verification_expected_count": 1,
             "verification_check_count": 1,
+            "checkpoint_dataset_id": f"test-shard-{index}",
+            "bars_sha256": sha256(bars),
+            "tradeability_sha256": sha256(facts),
+            "adjustments_sha256": sha256(adjustments),
+            "references_sha256": sha256([{"symbol": symbol}]),
+            "verification_checks_sha256": sha256(verification_checks),
             "global_verification_symbol_count": shard_count,
             "global_verification_symbols_sha256": sha256(verification_symbols),
             "verification_symbols": [symbol],
@@ -214,6 +226,17 @@ class MergeHistoricalShardsTests(unittest.TestCase):
 
             self.assertFalse(result["accepted"])
             self.assertFalse(result["merge_checks"]["all_shards_accepted"])
+
+    def test_merge_fails_closed_when_a_shard_file_does_not_match_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shards = _write_run(root, expected_counts=[2], bar_counts=[2])
+            _write_gzip(shards[0] / "historical-bars.json.gz", [])
+
+            result = merge(root / "input", root / "output")
+
+            self.assertFalse(result["accepted"])
+            self.assertFalse(result["merge_checks"]["shard_content_hashes_reconcile"])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from scripts.market_data.tidb_checkpoint_store import (
     default_dataset_id,
     ensure_schema,
     load_historical_evidence,
+    load_historical_manifest,
     publish_historical_evidence,
 )
 
@@ -24,6 +25,11 @@ def main() -> int:
     parser.add_argument("--dataset-id")
     parser.add_argument("--init-schema", action="store_true")
     parser.add_argument("--allow-unaccepted-checkpoint", action="store_true")
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Publish an accepted merged manifest and physical-shard mappings without duplicating market rows",
+    )
     parser.add_argument("--missing-input-ok", action="store_true")
     parser.add_argument("--publish-attempts", type=int, default=3)
     args = parser.parse_args()
@@ -40,7 +46,7 @@ def main() -> int:
             return 0
         raise FileNotFoundError(f"missing manifest under {args.input_dir}")
 
-    evidence = load_historical_evidence(args.input_dir)
+    evidence = load_historical_manifest(args.input_dir) if args.manifest_only else load_historical_evidence(args.input_dir)
     dataset_id = args.dataset_id or default_dataset_id(evidence.manifest)
     config = TiDBConfig.from_env()
     result = None
@@ -56,6 +62,7 @@ def main() -> int:
                 evidence,
                 dataset_id=dataset_id,
                 allow_unaccepted_checkpoint=args.allow_unaccepted_checkpoint,
+                manifest_only=args.manifest_only,
             )
             break
         except Exception as error:

@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from scripts.market_data.historical_bars import _write_gzip
+from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import (
     HistoricalEvidence,
     TiDBConfig,
@@ -16,7 +17,9 @@ from scripts.market_data.tidb_checkpoint_store import (
     default_dataset_id,
     ensure_schema,
     load_historical_evidence,
+    load_historical_manifest,
     load_resumable_evidence,
+    merged_shard_rows,
     publish_historical_evidence,
     publish_symbol_checkpoint,
     symbol_checkpoint_rows,
@@ -57,6 +60,48 @@ class FakeConnection:
 
     def query_result(self, sql: str):
         return []
+
+
+class PhysicalShardConnection(FakeConnection):
+    def __init__(self, evidence: HistoricalEvidence, *, omit_dataset_id: str | None = None) -> None:
+        super().__init__()
+        self.evidence = evidence
+        self.omit_dataset_id = omit_dataset_id
+
+    def query_result(self, sql: str):
+        if "FROM m2_history_runs" not in sql:
+            return []
+        rows = []
+        for shard in self.evidence.manifest["shard_manifests"]:
+            dataset_id = shard["checkpoint_dataset_id"]
+            if dataset_id == self.omit_dataset_id:
+                continue
+            rows.append((
+                dataset_id,
+                shard["mode"],
+                shard["business_end"],
+                shard["shard_index"],
+                shard["shard_count"],
+                0,
+                0,
+                1,
+                shard["global_symbol_count"],
+                shard["global_expected_key_count"],
+                shard["symbol_count"],
+                shard["expected_key_count"],
+                shard["bar_count"],
+                shard["tradeability_count"],
+                shard["adjustment_event_count"],
+                shard["reference_count"],
+                shard["verification_check_count"],
+                shard["bars_sha256"],
+                shard["tradeability_sha256"],
+                shard["adjustments_sha256"],
+                shard["references_sha256"],
+                shard["verification_checks_sha256"],
+                sha256(shard),
+            ))
+        return rows
 
 
 def sample_evidence(*, accepted: bool = True) -> HistoricalEvidence:
@@ -118,6 +163,79 @@ def sample_evidence(*, accepted: bool = True) -> HistoricalEvidence:
             "symbol": "000001", "exchange": "SZSE", "name": "Ping An Bank",
             "ipo_date": "1991-04-03", "out_date": None, "source": "akshare_eastmoney",
         }],
+        verification_checks=[],
+    )
+
+
+def merged_manifest_evidence() -> HistoricalEvidence:
+    merge_checks = {
+        "consistent_shard_metadata": True,
+        "complete_shard_inventory": True,
+        "all_shards_accepted": True,
+        "shard_content_hashes_reconcile": True,
+        "no_cross_shard_duplicates": True,
+        "expected_counts_reconcile": True,
+        "global_aggregate_accepted": True,
+        "verification_counts_reconcile": True,
+        "verification_symbol_inventory_reconciles": True,
+        "cross_source_accepted": True,
+    }
+    shards = []
+    for index in range(2):
+        shards.append({
+            "manifest_version": "m2-historical-market-manifest-v1",
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "accepted": True,
+            "mode": "preflight",
+            "history_start": "2018-01-01",
+            "business_end": "2026-07-24",
+            "shard_index": index,
+            "shard_count": 2,
+            "global_symbol_count": 20,
+            "global_expected_key_count": 200,
+            "symbol_count": 10,
+            "expected_key_count": 100,
+            "bar_count": 99,
+            "tradeability_count": 100,
+            "adjustment_event_count": 3,
+            "reference_count": 10,
+            "verification_check_count": 8,
+            "checkpoint_dataset_id": f"physical-shard-{index}",
+            "bars_sha256": "a" * 64,
+            "tradeability_sha256": "b" * 64,
+            "adjustments_sha256": "c" * 64,
+            "references_sha256": "d" * 64,
+            "verification_checks_sha256": "e" * 64,
+        })
+    return HistoricalEvidence(
+        manifest={
+            "manifest_version": "m2-historical-market-merged-manifest-v2",
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "accepted": True,
+            "mode": "preflight",
+            "business_end": "2026-07-24",
+            "shard_count": 2,
+            "global_symbol_count": 20,
+            "global_expected_key_count": 200,
+            "bar_count": 198,
+            "tradeability_count": 200,
+            "adjustment_event_count": 6,
+            "reference_count": 20,
+            "verification_check_count": 16,
+            "bars_sha256": "1" * 64,
+            "tradeability_sha256": "2" * 64,
+            "adjustments_sha256": "3" * 64,
+            "references_sha256": "4" * 64,
+            "verification_checks_sha256": "5" * 64,
+            "merge_checks": merge_checks,
+            "shard_manifests": shards,
+        },
+        bars=[],
+        tradeability=[],
+        adjustments=[],
+        references=[],
         verification_checks=[],
     )
 
@@ -247,6 +365,112 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(connection.executed), 6)
         self.assertEqual(connection.commits, 1)
         self.assertTrue(all("CREATE TABLE IF NOT EXISTS" in sql for sql, _ in connection.executed))
+        self.assertTrue(any("m2_history_run_shards" in sql for sql, _ in connection.executed))
+
+    def test_manifest_only_publish_maps_shards_without_duplicate_market_rows(self) -> None:
+        evidence = merged_manifest_evidence()
+        connection = PhysicalShardConnection(evidence)
+        result = publish_historical_evidence(
+            connection,
+            evidence,
+            dataset_id="logical-merged",
+            manifest_only=True,
+        )
+
+        self.assertEqual(result["storage_mode"], "manifest_only_shards")
+        self.assertEqual(result["counts"], {
+            "runs": 1,
+            "shard_mappings": 2,
+            "bars": 0,
+            "tradeability": 0,
+            "adjustments": 0,
+            "references": 0,
+            "verification_checks": 0,
+            "symbol_checkpoints": 0,
+        })
+        run_params = next(params for sql, params in connection.executed if "INSERT INTO m2_history_runs" in sql)
+        self.assertEqual(run_params[13:20], (20, 200, 198, 200, 6, 20, 16))
+        self.assertEqual(len(connection.executed_many), 1)
+        mapping_sql, mapping_rows = connection.executed_many[0]
+        self.assertIn("m2_history_run_shards", mapping_sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", mapping_sql)
+        self.assertEqual([row[1] for row in mapping_rows], ["physical-shard-0", "physical-shard-1"])
+        self.assertFalse(any("m2_historical_bars" in sql for sql, _rows in connection.executed_many))
+
+    def test_manifest_only_publish_is_idempotent_upsert(self) -> None:
+        evidence = merged_manifest_evidence()
+        connection = PhysicalShardConnection(evidence)
+        for _ in range(2):
+            publish_historical_evidence(
+                connection,
+                evidence,
+                dataset_id="logical-merged",
+                manifest_only=True,
+            )
+        self.assertEqual(connection.commits, 2)
+        self.assertEqual(len(connection.executed), 4)
+        self.assertEqual(len(connection.executed_many), 2)
+        self.assertTrue(all(len(rows) == 2 for _sql, rows in connection.executed_many))
+
+    def test_manifest_only_publish_fails_closed_on_incomplete_or_mismatched_inventory(self) -> None:
+        missing_id = merged_manifest_evidence()
+        missing_id.manifest["shard_manifests"][0].pop("checkpoint_dataset_id")
+        with self.assertRaisesRegex(RuntimeError, "checkpoint_dataset_id"):
+            merged_shard_rows("logical", missing_id.manifest)
+
+        mismatched_count = merged_manifest_evidence()
+        mismatched_count.manifest["bar_count"] = 199
+        with self.assertRaisesRegex(RuntimeError, "logical counts"):
+            merged_shard_rows("logical", mismatched_count.manifest)
+
+        duplicate_index = merged_manifest_evidence()
+        duplicate_index.manifest["shard_manifests"][1]["shard_index"] = 0
+        with self.assertRaisesRegex(RuntimeError, "indices"):
+            merged_shard_rows("logical", duplicate_index.manifest)
+
+    def test_manifest_only_publish_requires_all_acceptance_boundaries(self) -> None:
+        unaccepted = merged_manifest_evidence()
+        unaccepted.manifest["accepted"] = False
+        with self.assertRaisesRegex(RuntimeError, "unaccepted"):
+            publish_historical_evidence(
+                FakeConnection(),
+                unaccepted,
+                dataset_id="logical",
+                manifest_only=True,
+            )
+
+        failed_gate = merged_manifest_evidence()
+        failed_gate.manifest["merge_checks"]["cross_source_accepted"] = False
+        with self.assertRaisesRegex(RuntimeError, "critical merge check"):
+            publish_historical_evidence(
+                FakeConnection(),
+                failed_gate,
+                dataset_id="logical",
+                manifest_only=True,
+            )
+
+        authoritative_shard = merged_manifest_evidence()
+        authoritative_shard.manifest["shard_manifests"][0]["authoritative"] = True
+        with self.assertRaisesRegex(RuntimeError, "simulation-only boundary"):
+            publish_historical_evidence(
+                FakeConnection(),
+                authoritative_shard,
+                dataset_id="logical",
+                manifest_only=True,
+            )
+
+    def test_manifest_only_publish_requires_committed_matching_physical_shards(self) -> None:
+        evidence = merged_manifest_evidence()
+        missing = PhysicalShardConnection(evidence, omit_dataset_id="physical-shard-1")
+        with self.assertRaisesRegex(RuntimeError, "physical TiDB shard runs are missing"):
+            publish_historical_evidence(
+                missing,
+                evidence,
+                dataset_id="logical",
+                manifest_only=True,
+            )
+        self.assertEqual(missing.commits, 0)
+        self.assertFalse(any("INSERT INTO m2_history_runs" in sql for sql, _params in missing.executed))
 
     def test_load_historical_evidence_reads_existing_output_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -274,6 +498,25 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
             (root / "security-references.json").write_text(json.dumps(evidence.references), encoding="utf-8")
             loaded = load_historical_evidence(root)
             self.assertEqual(loaded.verification_checks, [])
+
+    def test_load_historical_manifest_does_not_require_large_evidence_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = merged_manifest_evidence()
+            (root / "manifest.json").write_text(json.dumps(evidence.manifest), encoding="utf-8")
+            loaded = load_historical_manifest(root)
+            self.assertEqual(loaded.manifest["shard_count"], 2)
+            self.assertEqual(loaded.bars, [])
+
+    def test_workflow_uses_fail_closed_manifest_only_merged_publication(self) -> None:
+        workflow = Path(".github/workflows/market-data-history-acceptance.yml").read_text(encoding="utf-8")
+        merged_step = workflow.split("- name: Publish merged accepted evidence to TiDB", 1)[1]
+        merged_step, merged_upload = merged_step.split("- name: Upload merged non-authoritative evidence", 1)
+        self.assertIn("if: success() && inputs.publish_tidb", merged_step)
+        self.assertIn("--manifest-only", merged_step)
+        self.assertNotIn("--allow-unaccepted-checkpoint", merged_step)
+        self.assertIn("path: historical-market-acceptance/manifest.json", merged_upload)
+        self.assertNotIn("path: historical-market-acceptance/*", merged_upload)
 
 
 if __name__ == "__main__":
