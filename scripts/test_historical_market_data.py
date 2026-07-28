@@ -8,10 +8,13 @@ from unittest.mock import patch
 
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
-from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, fetch_primary, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
+from scripts.market_data.adjustment_engine import build_adjusted_series_from_factor_events
+from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
+from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, enrich_repair_plan, fetch_primary, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
+from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
@@ -181,6 +184,39 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(len(plan["checkpoint_scope_sha256"]), 64)
         self.assertEqual(plan["checkpoint_scope_sha256"], repeated_plan["checkpoint_scope_sha256"])
 
+    def test_quality_repair_plan_can_be_reenriched_idempotently(self) -> None:
+        base = {
+            "mode": "full",
+            "business_end": "2026-07-24",
+            "symbol_count": 1,
+            "shard_size": 10,
+            "shard_count": 1,
+            "matrix": {"include": [{"shard_index": 0, "shard_count": 1}]},
+        }
+        base["checkpoint_scope_sha256"] = sha256(base)
+        repair = {
+            "repair_matrix": {"include": []},
+            "repair_shard_count": 0,
+            "repair_symbol_count": 0,
+            "resumable_symbol_count": 1,
+            "repair_details": [],
+        }
+
+        class Connection:
+            def close(self) -> None:
+                pass
+
+        with (
+            patch("scripts.market_data.historical_bars.checkpoint_expectations", return_value={0: {"000001": (1, False, "2026-07-24", "2026-07-24")}}),
+            patch("scripts.market_data.tidb_checkpoint_store.TiDBConfig.from_env", return_value=object()),
+            patch("scripts.market_data.tidb_checkpoint_store.connect", return_value=Connection()),
+            patch("scripts.market_data.tidb_checkpoint_store.ensure_schema"),
+            patch("scripts.market_data.tidb_checkpoint_store.build_checkpoint_repair_plan", return_value=repair),
+        ):
+            first = enrich_repair_plan(base)
+            second = enrich_repair_plan(first)
+        self.assertEqual(first, second)
+
     def test_akshare_history_falls_back_to_eastmoney_when_sina_is_empty(self) -> None:
         fallback_row = DailyBar(
             source="akshare_eastmoney", symbol="000413", exchange="SZSE",
@@ -206,72 +242,51 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(rows, [fallback_row])
         self.assertEqual(rows[0].source, "akshare_eastmoney")
 
-    def test_eastmoney_adjustment_events_are_derived_from_adjusted_close(self) -> None:
-        source = AkshareEastmoneyHistorySource()
+    def test_factor_events_create_positive_auditable_adjusted_series(self) -> None:
         raw = {
             date(2026, 7, 20): DailyBar(
-                source="akshare_eastmoney", symbol="600519", exchange="SSE",
+                source="tencent_archive", symbol="000937", exchange="SZSE",
                 business_date=date(2026, 7, 20), open=Decimal("10"), high=Decimal("11"),
                 low=Decimal("9"), close=Decimal("10"), previous_close=None,
                 volume_shares=100, amount_cny=Decimal("1000"), turnover_percent=Decimal("1"),
                 trade_status="trading", is_st=None,
             ),
             date(2026, 7, 21): DailyBar(
-                source="akshare_eastmoney", symbol="600519", exchange="SSE",
+                source="tencent_archive", symbol="000937", exchange="SZSE",
                 business_date=date(2026, 7, 21), open=Decimal("20"), high=Decimal("21"),
                 low=Decimal("19"), close=Decimal("20"), previous_close=None,
                 volume_shares=100, amount_cny=Decimal("2000"), turnover_percent=Decimal("1"),
                 trade_status="trading", is_st=None,
             ),
         }
-        qfq = {
-            date(2026, 7, 20): (Decimal("5"), Decimal("5.5"), Decimal("4.5"), Decimal("5")),
-            date(2026, 7, 21): (Decimal("20"), Decimal("21"), Decimal("19"), Decimal("20")),
-        }
-        hfq = {
-            date(2026, 7, 20): (Decimal("20"), Decimal("22"), Decimal("18"), Decimal("20")),
-            date(2026, 7, 21): (Decimal("40"), Decimal("42"), Decimal("38"), Decimal("40")),
-        }
-
-        events = source.derive_adjustments("600519", raw, qfq, hfq)
-
-        self.assertEqual([event.effective_date for event in events], [date(2026, 7, 20), date(2026, 7, 21)])
+        vendor_events = [
+            AdjustmentEvent("000937", date(1900, 1, 1), Decimal("2"), Decimal("1"), source="sina"),
+            AdjustmentEvent("000937", date(2026, 7, 21), Decimal("1"), Decimal("2"), source="sina"),
+        ]
+        qfq, hfq, events = build_adjusted_series_from_factor_events(
+            "000937", raw, vendor_events, source="akshare_sina_factor_multiplicative",
+        )
+        self.assertEqual(qfq[date(2026, 7, 20)][3], Decimal("5.0000"))
+        self.assertEqual(qfq[date(2026, 7, 21)][3], Decimal("20.0000"))
+        self.assertEqual(hfq[date(2026, 7, 20)][3], Decimal("10.0000"))
+        self.assertEqual(hfq[date(2026, 7, 21)][3], Decimal("40.0000"))
+        self.assertEqual([event.effective_date for event in events], [date(1900, 1, 1), date(2026, 7, 21)])
         self.assertEqual(events[0].qfq_factor, Decimal("0.500000"))
-        self.assertEqual(events[0].hfq_factor, Decimal("2.000000"))
-        self.assertEqual(events[0].source, "akshare_eastmoney_derived")
+        self.assertTrue(all(event.source == "akshare_sina_factor_multiplicative" for event in events))
 
-    def test_nonpositive_adjusted_date_is_omitted_without_failing_entire_symbol(self) -> None:
-        source = AkshareEastmoneyHistorySource()
-        raw = {
-            date(2026, 7, 20): DailyBar(
-                source="akshare_eastmoney", symbol="000937", exchange="SZSE",
-                business_date=date(2026, 7, 20), open=Decimal("10"), high=Decimal("11"),
-                low=Decimal("9"), close=Decimal("10"), previous_close=None,
-                volume_shares=100, amount_cny=Decimal("1000"), turnover_percent=Decimal("1"),
-                trade_status="trading", is_st=None,
-            ),
-            date(2026, 7, 21): DailyBar(
-                source="akshare_eastmoney", symbol="000937", exchange="SZSE",
-                business_date=date(2026, 7, 21), open=Decimal("11"), high=Decimal("12"),
-                low=Decimal("10"), close=Decimal("11"), previous_close=None,
-                volume_shares=100, amount_cny=Decimal("1100"), turnover_percent=Decimal("1"),
-                trade_status="trading", is_st=None,
-            ),
-        }
-        qfq = {
-            date(2026, 7, 20): (Decimal("0"),) * 4,
-            date(2026, 7, 21): (Decimal("11"), Decimal("12"), Decimal("10"), Decimal("11")),
-        }
-        hfq = {
-            date(2026, 7, 20): (Decimal("20"), Decimal("22"), Decimal("18"), Decimal("20")),
-            date(2026, 7, 21): (Decimal("22"), Decimal("24"), Decimal("20"), Decimal("22")),
-        }
-
-        events = source.derive_adjustments("000937", raw, qfq, hfq)
-
-        self.assertEqual([event.effective_date for event in events], [date(2026, 7, 21)])
-        self.assertEqual(events[0].qfq_factor, Decimal("1.000000"))
-        self.assertEqual(events[0].hfq_factor, Decimal("2.000000"))
+    def test_tencent_archive_parser_preserves_volume_and_amount_units(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        row = [
+            "2024-04-25", "0.41", "0.42", "0.43", "0.40", "86788.50",
+            {}, "1.25", "355.83", "0.00", "0.00",
+        ]
+        with patch.object(TencentHistorySource, "_rows", return_value=[row]):
+            bars = source.fetch_raw("002699", date(2024, 4, 25), date(2024, 4, 25))
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].source, "tencent_archive")
+        self.assertEqual(bars[0].volume_shares, 8_678_850)
+        self.assertEqual(bars[0].amount_cny, Decimal("3558300.00"))
+        self.assertEqual(bars[0].turnover_percent, Decimal("1.250000"))
 
     def test_primary_history_run_does_not_require_baostock_history_login(self) -> None:
         calendar = TradingCalendar.build(
@@ -347,13 +362,29 @@ class HistoricalMarketDataTests(unittest.TestCase):
                     self.build_reference(symbol, raw),
                     self.build_status_from_raw(raw),
                     "akshare_eastmoney",
+                    "akshare_sina_factor_multiplicative",
                 )
+
+        def verification_rows():
+            return [
+                DailyBar(
+                    source="akshare_sina", symbol=row.symbol, exchange=row.exchange,
+                    business_date=row.business_date, open=row.open, high=row.high,
+                    low=row.low, close=row.close, previous_close=row.previous_close,
+                    volume_shares=row.volume_shares, amount_cny=row.amount_cny,
+                    turnover_percent=row.turnover_percent, trade_status=row.trade_status,
+                    is_st=row.is_st,
+                )
+                for row in FakePrimarySource().fetch_raw(
+                    "600519", date(2026, 7, 20), date(2026, 7, 22),
+                )
+            ]
 
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", FakePrimarySource),
-            patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": list(FakePrimarySource().fetch_raw("600519", date(2026, 7, 20), date(2026, 7, 22)))}, {})),
+            patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows()}, {})),
             patch("scripts.market_data.sources.baostock_history_source.BaostockHistorySource.__enter__", side_effect=AssertionError("BaoStock history must not be opened")),
         ):
             manifest, bars, facts, adjustments, references, close_checks = run(
@@ -383,7 +414,8 @@ class HistoricalMarketDataTests(unittest.TestCase):
             verification_checks=[{
                 "symbol": symbol, "business_date": business_date.isoformat(),
                 "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
-            } for symbol, business_date, primary, verification in close_checks],
+                "verification_source": verification_source,
+            } for symbol, business_date, primary, verification, verification_source in close_checks],
         )
 
         class ResumeMustNotFetchPrimary:
@@ -448,7 +480,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
                     primary_calendar=calendar, secondary_calendar=calendar,
                     resume_evidence=incomplete_verification, acquisition_policy="finalize",
                 )
-        verification_rows = list(FakePrimarySource().fetch_raw("600519", date(2026, 7, 20), date(2026, 7, 22)))
+        verification_rows_for_refresh = verification_rows()
         refreshed_checkpoints = []
 
         def capture_refreshed_checkpoint(*values):
@@ -458,7 +490,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", ResumeMustNotFetchPrimary),
-            patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows}, {})),
+            patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows_for_refresh}, {})),
         ):
             refreshed_manifest, _bars, _facts, _adjustments, _references, refreshed_checks = run(
                 date(2026, 7, 22), mode="sample", current_universe=current,

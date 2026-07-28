@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping
 from scripts.market_data.manifest import sha256
 
 
-TIDB_SCHEMA_VERSION = "m2-tidb-market-checkpoint-v3"
+TIDB_SCHEMA_VERSION = "m2-tidb-market-checkpoint-v4"
 DEFAULT_ENV_FILE = Path(".env.local")
 
 
@@ -333,12 +333,17 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       business_date DATE NOT NULL,
       primary_close DECIMAL(18,4) NOT NULL,
       verification_close DECIMAL(18,4) NOT NULL,
+      verification_source VARCHAR(96) NULL,
       row_sha256 CHAR(64) NOT NULL,
       published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       PRIMARY KEY (dataset_id, symbol, business_date),
       KEY idx_m2_verification_business_date (business_date),
       KEY idx_m2_verification_symbol (symbol)
     )
+    """,
+    """
+    ALTER TABLE m2_history_verification_checks
+      ADD COLUMN IF NOT EXISTS verification_source VARCHAR(96) NULL AFTER verification_close
     """,
     """
     CREATE TABLE IF NOT EXISTS m2_adjustment_events (
@@ -510,10 +515,12 @@ ON DUPLICATE KEY UPDATE
 
 VERIFICATION_UPSERT = """
 INSERT INTO m2_history_verification_checks (
-  dataset_id, symbol, business_date, primary_close, verification_close, row_sha256
-) VALUES (%s, %s, %s, %s, %s, %s)
+  dataset_id, symbol, business_date, primary_close, verification_close,
+  verification_source, row_sha256
+) VALUES (%s, %s, %s, %s, %s, %s, %s)
 ON DUPLICATE KEY UPDATE
   primary_close=VALUES(primary_close), verification_close=VALUES(verification_close),
+  verification_source=VALUES(verification_source),
   row_sha256=VALUES(row_sha256)
 """
 
@@ -894,6 +901,7 @@ def _verification_rows(dataset_id: str, checks: Iterable[Mapping[str, Any]]) -> 
         (
             dataset_id, row["symbol"], row["business_date"],
             _decimal_text(row.get("primary_close")), _decimal_text(row.get("verification_close")),
+            _optional_text(row.get("verification_source")),
             sha256(row),
         )
         for row in checks
@@ -1036,6 +1044,23 @@ def publish_symbol_checkpoint(
     checkpoints = symbol_checkpoint_rows(dataset_id, evidence)
     if len(checkpoints) != 1:
         raise ValueError(f"symbol checkpoint requires exactly one symbol, got {len(checkpoints)}")
+    checkpoint = checkpoints[0]
+    symbol = str(checkpoint[1])
+    if str(checkpoint[8]) == "succeeded":
+        # A successful repair replaces the exact symbol snapshot atomically so
+        # obsolete adjustment or verification rows cannot survive an upsert.
+        with connection.cursor() as cursor:
+            for table in (
+                "m2_historical_bars",
+                "m2_tradeability_facts",
+                "m2_adjustment_events",
+                "m2_security_references",
+                "m2_history_verification_checks",
+            ):
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE dataset_id=%s AND symbol=%s",
+                    (dataset_id, symbol),
+                )
     counts = {
         "bars": _upsert_many(connection, BAR_UPSERT, _bar_rows(dataset_id, evidence.bars)),
         "tradeability": _upsert_many(connection, TRADEABILITY_UPSERT, _tradeability_rows(dataset_id, evidence.tradeability)),
@@ -1067,7 +1092,7 @@ def build_checkpoint_repair_plan(
     mode: str,
     shard_count: int,
 ) -> dict[str, Any]:
-    """Select only failed, missing, or structurally incomplete symbol checkpoints."""
+    """Select only failed, missing, or quality-incomplete symbol checkpoints."""
 
     expected_indices = set(range(shard_count))
     if set(dataset_ids) != expected_indices or set(expectations) != expected_indices:
@@ -1086,6 +1111,64 @@ def build_checkpoint_repair_plan(
         ORDER BY shard_index, symbol
     """, tuple(dataset_ids[index] for index in range(shard_count)))
 
+    dataset_params = tuple(dataset_ids[index] for index in range(shard_count))
+    quality_rows = _query_all(connection, f"""
+        SELECT facts.dataset_id, facts.symbol, facts.fact_rows, facts.primary_fact_rows,
+               COALESCE(bars.bar_rows, 0), COALESCE(bars.matched_primary_rows, 0),
+               COALESCE(bars.invalid_bar_rows, 0), COALESCE(checks.verification_rows, 0),
+               COALESCE(checks.missing_source_rows, 0), COALESCE(checks.source_overlap_rows, 0)
+        FROM (
+          SELECT dataset_id, symbol, COUNT(*) AS fact_rows,
+                 SUM(CASE WHEN has_primary_bar=1 THEN 1 ELSE 0 END) AS primary_fact_rows
+          FROM m2_tradeability_facts
+          WHERE dataset_id IN ({placeholders})
+          GROUP BY dataset_id, symbol
+        ) facts
+        LEFT JOIN (
+          SELECT b.dataset_id, b.symbol, COUNT(*) AS bar_rows,
+                 SUM(CASE WHEN f.has_primary_bar=1 THEN 1 ELSE 0 END) AS matched_primary_rows,
+                 SUM(CASE WHEN
+                   b.open_price IS NULL OR b.open_price<=0 OR
+                   b.high IS NULL OR b.high<=0 OR b.low IS NULL OR b.low<=0 OR
+                   b.close_price IS NULL OR b.close_price<=0 OR
+                   b.volume_shares IS NULL OR b.volume_shares<0 OR
+                   b.amount_cny IS NULL OR b.amount_cny<0 OR
+                   b.qfq_factor IS NULL OR b.qfq_factor<=0 OR
+                   b.hfq_factor IS NULL OR b.hfq_factor<=0 OR
+                   b.qfq_open IS NULL OR b.qfq_open<=0 OR
+                   b.qfq_high IS NULL OR b.qfq_high<=0 OR
+                   b.qfq_low IS NULL OR b.qfq_low<=0 OR
+                   b.qfq_close IS NULL OR b.qfq_close<=0 OR
+                   b.hfq_open IS NULL OR b.hfq_open<=0 OR
+                   b.hfq_high IS NULL OR b.hfq_high<=0 OR
+                   b.hfq_low IS NULL OR b.hfq_low<=0 OR
+                   b.hfq_close IS NULL OR b.hfq_close<=0 OR
+                   b.primary_source IS NULL OR TRIM(b.primary_source)='' OR
+                   b.factor_source IS NULL OR TRIM(b.factor_source)=''
+                 THEN 1 ELSE 0 END) AS invalid_bar_rows
+          FROM m2_historical_bars b
+          LEFT JOIN m2_tradeability_facts f
+            ON f.dataset_id=b.dataset_id AND f.symbol=b.symbol
+           AND f.business_date=b.business_date
+          WHERE b.dataset_id IN ({placeholders})
+          GROUP BY b.dataset_id, b.symbol
+        ) bars ON bars.dataset_id=facts.dataset_id AND bars.symbol=facts.symbol
+        LEFT JOIN (
+          SELECT v.dataset_id, v.symbol, COUNT(*) AS verification_rows,
+                 SUM(CASE WHEN v.verification_source IS NULL OR TRIM(v.verification_source)=''
+                          THEN 1 ELSE 0 END) AS missing_source_rows,
+                 SUM(CASE WHEN v.verification_source=b.primary_source THEN 1 ELSE 0 END)
+                   AS source_overlap_rows
+          FROM m2_history_verification_checks v
+          LEFT JOIN m2_historical_bars b
+            ON b.dataset_id=v.dataset_id AND b.symbol=v.symbol
+           AND b.business_date=v.business_date
+          WHERE v.dataset_id IN ({placeholders})
+          GROUP BY v.dataset_id, v.symbol
+        ) checks ON checks.dataset_id=facts.dataset_id AND checks.symbol=facts.symbol
+        ORDER BY facts.dataset_id, facts.symbol
+    """, dataset_params + dataset_params + dataset_params)
+
     observed: dict[tuple[int, str], tuple[Any, ...]] = {}
     for row in rows:
         dataset_id = str(row[0])
@@ -1097,6 +1180,18 @@ def build_checkpoint_repair_plan(
         if symbol not in expectations[shard_index] or key in observed:
             raise RuntimeError(f"checkpoint scope contains an unexpected or duplicate symbol: {shard_index}:{symbol}")
         observed[key] = row
+
+    quality: dict[tuple[int, str], tuple[int, ...]] = {}
+    for row in quality_rows:
+        dataset_id = str(row[0])
+        if dataset_id not in reverse_ids:
+            raise RuntimeError(f"unexpected quality dataset id: {dataset_id}")
+        shard_index = reverse_ids[dataset_id]
+        symbol = str(row[1])
+        key = (shard_index, symbol)
+        if symbol not in expectations[shard_index] or key in quality:
+            raise RuntimeError(f"quality scope contains an unexpected or duplicate symbol: {shard_index}:{symbol}")
+        quality[key] = tuple(int(value or 0) for value in row[2:])
 
     repair_details: list[str] = []
     resumable = 0
@@ -1110,6 +1205,25 @@ def build_checkpoint_repair_plan(
             if row is not None:
                 bar_rows = int(row[9])
                 verification_rows = int(row[11])
+                inventory = quality.get((shard_index, symbol))
+                quality_valid = inventory is not None
+                if inventory is not None:
+                    (
+                        fact_rows, primary_fact_rows, stored_bar_rows,
+                        matched_primary_rows, invalid_bar_rows,
+                        stored_verification_rows, missing_verification_sources,
+                        verification_source_overlaps,
+                    ) = inventory
+                    quality_valid = all((
+                        fact_rows == expected_rows,
+                        stored_bar_rows == bar_rows,
+                        primary_fact_rows == stored_bar_rows,
+                        matched_primary_rows == stored_bar_rows,
+                        invalid_bar_rows == 0,
+                        stored_verification_rows == verification_rows,
+                        not verification_required or missing_verification_sources == 0,
+                        verification_source_overlaps == 0,
+                    ))
                 valid = all((
                     str(row[2]) == mode,
                     int(row[3]) == shard_index,
@@ -1126,11 +1240,45 @@ def build_checkpoint_repair_plan(
                     _is_sha256(row[14]),
                     _is_sha256(row[15]),
                     row[16] is None,
+                    quality_valid,
                 ))
                 if valid:
                     resumable += 1
                     continue
-                reason = str(row[16] or row[7] or "invalid_checkpoint")
+                if row[16] is not None or str(row[7]) != "succeeded":
+                    reason = str(row[16] or row[7] or "invalid_checkpoint")
+                elif (
+                    str(row[2]) != mode
+                    or int(row[3]) != shard_index
+                    or int(row[4]) != shard_count
+                    or _date_text(row[5]) != expected_start
+                    or _date_text(row[6]) != expected_end
+                ):
+                    reason = "checkpoint_scope_mismatch"
+                elif int(row[8]) != expected_rows or int(row[10]) != expected_rows:
+                    reason = "expected_inventory_mismatch"
+                elif not 0 < bar_rows <= expected_rows:
+                    reason = "bar_count_invalid"
+                elif verification_required and verification_rows != bar_rows:
+                    reason = "verification_incomplete"
+                elif int(row[12]) != 1 or not bool(row[13]) or not _is_sha256(row[14]) or not _is_sha256(row[15]):
+                    reason = "checkpoint_provenance_incomplete"
+                elif inventory is None:
+                    reason = "missing_quality_inventory"
+                elif fact_rows != expected_rows:
+                    reason = "tradeability_inventory_mismatch"
+                elif stored_bar_rows != bar_rows or primary_fact_rows != stored_bar_rows or matched_primary_rows != stored_bar_rows:
+                    reason = "bar_inventory_mismatch"
+                elif invalid_bar_rows:
+                    reason = "adjusted_price_incomplete"
+                elif stored_verification_rows != verification_rows:
+                    reason = "verification_inventory_mismatch"
+                elif verification_required and missing_verification_sources:
+                    reason = "verification_source_missing"
+                elif verification_source_overlaps:
+                    reason = "verification_source_overlap"
+                else:
+                    reason = "invalid_checkpoint"
             shard_missing += 1
             repair_symbols += 1
             repair_details.append(f"{shard_index}:{symbol}:{reason}")
@@ -1256,7 +1404,7 @@ def load_resumable_evidence(connection: Any, dataset_id: str) -> HistoricalEvide
         FROM m2_security_references WHERE dataset_id=%s ORDER BY symbol
     """, (dataset_id,)))
     checks = retained(_query_all(connection, """
-        SELECT symbol, business_date, primary_close, verification_close
+        SELECT symbol, business_date, primary_close, verification_close, verification_source
         FROM m2_history_verification_checks WHERE dataset_id=%s ORDER BY symbol, business_date
     """, (dataset_id,)))
     return HistoricalEvidence(
@@ -1296,5 +1444,6 @@ def load_resumable_evidence(connection: Any, dataset_id: str) -> HistoricalEvide
         verification_checks=[{
             "symbol": str(row[0]), "business_date": _date_text(row[1]),
             "primary_close": _number_text(row[2]), "verification_close": _number_text(row[3]),
+            "verification_source": row[4],
         } for row in checks],
     )

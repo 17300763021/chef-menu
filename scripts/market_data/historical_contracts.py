@@ -91,7 +91,7 @@ class HistoricalBar:
     hfq_low: Decimal
     hfq_close: Decimal
     primary_source: str = "akshare_eastmoney"
-    factor_source: str = "baostock"
+    factor_source: str = "unknown"
     schema_version: str = HISTORICAL_SCHEMA_VERSION
 
     @property
@@ -118,6 +118,7 @@ class HistoricalBar:
         qfq_prices: tuple[Decimal, Decimal, Decimal, Decimal] | None = None,
         hfq_prices: tuple[Decimal, Decimal, Decimal, Decimal] | None = None,
         primary_source: str = "akshare_eastmoney",
+        factor_source: str = "unknown",
     ) -> "HistoricalBar":
         code = normalize_symbol(symbol)
         values = [open_price, high, low, close]
@@ -126,7 +127,7 @@ class HistoricalBar:
         return cls(
             code, exchange_for_symbol(code), business_date, index_code,
             open_price, high, low, close, previous_close, volume_shares, amount_cny, turnover_percent,
-            qfq_factor, hfq_factor, *qfq, *hfq, primary_source,
+            qfq_factor, hfq_factor, *qfq, *hfq, primary_source, factor_source,
         )
 
     def canonical(self) -> dict[str, Any]:

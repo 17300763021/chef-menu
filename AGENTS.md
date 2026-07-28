@@ -290,6 +290,8 @@ Completion note:
 - 2026-07-27 full-run storage checkpoint: Commit `b4552b4` upgraded TiDB checkpoint schema to `m2-tidb-market-checkpoint-v3`, added an idempotent merged-run-to-physical-shard mapping, and changed accepted merge publication to store logical counts, global hashes, and shard pointers without duplicating bars, tradeability facts, adjustment events, references, verification rows, or symbol checkpoints. Manifest-only publication now fails closed unless every critical merge check passes, every shard file count and SHA-256 reconciles, and every referenced TiDB physical shard is already committed, accepted, simulation-only, non-authoritative, and exactly matches its embedded manifest. GitHub uploads only the final merged manifest while retaining physical shard artifacts, avoiding a second approximately full-size artifact copy. All 71 M2.3 and prerequisite regression tests passed locally; workflow YAML parsing and Python compilation passed. A real TiDB sample for business date `2026-07-24` stored 20 physical symbols, 2,080 bars, 2,080 tradeability facts, 439 adjustment events, 20 references, and 2,080 verification checks under `local-20260727-m2-manifest-only-v3-shard-0-of-1`. Logical dataset `local-20260727-m2-manifest-only-v3-merged` was published twice idempotently with one shard mapping and independently queried as having zero physical rows in all six market/checkpoint tables, while retaining the correct logical counts and `simulation_orders_allowed=0`. Full 1,403-symbol GitHub Actions run `30243090884` was launched on commit `b4552b4` for business date `2026-07-24`, mode `full`, with 141 shards, `max-parallel=2`, and TiDB publication enabled. At this checkpoint deterministic tests and planning had passed, shards 0 and 1 had completed successfully, TiDB held 20 successful and zero failed symbol checkpoints for the full-run scope, and the next two shards were running. The next session must inspect run `30243090884` first; if it is incomplete, allow its online checkpoints to continue without starting a competing full run; if it failed, diagnose the exact failed shard or merge gate and reuse the same stable TiDB checkpoint scope; if it passed, verify all 141 physical shard runs, the manifest-only mapping count, logical-versus-physical reconciliation, hashes, missing-data trade blocks, artifact inventory, and current free-quota usage before recording full-universe acceptance.
 - 2026-07-28 local full-run recovery repair: Diagnosed GitHub Actions run `30243090884` as 139 completed shards plus two job-level timeouts, not a GitHub outage or free-quota rejection. TiDB read-only reconciliation under frozen scope `993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7` found exactly 1,326 structurally complete resumable symbols, 64 failed symbols, and 13 never-attempted symbols across 52 affected shards. Implemented a frozen-plan-derived repair matrix, a non-swallowable Linux symbol deadline, separate `capture`/`repair`/`finalize` policies, fail-closed verification-checkpoint refresh, nonpositive adjusted-row isolation without fabricated values, and checkpoint-manifest-only physical-run registration that avoids rewriting millions of existing rows. The `resume` workflow is designed to repair only the 77 missing or failed symbols at `max-parallel=2`, then rebuild all 141 final shard artifacts from TiDB with public market-data acquisition disabled before the existing deterministic merge.
 - 2026-07-28 verification: All 75 deterministic M2.3/prerequisite tests passed, along with Python compilation, workflow YAML parsing, and `git diff --check`. Real read-only TiDB planning reproduced exactly 1,326 resumable symbols, 77 repair symbols, and 52 repair shards while retaining the original checkpoint scope hash. Real shard 0 finalization recovered 10/10 symbols, 18,075 tradeability rows, and 18,053 bars with `acquired_symbol_count=0` and an accepted manifest; its checkpoint-manifest-only registration preconditions independently passed against the stored TiDB inventory without writing a run row. Intentionally incomplete shard 27 failed before writing a manifest with the public-market-data prohibition message. No GitHub workflow was triggered and no M2.3 completion is claimed from local evidence.
+- 2026-07-28 quality-aware recovery hardening: GitHub resume run `30323905791` showed that immediate retries alone could not recover archived identifiers, nonpositive additive QFQ rows, or missing independent verification. Added Tencent archive raw-history fallback with exact volume/amount units, separately attributed positive multiplicative Sina factor timelines, per-row raw/factor/verification provenance, strict primary-versus-verification source independence, quality-aware TiDB repair planning, atomic successful-symbol replacement that cannot leave stale adjustment or verification rows, and one aggregate post-repair workflow diagnosis instead of treating every unresolved matrix child as a separate root cause. Failed checkpoint attempts preserve prior physical rows and all outputs remain non-authoritative with `simulation_orders_allowed=false`.
+- 2026-07-28 quality-aware verification: All 78 M2.3/prerequisite regression tests, Python compilation, workflow YAML parsing, and `git diff --check` passed. Live local source probes recovered all 23 primary-acquisition or targeted-verification symbols currently exposed by the frozen full-run inventory; `300114` used Tencent archive history, the other currently reachable symbols used Eastmoney or Sina, and every generated QFQ/HFQ price was positive. `600240` obtained an independent Tencent verification series when Eastmoney was excluded. TiDB schema `m2-tidb-market-checkpoint-v4` was applied idempotently, and repeated planning from both the original and an already enriched frozen plan retained scope hash `993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7` and evidence hash `afe07dc1d2c54e537ab279a2faf248e493108bed83878825435bb31f720216f8` while identifying 1,341 resumable symbols and exactly 62 repair symbols across 55 shards: 13 prior primary failures, nine bar/factor inventory mismatches, 38 verification rows missing source attribution, and two incomplete verification inventories. No online workflow was triggered from this local acceptance and M2.3 remains `In Progress`.
 - Remaining limitations: M2.3 has not passed full-universe production-facing acceptance. The new recovery workflow still requires one online `resume` run using frozen-plan source run `30243090884`; only its accepted 141-shard merge, TiDB logical/physical reconciliation, global gates, hashes, artifacts, and quota review can complete the full-universe acceptance. Daily incremental scheduling, industry, fundamentals, verified flow data, and Qlib/RQAlpha adapters remain pending. All M2.3 outputs remain non-authoritative and `simulation_orders_allowed=false`; any critical gate failure must continue to produce zero simulated orders.
 
 Goal: Provide synchronized, auditable, point-in-time data suitable for A-share research and simulation.
@@ -328,6 +330,8 @@ Required work:
 - Atomically publish a complete reconciled run; never publish a partial account.
 - Support deterministic replay using immutable inputs, strategy version, and engine version.
 - Retire legacy `paper_trade_engine.py` from authoritative account writes.
+- Build daily position coverage from the authoritative set of all open RQAlpha positions, independently of candidate-list or model-ranking limits. Every open position must receive an explicit valuation, market-data state, and risk-evaluation state even when no current prediction exists.
+- Accept simulated order instructions only through validated structured fields. Human-readable recommendation text must never be parsed as an authoritative order price, stop, target, quantity, or side.
 
 Acceptance:
 
@@ -335,6 +339,8 @@ Acceptance:
 - Order, fill, cash, position, fee, and equity reconciliation differences are zero.
 - Deterministic A-share fixtures cover T+1, suspension, board lots, limit-up, limit-down, costs, slippage, rejection, and partial failure.
 - Backtest and simulation use the same execution rules.
+- A held stock outside the candidate list or persisted prediction Top-N still receives exactly one daily position evaluation. Missing market data is exposed and fails closed rather than silently omitting the position or guessing a value.
+- An order request with missing or invalid structured price or quantity fields is rejected without changing cash, positions, orders, or fills.
 
 ## M4: Explainable A-Share Adaptive Baseline Strategy
 
@@ -384,12 +390,21 @@ Factor exposures must be industry- and size-aware. Missing unverified flow data 
 - Time stop without excess return.
 - Portfolio de-risking after market-regime deterioration.
 
+### Structured recommendation contract
+
+- Store entry-price lower and upper bounds, stop price, target prices, defensive price, business date, validity window, data version, strategy version, actionability state, and blocked reason as typed structured fields where applicable.
+- Generate human-readable recommendation narratives from validated structured fields. Never reconstruct authoritative numeric fields by parsing narrative text.
+- A recommendation that requires a price but lacks a valid structured price range, stop, or other required field is non-actionable and must expose the exact validation failure.
+- Daily risk evaluation covers the union of all authoritative open positions and valid new-position candidates. Candidate ranking may limit new-buy consideration but must never remove an existing position from monitoring or exit evaluation.
+
 Acceptance:
 
 - Every recommendation records data version, regime, factors, contributions, risk budget, and reason.
 - Candidate ordering is explicitly score-based and deterministic.
 - The strategy can hold 100% cash.
 - No single stock or small cluster can dominate planned account loss.
+- Every actionable recommendation passes deterministic structured-field and price-relationship validation; narrative text and structured values cannot contradict each other.
+- The number of authoritative open positions equals the number receiving a daily risk-evaluation result, including positions with no current rank or prediction.
 
 ## M5: Professional Backtest And Falsification
 
@@ -407,6 +422,7 @@ Required work:
 - Report daily portfolio returns, annual return, excess return, max drawdown, Sharpe, Calmar, profit factor, turnover, holding period, consecutive losses, and tail concentration.
 - Run parameter perturbation, doubled-cost, delayed-fill, missing-data, and regime stress tests.
 - Reconcile every equity-curve change to cash flows and fills.
+- Include regression scenarios where an existing holding falls outside the candidate universe or persisted prediction Top-N, or has a missing or stale prediction. The holding must remain valued and risk-evaluated, and missing required market data must fail closed.
 
 Preregistered promotion gates:
 
@@ -437,6 +453,7 @@ Required work:
 - Store model name, version, training cutoff, feature version, dataset hash, score, rank, predicted excess return, and confidence.
 - Fall back to the validated factor baseline when predictions are missing or stale.
 - Do not permit model output to directly create a simulated order.
+- Treat prediction Top-N as a candidate-ranking or presentation limit only. It must not limit daily valuation, baseline risk evaluation, or exit handling for authoritative open positions.
 
 Acceptance:
 
@@ -444,6 +461,7 @@ Acceptance:
 - Predictions are reproducible by version and data hash.
 - The blended strategy passes M5 gates and materially improves the baseline on untouched data.
 - A model failure cannot corrupt or block the authoritative account.
+- A held stock outside the model Top-N, or without a current prediction, still receives exactly one versioned baseline risk result and cannot become an unmonitored position.
 
 ## M7: Online Trust And Research Console
 
@@ -464,6 +482,9 @@ Required views:
 - Shadow-account comparison.
 - Cloud job history, failures, heartbeat, and quota usage.
 - Circuit-breaker status.
+- Truthful cloud-job lifecycle showing the actual GitHub run id and link, trigger type, business date, started and heartbeat times, validation state, completion state, output run or dataset id, and failure or blocked reason.
+- Retire the legacy page behavior that writes `stock_job_requests` and presents a saved database request as evidence that GitHub Actions has started. The V2 console remains read-only; scheduled production work and administrator manual dispatches originate from the approved cloud workflow.
+- Distinguish scheduled, started, running, validating, succeeded, failed, data-incomplete or blocked, stale or timed-out, and canceled states without collapsing them into a generic healthy state.
 
 Acceptance:
 
@@ -471,6 +492,8 @@ Acceptance:
 - The frontend cannot authoritatively mutate cash, fills, or positions.
 - Failed or stale states are prominent and cannot appear healthy.
 - Simulation-only and non-investment-advice labels remain visible.
+- A displayed task can be traced to a real cloud run and its business output. Saving a request record alone can never be displayed as started, running, or successful.
+- Data-incomplete, blocked, timed-out, and canceled jobs remain visibly distinct and cannot publish or imply a successful business result.
 
 ## M8: Sixty-Trading-Day Cloud Shadow Simulation
 

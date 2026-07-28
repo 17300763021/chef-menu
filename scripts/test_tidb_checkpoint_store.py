@@ -245,14 +245,20 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
     def test_repair_plan_selects_only_missing_failed_or_incomplete_checkpoints(self) -> None:
         class RepairConnection(FakeConnection):
             def query_result(self, sql: str):
-                if "FROM m2_history_symbol_checkpoints" not in sql:
-                    return []
-                valid_hash = "a" * 64
-                return [
-                    ("shard-0", "000001", "full", 0, 2, "2026-01-01", "2026-07-24", "succeeded", 100, 99, 100, 0, 1, "akshare_eastmoney", valid_hash, valid_hash, None, None),
-                    ("shard-0", "000002", "full", 0, 2, "2026-01-01", "2026-07-24", "failed", 100, 0, 100, 0, 0, None, None, valid_hash, "primary_failure", "endpoint closed"),
-                    ("shard-1", "600001", "full", 1, 2, "2026-01-01", "2026-07-24", "succeeded", 90, 88, 90, 87, 1, "akshare_sina", valid_hash, valid_hash, None, None),
-                ]
+                if "FROM m2_history_symbol_checkpoints" in sql:
+                    valid_hash = "a" * 64
+                    return [
+                        ("shard-0", "000001", "full", 0, 2, "2026-01-01", "2026-07-24", "succeeded", 100, 99, 100, 0, 1, "akshare_eastmoney", valid_hash, valid_hash, None, None),
+                        ("shard-0", "000002", "full", 0, 2, "2026-01-01", "2026-07-24", "failed", 100, 0, 100, 0, 0, None, None, valid_hash, "primary_failure", "endpoint closed"),
+                        ("shard-1", "600001", "full", 1, 2, "2026-01-01", "2026-07-24", "succeeded", 90, 88, 90, 87, 1, "akshare_sina", valid_hash, valid_hash, None, None),
+                    ]
+                if "FROM m2_tradeability_facts" in sql:
+                    return [
+                        ("shard-0", "000001", 100, 99, 99, 99, 0, 0, 0, 0),
+                        ("shard-0", "000002", 100, 0, 0, 0, 0, 0, 0, 0),
+                        ("shard-1", "600001", 90, 88, 88, 88, 0, 87, 0, 0),
+                    ]
+                return []
 
         result = build_checkpoint_repair_plan(
             RepairConnection(),
@@ -288,6 +294,31 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         )
         self.assertEqual(config.safe_summary()["password"], "***")
         self.assertNotIn("secret-password", json.dumps(config.safe_summary()))
+
+    def test_repair_plan_rejects_nonpositive_adjusted_inventory(self) -> None:
+        class InvalidAdjustedConnection(FakeConnection):
+            def query_result(self, sql: str):
+                valid_hash = "a" * 64
+                if "FROM m2_history_symbol_checkpoints" in sql:
+                    return [(
+                        "shard-0", "000937", "full", 0, 1,
+                        "2018-01-02", "2026-07-24", "succeeded",
+                        100, 100, 100, 0, 1, "akshare_eastmoney",
+                        valid_hash, valid_hash, None, None,
+                    )]
+                if "FROM m2_tradeability_facts" in sql:
+                    return [("shard-0", "000937", 100, 100, 100, 100, 1, 0, 0, 0)]
+                return []
+
+        result = build_checkpoint_repair_plan(
+            InvalidAdjustedConnection(),
+            dataset_ids={0: "shard-0"},
+            expectations={0: {"000937": (100, False, "2018-01-02", "2026-07-24")}},
+            mode="full",
+            shard_count=1,
+        )
+        self.assertEqual(result["repair_symbol_count"], 1)
+        self.assertEqual(result["repair_details"], ["0:000937:adjusted_price_incomplete"])
 
     def test_connect_uses_tls_for_tidb_required_ssl(self) -> None:
         captured = {}
@@ -354,12 +385,37 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
             tradeability=evidence.tradeability[:1],
             adjustments=evidence.adjustments,
             references=evidence.references,
-            verification_checks=evidence.verification_checks,
+            verification_checks=[{
+                "symbol": "000001", "business_date": "2026-07-15",
+                "primary_close": "10.5000", "verification_close": "10.5000",
+                "verification_source": "akshare_sina",
+            }],
         )
         counts = publish_symbol_checkpoint(connection, one_symbol, dataset_id="stable-dataset")
         self.assertEqual(counts["symbol_checkpoints"], 1)
         self.assertEqual(connection.commits, 1)
         self.assertFalse(any("m2_history_runs" in sql for sql, _params in connection.executed))
+        deletes = [params for sql, params in connection.executed if sql.lstrip().startswith("DELETE FROM")]
+        self.assertEqual(deletes, [("stable-dataset", "000001")] * 5)
+        verification_rows = next(
+            rows for sql, rows in connection.executed_many
+            if "m2_history_verification_checks" in sql
+        )
+        self.assertEqual(verification_rows[0][5], "akshare_sina")
+
+    def test_failed_symbol_checkpoint_preserves_previous_physical_rows(self) -> None:
+        evidence = sample_evidence(accepted=False)
+        failed = HistoricalEvidence(
+            manifest={**evidence.manifest, "primary_failures": {"600519": "endpoint closed"}},
+            bars=[],
+            tradeability=evidence.tradeability[1:],
+            adjustments=[],
+            references=[],
+            verification_checks=[],
+        )
+        connection = FakeConnection()
+        publish_symbol_checkpoint(connection, failed, dataset_id="stable-dataset")
+        self.assertFalse(any(sql.lstrip().startswith("DELETE FROM") for sql, _params in connection.executed))
 
     def test_load_resumable_evidence_reads_only_succeeded_symbols(self) -> None:
         class ResumeConnection(FakeConnection):
@@ -387,7 +443,10 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
                 if "FROM m2_security_references" in sql:
                     return [("000001", "SZSE", "Ping An Bank", "1991-04-03", None, "akshare_eastmoney")]
                 if "FROM m2_history_verification_checks" in sql:
-                    return [("000001", "2026-07-15", Decimal("10.5000"), Decimal("10.5000"))]
+                    return [(
+                        "000001", "2026-07-15", Decimal("10.5000"),
+                        Decimal("10.5000"), "akshare_sina",
+                    )]
                 return []
 
         loaded = load_resumable_evidence(ResumeConnection(), "stable-dataset")
@@ -395,13 +454,18 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(loaded.bars[0]["close"], "10.5000")
         self.assertEqual(loaded.tradeability[0]["block_reasons"], [])
         self.assertEqual(loaded.verification_checks[0]["verification_close"], "10.5000")
+        self.assertEqual(loaded.verification_checks[0]["verification_source"], "akshare_sina")
 
     def test_schema_creation_is_idempotent_sql_only(self) -> None:
         connection = FakeConnection()
         ensure_schema(connection)
         self.assertGreaterEqual(len(connection.executed), 6)
         self.assertEqual(connection.commits, 1)
-        self.assertTrue(all("CREATE TABLE IF NOT EXISTS" in sql for sql, _ in connection.executed))
+        self.assertTrue(all(
+            "CREATE TABLE IF NOT EXISTS" in sql or "ALTER TABLE" in sql
+            for sql, _ in connection.executed
+        ))
+        self.assertTrue(any("ADD COLUMN IF NOT EXISTS verification_source" in sql for sql, _ in connection.executed))
         self.assertTrue(any("m2_history_run_shards" in sql for sql, _ in connection.executed))
 
     def test_manifest_only_publish_maps_shards_without_duplicate_market_rows(self) -> None:
@@ -616,6 +680,11 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertIn("--acquisition-policy finalize", workflow)
         self.assertIn("--checkpoint-manifest-only", workflow)
         self.assertIn("max-parallel: 2", workflow.split("repair-shard:", 1)[1].split("finalize-shard:", 1)[0])
+        self.assertIn("resume-diagnostics:", workflow)
+        self.assertIn("resume-repair-gate:", workflow)
+        self.assertIn("Reconcile all checkpoint quality after repair attempts", workflow)
+        retry_step = workflow.split("- name: Retry remaining failed symbols once", 1)[1].split("- name: Register repaired physical shard", 1)[0]
+        self.assertIn("continue-on-error: true", retry_step)
 
 
 if __name__ == "__main__":
