@@ -12,6 +12,9 @@ import time
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
+from scripts.market_data.adjustment_engine import (
+    build_adjusted_series_from_factor_events,
+)
 from scripts.market_data.contracts import (
     AMOUNT_QUANTUM,
     PRICE_QUANTUM,
@@ -57,46 +60,65 @@ class AkshareHistorySource:
         suffix = f": {last_error}" if last_error else ""
         raise RuntimeError(f"Sina returned no raw rows for {symbol}{suffix}")
 
-    def fetch_raw(self, symbol: str, start: date, end: date) -> list[DailyBar]:
+    def fetch_raw(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        *,
+        exclude_sources: set[str] | None = None,
+    ) -> list[DailyBar]:
         code = normalize_symbol(symbol)
-        try:
-            frame = self._frame(code, start, end)
-        except RuntimeError as sina_error:
+        excluded = exclude_sources or set()
+        failures: list[str] = []
+        if self.name not in excluded:
+            try:
+                frame = self._frame(code, start, end)
+                rows: list[DailyBar] = []
+                for raw in frame.to_dict(orient="records"):
+                    volume = int_value(raw.get("volume"), "volume(shares)")
+                    amount = decimal_value(raw.get("amount"), "amount(CNY)", AMOUNT_QUANTUM)
+                    turnover_ratio = decimal_value(raw.get("turnover"), "turnover(ratio)", TURNOVER_QUANTUM, allow_blank=True)
+                    assert amount is not None
+                    rows.append(DailyBar(
+                        source=self.name, symbol=code, exchange=exchange_for_symbol(code),
+                        business_date=parse_date(raw.get("date")),
+                        open=decimal_value(raw.get("open"), "open", PRICE_QUANTUM),  # type: ignore[arg-type]
+                        high=decimal_value(raw.get("high"), "high", PRICE_QUANTUM),  # type: ignore[arg-type]
+                        low=decimal_value(raw.get("low"), "low", PRICE_QUANTUM),  # type: ignore[arg-type]
+                        close=decimal_value(raw.get("close"), "close", PRICE_QUANTUM),  # type: ignore[arg-type]
+                        previous_close=None, volume_shares=volume, amount_cny=amount,
+                        turnover_percent=None if turnover_ratio is None else turnover_ratio * Decimal("100"),
+                        trade_status="trading" if volume > 0 else "unknown_zero_volume", is_st=None,
+                    ))
+                return rows
+            except Exception as error:
+                failures.append(f"{self.name}: {type(error).__name__}: {error}")
+        if "akshare_eastmoney" not in excluded:
             from scripts.market_data.sources.akshare_source import AkshareSource
-
             try:
                 return AkshareSource(timeout_seconds=self.timeout_seconds, attempts=self.attempts).fetch(code, start, end)
-            except Exception as eastmoney_error:
-                raise RuntimeError(f"{sina_error}; Eastmoney fallback failed: {eastmoney_error}") from eastmoney_error
-        rows: list[DailyBar] = []
-        for raw in frame.to_dict(orient="records"):
-            volume = int_value(raw.get("volume"), "volume(shares)")
-            amount = decimal_value(raw.get("amount"), "amount(CNY)", AMOUNT_QUANTUM)
-            turnover_ratio = decimal_value(raw.get("turnover"), "turnover(ratio)", TURNOVER_QUANTUM, allow_blank=True)
-            assert amount is not None
-            rows.append(DailyBar(
-                source=self.name, symbol=code, exchange=exchange_for_symbol(code),
-                business_date=parse_date(raw.get("date")),
-                open=decimal_value(raw.get("open"), "open", PRICE_QUANTUM),  # type: ignore[arg-type]
-                high=decimal_value(raw.get("high"), "high", PRICE_QUANTUM),  # type: ignore[arg-type]
-                low=decimal_value(raw.get("low"), "low", PRICE_QUANTUM),  # type: ignore[arg-type]
-                close=decimal_value(raw.get("close"), "close", PRICE_QUANTUM),  # type: ignore[arg-type]
-                previous_close=None, volume_shares=volume, amount_cny=amount,
-                turnover_percent=None if turnover_ratio is None else turnover_ratio * Decimal("100"),
-                trade_status="trading" if volume > 0 else "unknown_zero_volume", is_st=None,
-            ))
-        return rows
+            except Exception as error:
+                failures.append(f"akshare_eastmoney: {type(error).__name__}: {error}")
+        if "tencent_archive" not in excluded:
+            from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+            try:
+                return TencentHistorySource(
+                    timeout_seconds=self.timeout_seconds, attempts=self.attempts,
+                ).fetch_raw(code, start, end)
+            except Exception as error:
+                failures.append(f"tencent_archive: {type(error).__name__}: {error}")
+        raise RuntimeError(f"verification sources failed for {code}: {'; '.join(failures) or 'all sources excluded'}")
 
 
 class AkshareEastmoneyHistorySource:
     """Primary M2.3 historical bundle from AKShare's Eastmoney endpoint.
 
-    BaoStock previously supplied raw bars, adjusted bars, reference rows, and
-    adjustment factors.  This adapter keeps raw and adjusted prices under one
-    per-symbol primary source mouth: Eastmoney is preferred and the entire
-    symbol bundle falls back to Sina only when Eastmoney is unavailable.  Factor
-    events prefer Sina's factor table; daily bar factors remain derived from the
-    accepted raw/adjusted prices for that same symbol bundle.
+    Raw prices use one source per symbol: Eastmoney first, then Sina, then the
+    Tencent archive for historical/delisted identifiers.  Positive adjusted
+    prices always come from the separately attributed Sina factor timeline.
+    This separation is explicit in every stored bar and never permits one
+    vendor's missing raw rows to be silently filled date-by-date by another.
     """
 
     name = "akshare_eastmoney"
@@ -264,6 +286,35 @@ class AkshareEastmoneyHistorySource:
             events.append(AdjustmentEvent(code, effective_date, qfq_factor, hfq_factor, source="akshare_sina_factor"))
         return events
 
+    def fetch_raw_with_fallback(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+    ) -> tuple[dict[date, DailyBar], str]:
+        """Fetch one single-source raw series without requesting factor history."""
+        code = normalize_symbol(symbol)
+        failures: list[str] = []
+        try:
+            return {row.business_date: row for row in self.fetch_raw(code, start, end)}, "akshare_eastmoney"
+        except Exception as error:
+            failures.append(f"akshare_eastmoney: {type(error).__name__}: {error}")
+        try:
+            frame = self._sina_frame(code, start, end, "")
+            return {row.business_date: row for row in self._sina_raw_bars(code, frame)}, "akshare_sina"
+        except Exception as error:
+            failures.append(f"akshare_sina: {type(error).__name__}: {error}")
+        from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+        try:
+            rows = TencentHistorySource(
+                timeout_seconds=self.timeout_seconds,
+                attempts=min(self.attempts, 2),
+            ).fetch_raw(code, start, end)
+            return {row.business_date: row for row in rows}, "tencent_archive"
+        except Exception as error:
+            failures.append(f"tencent_archive: {type(error).__name__}: {error}")
+        raise RuntimeError(f"raw sources failed for {code}: {'; '.join(failures)}")
+
     def fetch_bundle(
         self,
         symbol: str,
@@ -277,65 +328,42 @@ class AkshareEastmoneyHistorySource:
         SecurityReference,
         dict[date, dict[str, str]],
         str,
+        str,
     ]:
         """Fetch one internally consistent primary bundle for a symbol.
 
-        Eastmoney is preferred.  If that endpoint is unavailable for this
-        symbol, the entire symbol bundle falls back to Sina.  The method never
-        mixes raw bars from one endpoint with adjusted prices from another.
+        Eastmoney is preferred, followed by Sina and Tencent raw history.  The
+        selected raw series stays single-source for the whole symbol.  A
+        separately identified factor timeline creates positive multiplicative
+        QFQ/HFQ prices and auditable corporate-action dates.
         """
 
         code = normalize_symbol(symbol)
         failures: list[str] = []
-        for source_name in ("akshare_eastmoney", "akshare_sina"):
-            try:
-                if source_name == "akshare_eastmoney":
-                    raw = {row.business_date: row for row in self.fetch_raw(code, start, end)}
-                    qfq = self.fetch_adjusted_prices(code, start, end, "qfq")
-                    hfq = self.fetch_adjusted_prices(code, start, end, "hfq")
-                else:
-                    raw = {row.business_date: row for row in self._sina_raw_bars(code, self._sina_frame(code, start, end, ""))}
-                    qfq = self._sina_adjusted_prices(code, self._sina_frame(code, start, end, "qfq"))
-                    hfq = self._sina_adjusted_prices(code, self._sina_frame(code, start, end, "hfq"))
-                try:
-                    events = self.fetch_sina_adjustments(code, end)
-                except Exception:
-                    events = self.derive_adjustments(code, raw, qfq, hfq, source_name=source_name)
-                reference = self.build_reference(code, raw, source_name=source_name)
-                status = self.build_status_from_raw(raw)
-                return raw, qfq, hfq, events, reference, status, source_name
-            except Exception as error:
-                failures.append(f"{source_name}: {type(error).__name__}: {error}")
-        raise RuntimeError(f"AKShare primary bundle failed for {code}: {'; '.join(failures)}")
+        try:
+            raw, source_name = self.fetch_raw_with_fallback(code, start, end)
+        except Exception as error:
+            failures.append(f"raw_bundle: {type(error).__name__}: {error}")
+            raise RuntimeError(f"AKShare primary bundle failed for {code}: {'; '.join(failures)}") from error
+
+        factor_source = "akshare_sina_factor_multiplicative"
+        try:
+            vendor_events = self.fetch_sina_adjustments(code, end)
+            qfq, hfq, events = build_adjusted_series_from_factor_events(
+                code, raw, vendor_events, source=factor_source,
+            )
+        except Exception as error:
+            failures.append(f"{factor_source}: {type(error).__name__}: {error}")
+            raise RuntimeError(f"AKShare factor bundle failed for {code}: {'; '.join(failures)}") from error
+        reference = self.build_reference(code, raw, source_name=source_name)
+        status = self.build_status_from_raw(raw)
+        return raw, qfq, hfq, events, reference, status, source_name, factor_source
 
     @staticmethod
     def _factor(adjusted_close: Decimal, raw_close: Decimal) -> Decimal:
         if raw_close <= 0 or adjusted_close <= 0:
             raise ValueError("cannot derive adjustment factor from nonpositive close")
         return (adjusted_close / raw_close).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-
-    def derive_adjustments(
-        self,
-        symbol: str,
-        raw: dict[date, DailyBar],
-        qfq: dict[date, tuple[Decimal, Decimal, Decimal, Decimal]],
-        hfq: dict[date, tuple[Decimal, Decimal, Decimal, Decimal]],
-        *,
-        source_name: str | None = None,
-    ) -> list[AdjustmentEvent]:
-        code = normalize_symbol(symbol)
-        source = source_name or self.name
-        events: list[AdjustmentEvent] = []
-        previous: tuple[Decimal, Decimal] | None = None
-        for business_date in sorted(set(raw) & set(qfq) & set(hfq)):
-            raw_close = raw[business_date].close
-            qfq_factor = self._factor(qfq[business_date][3], raw_close)
-            hfq_factor = self._factor(hfq[business_date][3], raw_close)
-            factors = (qfq_factor, hfq_factor)
-            if factors != previous:
-                events.append(AdjustmentEvent(code, business_date, qfq_factor, hfq_factor, source=f"{source}_derived"))
-            previous = factors
-        return events
 
     def build_status_from_raw(self, rows: dict[date, DailyBar]) -> dict[date, dict[str, str]]:
         """Return a status-like map without pretending missing bars are suspensions.

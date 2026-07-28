@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from scripts.market_data.historical_bars import _write_gzip
-from scripts.market_data.historical_quality_gates import evaluate_cross_source
+from scripts.market_data.historical_quality_gates import (
+    evaluate_active_coverage,
+    evaluate_adjustment_alignment,
+    evaluate_cross_source,
+)
 from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted as gates_accepted
 
@@ -48,13 +52,32 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
     adjustments: list[dict[str, Any]] = []
     references: list[dict[str, Any]] = []
     verification_checks: list[dict[str, Any]] = []
+    shard_content_hashes_reconcile = True
     for manifest_path in sorted(input_dir.rglob("manifest.json")):
         parent = manifest_path.parent
-        bars.extend(_read_json(parent / "historical-bars.json.gz"))
-        facts.extend(_read_json(parent / "tradeability.json.gz"))
-        adjustments.extend(_read_json(parent / "adjustment-events.json.gz"))
-        references.extend(_read_json(parent / "security-references.json"))
-        verification_checks.extend(_read_json(parent / "verification-checks.json.gz"))
+        shard_manifest = _read_json(manifest_path)
+        shard_bars = _read_json(parent / "historical-bars.json.gz")
+        shard_facts = _read_json(parent / "tradeability.json.gz")
+        shard_adjustments = _read_json(parent / "adjustment-events.json.gz")
+        shard_references = _read_json(parent / "security-references.json")
+        shard_verifications = _read_json(parent / "verification-checks.json.gz")
+        shard_content_hashes_reconcile = shard_content_hashes_reconcile and all((
+            shard_manifest.get("bar_count") == len(shard_bars),
+            shard_manifest.get("tradeability_count") == len(shard_facts),
+            shard_manifest.get("adjustment_event_count") == len(shard_adjustments),
+            shard_manifest.get("reference_count") == len(shard_references),
+            shard_manifest.get("verification_check_count") == len(shard_verifications),
+            shard_manifest.get("bars_sha256") == sha256(shard_bars),
+            shard_manifest.get("tradeability_sha256") == sha256(shard_facts),
+            shard_manifest.get("adjustments_sha256") == sha256(shard_adjustments),
+            shard_manifest.get("references_sha256") == sha256(shard_references),
+            shard_manifest.get("verification_checks_sha256") == sha256(shard_verifications),
+        ))
+        bars.extend(shard_bars)
+        facts.extend(shard_facts)
+        adjustments.extend(shard_adjustments)
+        references.extend(shard_references)
+        verification_checks.extend(shard_verifications)
 
     bars.sort(key=lambda row: (row["symbol"], row["business_date"]))
     facts.sort(key=lambda row: (row["symbol"], row["business_date"]))
@@ -84,6 +107,44 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         and len(verification_symbols) == len(set(verification_symbols))
         and sha256(verification_symbols) == manifests[0].get("global_verification_symbols_sha256")
     )
+    expected_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in facts
+    }
+    observed_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in bars
+    }
+    suspended_scope = {
+        (row["symbol"], date.fromisoformat(row["business_date"]))
+        for row in facts
+        if row.get("is_suspended", False)
+    }
+    aggregate_gates = [
+        evaluate_active_coverage(expected_scope, observed_scope, suspended_scope),
+        evaluate_adjustment_alignment(
+            (
+                (
+                    row["symbol"],
+                    date.fromisoformat(row["business_date"]),
+                    Decimal(row["close"]),
+                    Decimal(row["qfq_close"]),
+                    Decimal(row["hfq_close"]),
+                )
+                for row in bars
+            ),
+            (
+                (
+                    row["symbol"],
+                    date.fromisoformat(row["effective_date"]),
+                    Decimal(row["qfq_factor"]),
+                    Decimal(row["hfq_factor"]),
+                )
+                for row in adjustments
+            ),
+        ),
+    ]
+    aggregate_accepted = gates_accepted(aggregate_gates)
     cross_source_gates = evaluate_cross_source(
         [
             (
@@ -95,15 +156,27 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         verification_expected,
     )
     cross_source_accepted = verification_reconciles and verification_inventory_ok and gates_accepted(cross_source_gates)
-    accepted = consistent and inventory_ok and all_shards_accepted and no_duplicates and expected_reconciles and cross_source_accepted
+    accepted = (
+        consistent
+        and inventory_ok
+        and all_shards_accepted
+        and shard_content_hashes_reconcile
+        and no_duplicates
+        and expected_reconciles
+        and aggregate_accepted
+        and cross_source_accepted
+    )
     result = {
-        "manifest_version": "m2-historical-market-merged-manifest-v1",
+        "manifest_version": "m2-historical-market-merged-manifest-v2",
         "authoritative": False, "simulation_orders_allowed": False,
         "mode": manifests[0]["mode"], "business_end": manifests[0]["business_end"],
         "shard_count": shard_count, "global_symbol_count": manifests[0]["global_symbol_count"],
         "global_expected_key_count": manifests[0]["global_expected_key_count"],
         "bar_count": len(bars), "tradeability_count": len(facts),
         "adjustment_event_count": len(adjustments), "reference_count": len(references),
+        "confirmed_suspension_count": len(suspended_scope),
+        "unknown_status_count": sum(not row.get("has_secondary_status", False) for row in facts),
+        "missing_active_bar_count": len((expected_scope - suspended_scope) - observed_scope),
         "verification_expected_count": verification_expected,
         "verification_check_count": len(verification_checks),
         "bars_sha256": sha256(bars), "tradeability_sha256": sha256(facts),
@@ -113,11 +186,14 @@ def merge(input_dir: Path, output_dir: Path) -> dict[str, Any]:
         "merge_checks": {
             "consistent_shard_metadata": consistent, "complete_shard_inventory": inventory_ok,
             "all_shards_accepted": all_shards_accepted, "no_cross_shard_duplicates": no_duplicates,
+            "shard_content_hashes_reconcile": shard_content_hashes_reconcile,
             "expected_counts_reconcile": expected_reconciles,
+            "global_aggregate_accepted": aggregate_accepted,
             "verification_counts_reconcile": verification_reconciles,
             "verification_symbol_inventory_reconciles": verification_inventory_ok,
             "cross_source_accepted": cross_source_accepted,
         },
+        "global_aggregate_gates": [gate.canonical() for gate in aggregate_gates],
         "cross_source_gates": [gate.canonical() for gate in cross_source_gates],
         "shard_manifests": manifests,
     }

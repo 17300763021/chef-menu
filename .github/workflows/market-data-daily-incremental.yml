@@ -1,0 +1,132 @@
+name: M2 Daily Market Increment
+
+on:
+  schedule:
+    - cron: "45 9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      target_session:
+        description: "Optional next trading session; blank advances exactly one missing session"
+        required: false
+        type: string
+      tidb_ru_percent:
+        description: "Current TiDB monthly Request Units percentage from Usage this month"
+        required: true
+        type: string
+      tidb_ru_checked_at:
+        description: "Date the TiDB percentage was checked (YYYY-MM-DD, no older than 7 days)"
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-daily-incremental.yml
+      - scripts/market_data/daily_*.py
+      - scripts/market_data/tidb_daily_store.py
+      - scripts/market_data/sources/akshare_history_source.py
+      - scripts/test_market_data_daily_incremental.py
+      - scripts/test_market_data_daily_quota.py
+      - scripts/test_tidb_daily_store.py
+      - scripts/market_data/requirements.lock.txt
+      - .python-version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m2-daily-market-increment
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  deterministic-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned M2 dependencies
+        run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Run deterministic M2 daily and prerequisite tests
+        run: |
+          python -m scripts.test_market_data_daily_incremental
+          python -m scripts.test_market_data_daily_quota
+          python -m scripts.test_tidb_daily_store
+          python -m scripts.test_market_data_contracts
+          python -m scripts.test_market_data_quality
+          python -m scripts.test_market_calendar
+          python -m scripts.test_point_in_time_universe
+          python -m scripts.test_adjustment_engine
+          python -m scripts.test_tradeability
+          python -m scripts.test_baostock_calendar_source
+          python -m scripts.test_baostock_history_source
+
+  quota-gate:
+    if: github.event_name == 'workflow_dispatch' || vars.M2_DAILY_ENABLED == 'true'
+    needs: deterministic-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - name: Enforce fresh TiDB free-quota attestation below 80 percent
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_ENABLED: ${{ vars.M2_DAILY_ENABLED }}
+          MANUAL_RU_PERCENT: ${{ inputs.tidb_ru_percent }}
+          MANUAL_CHECKED_AT: ${{ inputs.tidb_ru_checked_at }}
+          SCHEDULED_RU_PERCENT: ${{ vars.TIDB_RU_PERCENT }}
+          SCHEDULED_CHECKED_AT: ${{ vars.TIDB_RU_CHECKED_AT }}
+        run: >-
+          python -m scripts.market_data.daily_quota_guard
+          --event-name "$EVENT_NAME"
+          --schedule-enabled "${SCHEDULE_ENABLED:-false}"
+          --reported-percent "${MANUAL_RU_PERCENT:-$SCHEDULED_RU_PERCENT}"
+          --checked-at "${MANUAL_CHECKED_AT:-$SCHEDULED_CHECKED_AT}"
+
+  ingest:
+    if: github.event_name == 'workflow_dispatch' || vars.M2_DAILY_ENABLED == 'true'
+    needs: [deterministic-tests, quota-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned M2 dependencies
+        run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Capture and atomically publish exactly one missing daily session
+        env:
+          INPUT_TARGET_SESSION: ${{ inputs.target_session }}
+          M2_BASE_HISTORY_DATASET_ID: ${{ vars.M2_BASE_HISTORY_DATASET_ID }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: |
+          args=(--init-schema --output-dir daily-market-increment --symbol-attempts 2)
+          if [[ -n "$INPUT_TARGET_SESSION" ]]; then
+            args+=(--target-session "$INPUT_TARGET_SESSION")
+          fi
+          python -u -m scripts.market_data.daily_incremental_runner "${args[@]}"
+      - name: Upload compact non-authoritative daily manifest
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m2-daily-manifest-${{ github.run_id }}
+          path: daily-market-increment/manifest.json
+          if-no-files-found: ignore
+          retention-days: 7

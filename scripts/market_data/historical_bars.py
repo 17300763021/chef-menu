@@ -5,17 +5,20 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import signal
 import sys
 import time
 from bisect import bisect_right
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import date, timedelta
 from decimal import Decimal
+from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from scripts.market_data.calendar_contracts import CALENDAR_SCHEMA_VERSION, TradingCalendar
 from scripts.market_data.contracts import DailyBar
@@ -38,9 +41,99 @@ from scripts.market_data.universe_contracts import CurrentUniverse, INDEX_SIZES
 SHARD_SIZE = 10
 SMOKE_SYMBOLS = 20
 PREFLIGHT_SYMBOLS = 100
-SYMBOL_DEADLINE_SECONDS = 90
+SYMBOL_DEADLINE_SECONDS = 60
 FULL_HISTORY_ACQUISITION_STAGGER_SECONDS = 10
 FULL_HISTORY_ACQUISITION_STAGGER_BUCKETS = 6
+ACQUISITION_POLICIES = ("capture", "repair", "finalize")
+PLAN_RUNTIME_FIELDS = {
+    "acquisition_policy",
+    "repair_matrix",
+    "repair_shard_count",
+    "repair_symbol_count",
+    "resumable_symbol_count",
+    "repair_details",
+    "plan_evidence_sha256",
+}
+VerificationCheck = tuple[str, date, Decimal, Decimal, str]
+UNKNOWN_VERIFICATION_SOURCES = {"", "unknown", "unknown_legacy", "legacy_manifest_evidence"}
+
+
+class SymbolDeadlineInterrupt(BaseException):
+    """Private control-flow exception that vendor ``except Exception`` blocks cannot swallow."""
+
+
+@lru_cache(maxsize=1)
+def frozen_archive_source():
+    """Load and validate the bounded archive only when a live request needs it."""
+    from scripts.market_data.sources.frozen_archive_history_source import FrozenArchiveHistorySource
+
+    return FrozenArchiveHistorySource()
+
+
+def fetch_verification_with_archive(
+    source: AkshareHistorySource,
+    symbol: str,
+    start: date,
+    end: date,
+    excluded_sources: set[str],
+) -> list[DailyBar]:
+    """Fetch one independent verification series, with an immutable bounded fallback."""
+    try:
+        return source.fetch_raw(symbol, start, end, exclude_sources=excluded_sources)
+    except Exception as live_error:
+        from scripts.market_data.sources.frozen_archive_history_source import (
+            VERIFICATION_SOURCE,
+            FrozenArchiveHistorySource,
+        )
+
+        if VERIFICATION_SOURCE in excluded_sources or not FrozenArchiveHistorySource.supports(symbol, start, end):
+            raise
+        try:
+            rows = frozen_archive_source().fetch_verification(symbol, start, end)
+        except Exception as archive_error:
+            raise RuntimeError(
+                f"live verification failed for {symbol}: {type(live_error).__name__}: {live_error}; "
+                f"bounded archive verification failed: {type(archive_error).__name__}: {archive_error}"
+            ) from archive_error
+        _progress(
+            "frozen_archive_verification_used",
+            symbol=symbol,
+            live_error=f"{type(live_error).__name__}: {live_error}",
+            rows=len(rows),
+            dataset_sha256=frozen_archive_source().dataset_sha256,
+        )
+        return rows
+
+
+def fetch_bundle_from_live_or_archive(
+    source: AkshareEastmoneyHistorySource,
+    symbol: str,
+    start: date,
+    end: date,
+):
+    """Use the live bundle first and the validated archive only for its exact bounded scope."""
+    try:
+        return source.fetch_bundle(symbol, start, end)
+    except (Exception, SymbolDeadlineInterrupt) as live_error:
+        from scripts.market_data.sources.frozen_archive_history_source import FrozenArchiveHistorySource
+
+        if not FrozenArchiveHistorySource.supports(symbol, start, end):
+            raise
+        try:
+            bundle = frozen_archive_source().fetch_bundle(symbol, start, end)
+        except Exception as archive_error:
+            raise RuntimeError(
+                f"live primary bundle failed for {symbol}: {type(live_error).__name__}: {live_error}; "
+                f"bounded archive primary failed: {type(archive_error).__name__}: {archive_error}"
+            ) from archive_error
+        _progress(
+            "frozen_archive_primary_used",
+            symbol=symbol,
+            live_error=f"{type(live_error).__name__}: {live_error}",
+            rows=len(bundle[0]),
+            dataset_sha256=frozen_archive_source().dataset_sha256,
+        )
+        return bundle
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -57,12 +150,40 @@ def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, 
     return output
 
 
-def fetch_primary(symbols: list[str], ranges: dict[str, tuple[date, date]], workers: int) -> tuple[dict[str, list[DailyBar]], dict[str, str]]:
-    source = AkshareHistorySource(attempts=5)
+def fetch_primary(
+    symbols: list[str],
+    ranges: dict[str, tuple[date, date]],
+    workers: int,
+    *,
+    excluded_sources_by_symbol: dict[str, set[str]] | None = None,
+) -> tuple[dict[str, list[DailyBar]], dict[str, str]]:
+    source = AkshareHistorySource(timeout_seconds=15, attempts=2)
+    excluded = excluded_sources_by_symbol or {}
     output: dict[str, list[DailyBar]] = {}
     failures: dict[str, str] = {}
+    if workers == 1:
+        for symbol in symbols:
+            try:
+                with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
+                    output[symbol] = fetch_verification_with_archive(
+                        source, symbol, *ranges[symbol], excluded.get(symbol, set()),
+                    )
+            except SymbolDeadlineInterrupt as error:
+                failures[symbol] = f"TimeoutError: {error}"
+            except Exception as error:
+                failures[symbol] = f"{type(error).__name__}: {error}"
+        return output, failures
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(source.fetch_raw, symbol, *ranges[symbol]): symbol for symbol in symbols}
+        futures = {
+            executor.submit(
+                fetch_verification_with_archive,
+                source,
+                symbol,
+                *ranges[symbol],
+                excluded.get(symbol, set()),
+            ): symbol
+            for symbol in symbols
+        }
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -156,7 +277,7 @@ def symbol_deadline(seconds: int):
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def raise_timeout(signum: int, frame: object) -> None:
-        raise TimeoutError(f"symbol acquisition exceeded {seconds} seconds")
+        raise SymbolDeadlineInterrupt(f"symbol acquisition exceeded {seconds} seconds")
 
     signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -177,6 +298,83 @@ def _row_for_tradeability(bar: DailyBar | None) -> dict[str, object] | None:
     return {"high": bar.high, "low": bar.low, "close": bar.close}
 
 
+def _historical_bar_from_canonical(row: dict[str, Any]) -> HistoricalBar:
+    decimal_fields = (
+        "open", "high", "low", "close", "previous_close", "amount_cny", "turnover_percent",
+        "qfq_factor", "hfq_factor", "qfq_open", "qfq_high", "qfq_low", "qfq_close",
+        "hfq_open", "hfq_high", "hfq_low", "hfq_close",
+    )
+    values = {field: None if row.get(field) is None else Decimal(str(row[field])) for field in decimal_fields}
+    return HistoricalBar(
+        symbol=str(row["symbol"]), exchange=str(row["exchange"]),
+        business_date=date.fromisoformat(str(row["business_date"])), index_code=str(row["index_code"]),
+        open=values["open"], high=values["high"], low=values["low"], close=values["close"],
+        previous_close=values["previous_close"], volume_shares=int(row["volume_shares"]),
+        amount_cny=values["amount_cny"], turnover_percent=values["turnover_percent"],
+        qfq_factor=values["qfq_factor"], hfq_factor=values["hfq_factor"],
+        qfq_open=values["qfq_open"], qfq_high=values["qfq_high"], qfq_low=values["qfq_low"], qfq_close=values["qfq_close"],
+        hfq_open=values["hfq_open"], hfq_high=values["hfq_high"], hfq_low=values["hfq_low"], hfq_close=values["hfq_close"],
+        primary_source=str(row.get("primary_source") or "unknown"),
+        factor_source=str(row.get("factor_source") or "unknown"),
+        schema_version=str(row.get("schema_version") or "m2-historical-market-v1"),
+    )
+
+
+def _tradeability_from_canonical(row: dict[str, Any]) -> TradeabilityFact:
+    return TradeabilityFact(
+        symbol=str(row["symbol"]), business_date=date.fromisoformat(str(row["business_date"])),
+        index_code=str(row["index_code"]), has_primary_bar=bool(row["has_primary_bar"]),
+        has_secondary_status=bool(row["has_secondary_status"]), is_suspended=bool(row["is_suspended"]),
+        is_st=None if row.get("is_st") is None else bool(row["is_st"]),
+        listing_age_sessions=int(row["listing_age_sessions"]),
+        limit_rate=None if row.get("limit_rate") is None else Decimal(str(row["limit_rate"])),
+        limit_up=None if row.get("limit_up") is None else Decimal(str(row["limit_up"])),
+        limit_down=None if row.get("limit_down") is None else Decimal(str(row["limit_down"])),
+        at_limit_up=bool(row["at_limit_up"]), at_limit_down=bool(row["at_limit_down"]),
+        one_price_limit_up=bool(row["one_price_limit_up"]), one_price_limit_down=bool(row["one_price_limit_down"]),
+        can_buy=bool(row["can_buy"]), can_sell=bool(row["can_sell"]),
+        block_reasons=tuple(str(value) for value in row.get("block_reasons", [])),
+        schema_version=str(row.get("schema_version") or "m2-tradeability-v1"),
+    )
+
+
+def _adjustment_from_canonical(row: dict[str, Any]) -> AdjustmentEvent:
+    return AdjustmentEvent(
+        symbol=str(row["symbol"]), effective_date=date.fromisoformat(str(row["effective_date"])),
+        qfq_factor=Decimal(str(row["qfq_factor"])), hfq_factor=Decimal(str(row["hfq_factor"])),
+        source=str(row.get("source") or "unknown"),
+    )
+
+
+def _reference_from_canonical(row: dict[str, Any]) -> SecurityReference:
+    return SecurityReference(
+        symbol=str(row["symbol"]), exchange=str(row["exchange"]), name=str(row["name"]),
+        ipo_date=date.fromisoformat(str(row["ipo_date"])),
+        out_date=None if row.get("out_date") is None else date.fromisoformat(str(row["out_date"])),
+        source=str(row.get("source") or "unknown"),
+    )
+
+
+def _close_check_from_canonical(row: dict[str, Any]) -> VerificationCheck:
+    return (
+        str(row["symbol"]), date.fromisoformat(str(row["business_date"])),
+        Decimal(str(row["primary_close"])), Decimal(str(row["verification_close"])),
+        str(row.get("verification_source") or "unknown_legacy"),
+    )
+
+
+def _confirmed_status_only_facts(rows: list[TradeabilityFact]) -> bool:
+    """Accept zero bars only when every scoped session is explicitly suspended."""
+    return bool(rows) and all(
+        not row.has_primary_bar
+        and row.has_secondary_status
+        and row.is_suspended
+        and not row.can_buy
+        and not row.can_sell
+        for row in rows
+    )
+
+
 def run(
     end: date,
     *,
@@ -184,12 +382,17 @@ def run(
     workers: int = 4,
     shard_index: int = 0,
     shard_count: int = 1,
-    symbol_attempts: int = 2,
+    symbol_attempts: int = 1,
     current_universe: CurrentUniverse | None = None,
     csi_discovered_notice_ids: set[int] | None = None,
     primary_calendar: TradingCalendar | None = None,
     secondary_calendar: TradingCalendar | None = None,
-) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
+    resume_evidence: Any | None = None,
+    checkpoint_callback: Callable[..., None] | None = None,
+    acquisition_policy: str = "capture",
+) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[VerificationCheck]]:
+    if acquisition_policy not in ACQUISITION_POLICIES:
+        raise ValueError(f"unsupported acquisition policy: {acquisition_policy}")
     start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
     using_frozen_calendars = primary_calendar is not None and secondary_calendar is not None
@@ -235,139 +438,378 @@ def run(
         for symbol in symbols
     }
     verification_targets = [symbol for symbol in global_verification_targets if symbol in symbol_set]
+
+    resumed_bars = [_historical_bar_from_canonical(row) for row in getattr(resume_evidence, "bars", [])]
+    resumed_facts = [_tradeability_from_canonical(row) for row in getattr(resume_evidence, "tradeability", [])]
+    resumed_adjustments = [_adjustment_from_canonical(row) for row in getattr(resume_evidence, "adjustments", [])]
+    resumed_references = [_reference_from_canonical(row) for row in getattr(resume_evidence, "references", [])]
+    resumed_checks = [_close_check_from_canonical(row) for row in getattr(resume_evidence, "verification_checks", [])]
+    claimed_resumed = set(getattr(resume_evidence, "manifest", {}).get("resumed_symbols", []))
+    resumed_bar_keys = {(row.symbol, row.business_date) for row in resumed_bars}
+    resumed_fact_keys = {(row.symbol, row.business_date) for row in resumed_facts}
+    resumed_reference_symbols = {row.symbol for row in resumed_references}
+    resumed_primary_sources = {
+        str(symbol): str(source)
+        for symbol, source in getattr(resume_evidence, "manifest", {}).get("primary_sources_by_symbol", {}).items()
+    }
+    valid_resumed: set[str] = set()
+    for symbol in claimed_resumed & symbol_set:
+        expected_for_symbol = {key for key in expected if key[0] == symbol}
+        bars_for_symbol = {key for key in resumed_bar_keys if key[0] == symbol}
+        facts_for_symbol = {key for key in resumed_fact_keys if key[0] == symbol}
+        primary_fact_keys = {
+            (row.symbol, row.business_date)
+            for row in resumed_facts
+            if row.symbol == symbol and row.has_primary_bar
+        }
+        adjusted_complete = all(
+            min(
+                row.qfq_open, row.qfq_high, row.qfq_low, row.qfq_close,
+                row.hfq_open, row.hfq_high, row.hfq_low, row.hfq_close,
+            ) > 0
+            for row in resumed_bars
+            if row.symbol == symbol
+        )
+        status_only_complete = (
+            not bars_for_symbol
+            and _confirmed_status_only_facts([
+                row for row in resumed_facts if row.symbol == symbol
+            ])
+        )
+        if (
+            (bool(bars_for_symbol) or status_only_complete)
+            and bars_for_symbol == primary_fact_keys
+            and bars_for_symbol <= expected_for_symbol
+            and facts_for_symbol == expected_for_symbol
+            and symbol in resumed_reference_symbols
+            and adjusted_complete
+        ):
+            valid_resumed.add(symbol)
+    ignored_resumed = sorted((claimed_resumed & symbol_set) - valid_resumed)
+    if claimed_resumed:
+        _progress("tidb_resume_validated", resumed=len(valid_resumed), ignored=len(ignored_resumed), ignored_symbols=ignored_resumed)
+
+    bars = [row for row in resumed_bars if row.symbol in valid_resumed]
+    facts = [row for row in resumed_facts if row.symbol in valid_resumed]
+    adjustments = [row for row in resumed_adjustments if row.symbol in valid_resumed]
+    references = [row for row in resumed_references if row.symbol in valid_resumed]
+    close_checks = [row for row in resumed_checks if row[0] in valid_resumed and (row[0], row[1]) in expected]
+    primary_sources_by_symbol = {
+        symbol: next(
+            (row.primary_source for row in bars if row.symbol == symbol),
+            resumed_primary_sources.get(symbol, "unknown"),
+        )
+        for symbol in sorted(valid_resumed)
+    }
+    factor_sources_by_symbol = {
+        symbol: sorted({row.factor_source for row in bars if row.symbol == symbol})
+        for symbol in sorted(valid_resumed)
+    }
+    resumed_check_counts = {
+        symbol: sum(1 for check in close_checks if check[0] == symbol)
+        for symbol in verification_targets
+    }
+    resumed_bar_counts = {
+        symbol: sum(1 for row in bars if row.symbol == symbol)
+        for symbol in verification_targets
+    }
+    resumed_attributed_check_counts = {
+        symbol: sum(
+            1 for check in close_checks
+            if check[0] == symbol and check[4] not in UNKNOWN_VERIFICATION_SOURCES
+        )
+        for symbol in verification_targets
+    }
+    verification_fetch_targets = [
+        symbol for symbol in verification_targets
+        if (
+            symbol not in valid_resumed
+            or resumed_check_counts[symbol] < resumed_bar_counts[symbol]
+            or resumed_attributed_check_counts[symbol] < resumed_bar_counts[symbol]
+        )
+    ]
+    if acquisition_policy == "finalize":
+        missing_resume_symbols = sorted(symbol_set - valid_resumed)
+        if missing_resume_symbols or verification_fetch_targets:
+            problems = []
+            if missing_resume_symbols:
+                problems.append(f"missing or invalid symbol checkpoints: {', '.join(missing_resume_symbols)}")
+            if verification_fetch_targets:
+                problems.append(f"incomplete verification checkpoints: {', '.join(verification_fetch_targets)}")
+            raise RuntimeError("finalize policy forbids public market-data requests; " + "; ".join(problems))
+    checkpoint_failures: dict[str, str] = {}
     verification_delay = 0 if mode == "sample" else (shard_index % 4) * 5
-    if verification_delay:
+    if verification_fetch_targets and verification_delay:
         _progress("verification_stagger", delay_seconds=verification_delay)
         time.sleep(verification_delay)
-    _progress("verification_started", symbols=len(verification_targets))
-    verification_by_symbol, verification_failures = fetch_primary(verification_targets, ranges, 1)
+    _progress("verification_started", symbols=len(verification_fetch_targets), resumed=len(verification_targets) - len(verification_fetch_targets))
+    verification_exclusions = {
+        symbol: {primary_sources_by_symbol[symbol]}
+        for symbol in verification_fetch_targets
+        if symbol in primary_sources_by_symbol
+    }
+    verification_by_symbol, verification_failures = fetch_primary(
+        verification_fetch_targets,
+        ranges,
+        1,
+        excluded_sources_by_symbol=verification_exclusions,
+    ) if verification_fetch_targets else ({}, {})
     _progress("verification_completed", succeeded=len(verification_by_symbol), failed=len(verification_failures))
+    verification_map = {row.key: row for rows in verification_by_symbol.values() for row in rows if row.key in expected}
+    if verification_fetch_targets:
+        refreshed_symbols = set(verification_fetch_targets)
+        close_checks = [row for row in close_checks if row[0] not in refreshed_symbols]
+        for resumed_bar in bars:
+            if resumed_bar.symbol not in refreshed_symbols:
+                continue
+            verification = verification_map.get(resumed_bar.key)
+            if verification is not None:
+                close_checks.append((
+                    resumed_bar.symbol, resumed_bar.business_date,
+                    resumed_bar.close, verification.close,
+                    verification.source,
+                ))
+        if checkpoint_callback is not None:
+            for symbol in sorted(refreshed_symbols & valid_resumed):
+                symbol_bars = [row for row in bars if row.symbol == symbol]
+                symbol_facts = [row for row in facts if row.symbol == symbol]
+                symbol_adjustments = [row for row in adjustments if row.symbol == symbol]
+                symbol_reference = next((row for row in references if row.symbol == symbol), None)
+                symbol_checks = [row for row in close_checks if row[0] == symbol]
+                try:
+                    checkpoint_callback(
+                        symbol, symbol_bars, symbol_facts, symbol_adjustments,
+                        symbol_reference, symbol_checks,
+                        primary_sources_by_symbol.get(symbol), None,
+                    )
+                    _progress("tidb_verification_checkpoint_refreshed", symbol=symbol, checks=len(symbol_checks))
+                except Exception as error:
+                    checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
+                    _progress("tidb_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
 
+    acquisition_symbols = [symbol for symbol in symbols if symbol not in valid_resumed]
     history_delay = history_stagger_seconds(mode, shard_index)
-    if history_delay:
+    if acquisition_symbols and history_delay:
         _progress("history_stagger", delay_seconds=history_delay)
         time.sleep(history_delay)
 
-    status_by_symbol: dict[str, dict[date, dict[str, str]]] = {}
-    raw_by_symbol: dict[str, dict[date, DailyBar]] = {}
-    qfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
-    hfq_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
-    factors_by_symbol: dict[str, dict[date, tuple[Decimal, Decimal]]] = {}
-    references: list[SecurityReference] = []
-    adjustments: list[AdjustmentEvent] = []
-    primary_sources_by_symbol: dict[str, str] = {}
     primary_failures: dict[str, str] = {}
     started_at = time.monotonic()
-    source = AkshareEastmoneyHistorySource(timeout_seconds=30, attempts=5)
-    for position, symbol in enumerate(symbols, start=1):
+    source = AkshareEastmoneyHistorySource(timeout_seconds=20, attempts=2) if acquisition_symbols else None
+    for position, symbol in enumerate(acquisition_symbols, start=1):
+        _progress("symbol_started", symbol=symbol, position=position, total=len(acquisition_symbols))
         last_error: Exception | None = None
+        raw: dict[date, DailyBar] = {}
+        qfq: dict[date, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+        hfq: dict[date, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+        factors: dict[date, tuple[Decimal, Decimal]] = {}
+        status: dict[date, dict[str, str]] = {}
+        events_for_symbol: list[AdjustmentEvent] = []
+        reference: SecurityReference | None = None
+        primary_source_name: str | None = None
+        factor_source_name: str | None = None
         for attempt in range(1, symbol_attempts + 1):
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
-                    raw, qfq, hfq, events_for_symbol, reference, status, primary_source_name = source.fetch_bundle(symbol, *ranges[symbol])
+                    assert source is not None
+                    (
+                        raw, qfq, hfq, events_for_symbol, reference, status,
+                        primary_source_name, factor_source_name,
+                    ) = fetch_bundle_from_live_or_archive(source, symbol, *ranges[symbol])
                     factors = {
                         business_date: (
                             source._factor(qfq[business_date][3], raw[business_date].close),
                             source._factor(hfq[business_date][3], raw[business_date].close),
                         )
                         for business_date in set(raw) & set(qfq) & set(hfq)
+                        if raw[business_date].close > 0
+                        and qfq[business_date][3] > 0
+                        and hfq[business_date][3] > 0
                     }
-                status_by_symbol[symbol] = status
-                raw_by_symbol[symbol] = raw
-                qfq_by_symbol[symbol] = qfq
-                hfq_by_symbol[symbol] = hfq
-                factors_by_symbol[symbol] = factors
-                primary_sources_by_symbol[symbol] = primary_source_name
-                references.append(reference)
-                adjustments.extend(events_for_symbol)
                 last_error = None
                 break
+            except SymbolDeadlineInterrupt as error:
+                last_error = TimeoutError(str(error))
+                _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"TimeoutError: {error}")
+                if attempt < symbol_attempts:
+                    time.sleep(2 ** (attempt - 1))
             except Exception as error:
                 last_error = error
                 _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"{type(error).__name__}: {error}")
                 if attempt < symbol_attempts:
                     time.sleep(2 ** (attempt - 1))
+
+        symbol_bars: list[HistoricalBar] = []
+        symbol_facts: list[TradeabilityFact] = []
+        symbol_checks: list[VerificationCheck] = []
+        for (expected_symbol, business_date), index_code in sorted(expected.items()):
+            if expected_symbol != symbol:
+                continue
+            primary = raw.get(business_date)
+            secondary = status.get(business_date)
+            age = listing_age(reference, business_date, primary_calendar.open_dates) if reference else 0
+            symbol_facts.append(derive_tradeability(
+                symbol=symbol, business_date=business_date, index_code=index_code, listing_age_sessions=age,
+                primary=_row_for_tradeability(primary), secondary=secondary,
+            ))
+            symbol_factors = factors.get(business_date)
+            adjusted_qfq = qfq.get(business_date)
+            adjusted_hfq = hfq.get(business_date)
+            if primary is None or symbol_factors is None or adjusted_qfq is None or adjusted_hfq is None:
+                continue
+            qfq_factor, hfq_factor = symbol_factors
+            previous_close = Decimal(secondary["preclose"]) if secondary and secondary.get("preclose") else None
+            symbol_bars.append(HistoricalBar.build(
+                symbol=symbol, business_date=business_date, index_code=index_code,
+                open_price=primary.open, high=primary.high, low=primary.low, close=primary.close,
+                previous_close=previous_close, volume_shares=primary.volume_shares,
+                amount_cny=primary.amount_cny, turnover_percent=primary.turnover_percent,
+                qfq_factor=qfq_factor, hfq_factor=hfq_factor,
+                qfq_prices=adjusted_qfq, hfq_prices=adjusted_hfq,
+                primary_source=primary_source_name or "unknown",
+                factor_source=factor_source_name or "unknown",
+            ))
+            verification = verification_map.get((symbol, business_date))
+            if verification:
+                symbol_checks.append((
+                    symbol, business_date, primary.close, verification.close, verification.source,
+                ))
+
+        error_message = None
         if last_error is not None:
-            primary_failures[symbol] = f"{type(last_error).__name__}: {last_error}"
+            error_message = f"{type(last_error).__name__}: {last_error}"
+            primary_failures[symbol] = error_message
+        else:
+            primary_sources_by_symbol[symbol] = primary_source_name or "unknown"
+            factor_sources_by_symbol[symbol] = [factor_source_name or "unknown"]
+            if reference is not None:
+                references.append(reference)
+            adjustments.extend(events_for_symbol)
+        bars.extend(symbol_bars)
+        facts.extend(symbol_facts)
+        close_checks.extend(symbol_checks)
+
+        if checkpoint_callback is not None:
+            try:
+                checkpoint_callback(
+                    symbol, symbol_bars, symbol_facts, events_for_symbol if last_error is None else [],
+                    reference if last_error is None else None, symbol_checks,
+                    primary_source_name if last_error is None else None, error_message,
+                )
+                _progress("tidb_symbol_checkpointed", symbol=symbol, status="failed" if error_message else "succeeded")
+            except Exception as error:
+                checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
+                _progress("tidb_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
+
         elapsed = max(time.monotonic() - started_at, 0.001)
+        completed = len(valid_resumed) + position
+        total = len(symbols)
         _progress(
-            "symbol_completed", symbol=symbol, completed=position, total=len(symbols),
-            succeeded=position - len(primary_failures), failed=len(primary_failures),
-            elapsed_seconds=round(elapsed, 1), estimated_remaining_seconds=round(elapsed / position * (len(symbols) - position), 1),
+            "symbol_completed", symbol=symbol, completed=completed, total=total,
+            resumed=len(valid_resumed), succeeded=completed - len(primary_failures), failed=len(primary_failures),
+            elapsed_seconds=round(elapsed, 1),
+            estimated_remaining_seconds=round(elapsed / position * (len(acquisition_symbols) - position), 1),
         )
 
-    primary_map = {(symbol, day): row for symbol, rows in raw_by_symbol.items() for day, row in rows.items() if (symbol, day) in expected}
-    verification_map = {row.key: row for rows in verification_by_symbol.values() for row in rows if row.key in expected}
-    reference_map = {row.symbol: row for row in references}
-    factor_map = {(symbol, day): factors for symbol, rows in factors_by_symbol.items() for day, factors in rows.items()}
-
-    bars: list[HistoricalBar] = []
-    facts: list[TradeabilityFact] = []
-    close_checks: list[tuple[str, date, Decimal, Decimal]] = []
-    for (symbol, business_date), index_code in sorted(expected.items()):
-        raw = primary_map.get((symbol, business_date))
-        secondary = status_by_symbol.get(symbol, {}).get(business_date)
-        reference = reference_map.get(symbol)
-        age = listing_age(reference, business_date, primary_calendar.open_dates) if reference else 0
-        fact = derive_tradeability(
-            symbol=symbol, business_date=business_date, index_code=index_code, listing_age_sessions=age,
-            primary=_row_for_tradeability(raw), secondary=secondary,
-        )
-        facts.append(fact)
-        if raw is None:
-            continue
-        factors = factor_map.get((symbol, business_date))
-        if factors is None:
-            continue
-        qfq_factor, hfq_factor = factors
-        qfq = qfq_by_symbol.get(symbol, {}).get(business_date)
-        hfq = hfq_by_symbol.get(symbol, {}).get(business_date)
-        if qfq is None or hfq is None:
-            continue
-        previous_close = Decimal(secondary["preclose"]) if secondary and secondary.get("preclose") else None
-        bars.append(HistoricalBar.build(
-            symbol=symbol, business_date=business_date, index_code=index_code,
-            open_price=raw.open, high=raw.high, low=raw.low, close=raw.close, previous_close=previous_close,
-            volume_shares=raw.volume_shares, amount_cny=raw.amount_cny, turnover_percent=raw.turnover_percent,
-            qfq_factor=qfq_factor, hfq_factor=hfq_factor,
-            qfq_prices=qfq, hfq_prices=hfq, primary_source=primary_sources_by_symbol.get(symbol, "unknown"),
-        ))
-        verification = verification_map.get((symbol, business_date))
-        if verification:
-            close_checks.append((symbol, business_date, raw.close, verification.close))
-
-    verification_expected = sum(
-        1 for key in primary_map
-        if key[0] in set(verification_targets)
-    )
+    verification_expected = sum(1 for row in bars if row.symbol in set(verification_targets))
 
     historical_gates = evaluate_historical(
         expected_keys=set(expected), calendar_dates=set(sessions), bars=bars, facts=facts,
-        adjustments=adjustments, close_checks=close_checks, verification_expected=verification_expected,
+        adjustments=adjustments,
+        close_checks=(row[:4] for row in close_checks),
+        verification_expected=verification_expected,
         cross_source_critical=shard_count == 1,
+        aggregate_critical=shard_count == 1,
     )
     gates = [*calendar_gates, *universe_gates, *historical_gates]
-    canonical_bars = [row.canonical() for row in sorted(bars, key=lambda value: value.key)]
-    canonical_facts = [row.canonical() for row in sorted(facts, key=lambda value: (value.symbol, value.business_date))]
-    canonical_adjustments = [row.canonical() for row in sorted(adjustments, key=lambda value: (value.symbol, value.effective_date))]
-    canonical_close_checks = [
-        {
-            "symbol": symbol, "business_date": business_date.isoformat(),
-            "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
-        }
-        for symbol, business_date, primary, verification in sorted(close_checks)
-    ]
     verification_sources_by_symbol = {
-        symbol: sorted({row.source for row in rows})
-        for symbol, rows in sorted(verification_by_symbol.items())
+        symbol: sorted({row[4] for row in close_checks if row[0] == symbol})
+        for symbol in sorted({row[0] for row in close_checks})
     }
     verification_source_overlap_symbols = sorted(
         symbol for symbol, sources in verification_sources_by_symbol.items()
         if primary_sources_by_symbol.get(symbol) in sources
     )
+    unattributed_verification_symbols = sorted(
+        symbol for symbol, sources in verification_sources_by_symbol.items()
+        if any(source in UNKNOWN_VERIFICATION_SOURCES for source in sources)
+    )
+    frozen_archive_symbols = sorted({
+        symbol
+        for symbol, source_name in primary_sources_by_symbol.items()
+        if source_name.endswith("_frozen")
+    } | {
+        symbol
+        for symbol, source_names in verification_sources_by_symbol.items()
+        if any(source_name.endswith("_frozen") for source_name in source_names)
+    })
+    frozen_archive_dataset_sha256 = (
+        frozen_archive_source().dataset_sha256 if frozen_archive_symbols else None
+    )
+    gates.append(GateResult(
+        "verification_source_attribution",
+        not unattributed_verification_symbols,
+        len(unattributed_verification_symbols),
+        "= 0 unattributed verification sources",
+        details=tuple(unattributed_verification_symbols),
+    ))
+    gates.append(GateResult(
+        "verification_source_independence",
+        not verification_source_overlap_symbols,
+        len(verification_source_overlap_symbols),
+        "= 0 primary/verification source overlaps",
+        details=tuple(verification_source_overlap_symbols),
+    ))
+    if acquisition_policy in {"repair", "finalize"}:
+        completed_symbols = set(valid_resumed) | set(primary_sources_by_symbol)
+        incomplete_symbols = sorted(symbol_set - completed_symbols)
+        gates.append(GateResult(
+            "checkpoint_symbol_completion",
+            not primary_failures and not incomplete_symbols,
+            len(incomplete_symbols),
+            "= 0",
+            details=tuple(incomplete_symbols),
+        ))
+        verification_bar_counts = {
+            symbol: sum(1 for row in bars if row.symbol == symbol)
+            for symbol in verification_targets
+        }
+        verification_check_counts = {
+            symbol: sum(1 for row in close_checks if row[0] == symbol)
+            for symbol in verification_targets
+        }
+        incomplete_verification_symbols = sorted(
+            symbol for symbol in verification_targets
+            if verification_check_counts[symbol] != verification_bar_counts[symbol]
+        )
+        gates.append(GateResult(
+            "checkpoint_verification_completion",
+            not incomplete_verification_symbols,
+            len(incomplete_verification_symbols),
+            "= 0",
+            details=tuple(incomplete_verification_symbols),
+        ))
+    if checkpoint_callback is not None:
+        gates.append(GateResult(
+            "tidb_symbol_checkpoint_writes", not checkpoint_failures, len(checkpoint_failures), "= 0",
+            details=tuple(f"{symbol}: {message}" for symbol, message in sorted(checkpoint_failures.items())),
+        ))
+    canonical_bars = [row.canonical() for row in sorted(bars, key=lambda value: value.key)]
+    canonical_facts = [row.canonical() for row in sorted(facts, key=lambda value: (value.symbol, value.business_date))]
+    canonical_adjustments = [row.canonical() for row in sorted(adjustments, key=lambda value: (value.symbol, value.effective_date))]
+    canonical_references = [row.canonical() for row in sorted(references, key=lambda value: value.symbol)]
+    canonical_close_checks = [
+        {
+            "symbol": symbol, "business_date": business_date.isoformat(),
+            "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
+            "verification_source": verification_source,
+        }
+        for symbol, business_date, primary, verification, verification_source in sorted(close_checks)
+    ]
     manifest = {
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
+        "acquisition_policy": acquisition_policy,
         "business_end": current.as_of_date.isoformat(), "symbol_count": len(symbols),
         "global_symbol_count": len(selected_symbols), "global_expected_key_count": global_expected_key_count,
         "shard_index": shard_index, "shard_count": shard_count,
@@ -378,21 +820,30 @@ def run(
         "verification_expected_count": verification_expected,
         "verification_check_count": len(close_checks),
         "expected_key_count": len(expected), "bar_count": len(bars), "tradeability_count": len(facts),
-        "adjustment_event_count": len(adjustments),
+        "adjustment_event_count": len(adjustments), "reference_count": len(references),
         "primary_source": "akshare_historical_bundle",
         "primary_source_role": "per-symbol single-mouth historical raw/qfq/hfq source",
         "primary_sources_by_symbol": dict(sorted(primary_sources_by_symbol.items())),
+        "factor_sources_by_symbol": dict(sorted(factor_sources_by_symbol.items())),
         "tradeability_status_source": "akshare_observed_raw_fail_closed",
-        "verification_source": "akshare_sina_with_eastmoney_fallback",
+        "verification_source": "single_independent_source_sina_eastmoney_or_tencent",
         "verification_sources_by_symbol": verification_sources_by_symbol,
+        "unattributed_verification_symbols": unattributed_verification_symbols,
         "verification_source_overlap_symbols": verification_source_overlap_symbols,
+        "frozen_archive_symbols": frozen_archive_symbols,
+        "frozen_archive_dataset_sha256": frozen_archive_dataset_sha256,
         "csi_event_index_source": event_index_source,
         "calendar_source": calendar_source,
         "verification_failures": dict(sorted(verification_failures.items())),
         "primary_failures": dict(sorted(primary_failures.items())),
+        "checkpoint_failures": dict(sorted(checkpoint_failures.items())),
+        "resumed_symbols": sorted(valid_resumed),
+        "resumed_symbol_count": len(valid_resumed),
+        "acquired_symbol_count": len(acquisition_symbols),
         "source_versions": {"akshare": version("akshare")},
         "bars_sha256": sha256(canonical_bars), "tradeability_sha256": sha256(canonical_facts),
         "adjustments_sha256": sha256(canonical_adjustments),
+        "references_sha256": sha256(canonical_references),
         "verification_checks_sha256": sha256(canonical_close_checks), "accepted": accepted(gates),
         "gates": [gate.canonical() for gate in gates],
     }
@@ -426,7 +877,7 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         current_snapshot = current.canonical()
         primary_calendar_snapshot = primary_calendar.canonical()
         secondary_calendar_snapshot = secondary_calendar.canonical()
-    return {
+    plan = {
         "mode": mode, "business_end": end.isoformat(), "symbol_count": symbol_limit,
         "shard_size": SHARD_SIZE, "shard_count": shard_count,
         "current_snapshot": current_snapshot,
@@ -438,6 +889,111 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
         "csi_event_index_source": None if mode == "sample" else event_index_source,
         "matrix": {"include": [{"shard_index": index, "shard_count": shard_count} for index in range(shard_count)]},
     }
+    plan["checkpoint_scope_sha256"] = sha256(plan)
+    return plan
+
+
+def validate_plan_scope(plan: dict[str, Any]) -> None:
+    scope_hash = str(plan.get("checkpoint_scope_sha256") or "")
+    base_plan = {key: value for key, value in plan.items() if key not in PLAN_RUNTIME_FIELDS and key != "checkpoint_scope_sha256"}
+    actual_hash = sha256(base_plan)
+    if len(scope_hash) != 64 or actual_hash != scope_hash:
+        raise ValueError(f"checkpoint plan scope hash mismatch: expected {scope_hash or '<missing>'}, got {actual_hash}")
+    evidence_hash = plan.get("plan_evidence_sha256")
+    if evidence_hash is not None:
+        evidence_payload = {key: value for key, value in plan.items() if key != "plan_evidence_sha256"}
+        actual_evidence_hash = sha256(evidence_payload)
+        if str(evidence_hash) != actual_evidence_hash:
+            raise ValueError(f"repair plan evidence hash mismatch: expected {evidence_hash}, got {actual_evidence_hash}")
+
+
+def shard_checkpoint_dataset_id(plan: dict[str, Any], shard_index: int) -> str:
+    validate_plan_scope(plan)
+    return (
+        f"m2-{plan['mode']}-{plan['business_end']}-{plan['checkpoint_scope_sha256']}"
+        f"-shard-{shard_index}-of-{plan['shard_count']}"
+    )
+
+
+def checkpoint_expectations(plan: dict[str, Any]) -> dict[int, dict[str, tuple[int, bool, str, str]]]:
+    """Rebuild exact per-shard checkpoint expectations from one frozen plan without network I/O."""
+
+    validate_plan_scope(plan)
+    if plan.get("mode") == "sample":
+        raise ValueError("sample mode does not use a resumable shard plan")
+    current = current_universe_from_canonical(plan["current_snapshot"])
+    primary_calendar = trading_calendar_from_canonical(plan["primary_calendar"])
+    events, _discovered, _source = CsiIndexSource().fetch_indexed_events(
+        current.as_of_date,
+        {int(value) for value in plan.get("csi_discovered_notice_ids", [])},
+    )
+    snapshots = reconstruct(current, events)
+    sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
+    expected = membership_keys(sessions, snapshots)
+    all_symbols = sorted({symbol for symbol, _ in expected})
+    mode = str(plan["mode"])
+    requested_limit = SMOKE_SYMBOLS if mode == "smoke" else PREFLIGHT_SYMBOLS if mode == "preflight" else len(all_symbols)
+    selected_symbols = bounded_symbols(all_symbols, min(len(all_symbols), requested_limit))
+    if len(selected_symbols) != int(plan["symbol_count"]):
+        raise ValueError("frozen plan symbol count no longer reconstructs deterministically")
+    verification_targets = set(verification_symbols(selected_symbols, "full"))
+    expected_row_counts = Counter(symbol for symbol, _day in expected)
+    expected_bounds: dict[str, tuple[date, date]] = {}
+    for symbol, business_date in expected:
+        current_bounds = expected_bounds.get(symbol)
+        if current_bounds is None:
+            expected_bounds[symbol] = (business_date, business_date)
+        else:
+            expected_bounds[symbol] = (min(current_bounds[0], business_date), max(current_bounds[1], business_date))
+    shard_count = int(plan["shard_count"])
+    result: dict[int, dict[str, tuple[int, bool, str, str]]] = {}
+    for shard_index in range(shard_count):
+        shard = shard_symbols(selected_symbols, shard_index, shard_count)
+        result[shard_index] = {
+            symbol: (
+                expected_row_counts[symbol],
+                symbol in verification_targets,
+                expected_bounds[symbol][0].isoformat(),
+                expected_bounds[symbol][1].isoformat(),
+            )
+            for symbol in shard
+        }
+    return result
+
+
+def enrich_repair_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Attach a TiDB-derived repair matrix without changing the frozen checkpoint scope."""
+
+    from scripts.market_data.tidb_checkpoint_store import (
+        TiDBConfig,
+        build_checkpoint_repair_plan,
+        connect,
+        ensure_schema,
+    )
+
+    expectations = checkpoint_expectations(plan)
+    dataset_ids = {index: shard_checkpoint_dataset_id(plan, index) for index in expectations}
+    connection = connect(TiDBConfig.from_env())
+    try:
+        ensure_schema(connection)
+        repair = build_checkpoint_repair_plan(
+            connection,
+            dataset_ids=dataset_ids,
+            expectations=expectations,
+            mode=str(plan["mode"]),
+            shard_count=int(plan["shard_count"]),
+        )
+    finally:
+        connection.close()
+    enriched = {
+        key: value for key, value in plan.items()
+        if key not in PLAN_RUNTIME_FIELDS
+    }
+    enriched.update(repair)
+    enriched["acquisition_policy"] = "repair"
+    enriched["plan_evidence_sha256"] = sha256(enriched)
+    validate_plan_scope(enriched)
+    return enriched
 
 
 def _write_gzip(path: Path, value: Any) -> None:
@@ -454,7 +1010,7 @@ def write_outputs(
     facts: list[TradeabilityFact],
     adjustments: list[AdjustmentEvent],
     references: list[SecurityReference],
-    close_checks: list[tuple[str, date, Decimal, Decimal]],
+    close_checks: list[VerificationCheck],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_gzip(output_dir / "historical-bars.json.gz", [row.canonical() for row in sorted(bars, key=lambda value: value.key)])
@@ -466,8 +1022,9 @@ def write_outputs(
             "business_date": business_date.isoformat(),
             "primary_close": format(primary, "f"),
             "verification_close": format(verification, "f"),
+            "verification_source": verification_source,
         }
-        for symbol, business_date, primary, verification in sorted(close_checks)
+        for symbol, business_date, primary, verification, verification_source in sorted(close_checks)
     ])
     (output_dir / "security-references.json").write_text(json.dumps([row.canonical() for row in sorted(references, key=lambda value: value.symbol)], ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -482,13 +1039,42 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--plan-output", type=Path)
     parser.add_argument("--plan-input", type=Path)
+    parser.add_argument("--acquisition-policy", choices=ACQUISITION_POLICIES, default="capture")
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
+    parser.add_argument("--symbol-attempts", type=int, default=1)
+    parser.add_argument(
+        "--tidb-checkpoint-dataset-id",
+        default=os.environ.get("TIDB_CHECKPOINT_DATASET_ID", ""),
+        help="Stable TiDB dataset id; blank disables resumable per-symbol checkpoints",
+    )
     args = parser.parse_args()
     if args.plan_output:
-        plan = build_plan(args.end_date, args.mode)
+        if args.plan_input:
+            plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
+            validate_plan_scope(plan)
+            if plan.get("mode") != args.mode:
+                raise ValueError(f"plan mode {plan.get('mode')} does not match requested mode {args.mode}")
+            if plan.get("business_end") != args.end_date.isoformat():
+                raise ValueError(f"plan end date {plan.get('business_end')} does not match requested end date {args.end_date}")
+        else:
+            if args.acquisition_policy != "capture":
+                raise ValueError("repair/finalize plan generation requires --plan-input with a frozen checkpoint plan")
+            plan = build_plan(args.end_date, args.mode)
+        if args.acquisition_policy == "repair":
+            plan = enrich_repair_plan(plan)
         args.plan_output.parent.mkdir(parents=True, exist_ok=True)
         args.plan_output.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(json.dumps(plan, ensure_ascii=False, sort_keys=True), flush=True)
+        _progress(
+            "plan_written",
+            mode=plan["mode"],
+            business_end=plan["business_end"],
+            shard_count=plan["shard_count"],
+            repair_shard_count=plan.get("repair_shard_count", 0),
+            repair_symbol_count=plan.get("repair_symbol_count", 0),
+            resumable_symbol_count=plan.get("resumable_symbol_count", 0),
+            checkpoint_scope_sha256=plan["checkpoint_scope_sha256"],
+            output=str(args.plan_output),
+        )
         return 0
     current_universe = None
     csi_discovered_notice_ids = None
@@ -496,6 +1082,7 @@ def main() -> int:
     secondary_calendar = None
     if args.plan_input:
         plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
+        validate_plan_scope(plan)
         if plan.get("mode") != args.mode:
             raise ValueError(f"plan mode {plan.get('mode')} does not match requested mode {args.mode}")
         if plan.get("business_end") != args.end_date.isoformat():
@@ -512,15 +1099,126 @@ def main() -> int:
             primary_calendar = trading_calendar_from_canonical(primary_calendar_snapshot)
         if secondary_calendar_snapshot:
             secondary_calendar = trading_calendar_from_canonical(secondary_calendar_snapshot)
+        if args.acquisition_policy == "repair":
+            repair_indices = {
+                int(item["shard_index"])
+                for item in plan.get("repair_matrix", {}).get("include", [])
+            }
+            if args.shard_index not in repair_indices:
+                raise ValueError(f"shard {args.shard_index} is not present in the frozen repair matrix")
+    checkpoint_dataset_id = args.tidb_checkpoint_dataset_id.strip()
+    if checkpoint_dataset_id and args.plan_input:
+        expected_dataset_id = shard_checkpoint_dataset_id(plan, args.shard_index)
+        if checkpoint_dataset_id != expected_dataset_id:
+            raise ValueError(
+                f"TiDB checkpoint dataset id does not match frozen plan: "
+                f"expected {expected_dataset_id}, got {checkpoint_dataset_id}"
+            )
+    if args.acquisition_policy in {"repair", "finalize"} and not checkpoint_dataset_id:
+        raise ValueError(f"{args.acquisition_policy} policy requires a stable TiDB checkpoint dataset id")
+    resume_evidence = None
+    checkpoint_writer: Callable[..., None] | None = None
+    if checkpoint_dataset_id:
+        from scripts.market_data.tidb_checkpoint_store import (
+            HistoricalEvidence,
+            TiDBConfig,
+            connect,
+            ensure_schema,
+            load_resumable_evidence,
+            publish_symbol_checkpoint,
+        )
+
+        tidb_config = TiDBConfig.from_env()
+        resume_connection = connect(tidb_config)
+        try:
+            ensure_schema(resume_connection)
+            resume_evidence = load_resumable_evidence(resume_connection, checkpoint_dataset_id)
+        finally:
+            resume_connection.close()
+        _progress(
+            "tidb_checkpoint_scope_ready", dataset_id=checkpoint_dataset_id,
+            resumable_symbols=len(resume_evidence.manifest.get("resumed_symbols", [])),
+        )
+
+        def write_symbol_checkpoint(
+            symbol: str,
+            symbol_bars: list[HistoricalBar],
+            symbol_facts: list[TradeabilityFact],
+            symbol_adjustments: list[AdjustmentEvent],
+            symbol_reference: SecurityReference | None,
+            symbol_checks: list[VerificationCheck],
+            primary_source_name: str | None,
+            error_message: str | None,
+        ) -> None:
+            checkpoint_manifest = {
+                "manifest_version": "m2-historical-symbol-checkpoint-v1",
+                "authoritative": False,
+                "simulation_orders_allowed": False,
+                "accepted": False,
+                "mode": args.mode,
+                "history_start": (HISTORY_START if args.mode in {"smoke", "preflight", "full"} else max(HISTORY_START, args.end_date - timedelta(days=150))).isoformat(),
+                "business_end": args.end_date.isoformat(),
+                "shard_index": args.shard_index,
+                "shard_count": args.shard_count,
+                "symbol_count": 1,
+                "expected_key_count": len(symbol_facts),
+                "primary_failures": {} if error_message is None else {symbol: error_message},
+                "primary_sources_by_symbol": {} if primary_source_name is None else {symbol: primary_source_name},
+            }
+            checkpoint_evidence = HistoricalEvidence(
+                manifest=checkpoint_manifest,
+                bars=[row.canonical() for row in symbol_bars],
+                tradeability=[row.canonical() for row in symbol_facts],
+                adjustments=[row.canonical() for row in symbol_adjustments],
+                references=[] if symbol_reference is None else [symbol_reference.canonical()],
+                verification_checks=[{
+                    "symbol": code, "business_date": business_date.isoformat(),
+                    "primary_close": format(primary, "f"), "verification_close": format(verification, "f"),
+                    "verification_source": verification_source,
+                } for code, business_date, primary, verification, verification_source in symbol_checks],
+            )
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                checkpoint_connection = None
+                try:
+                    checkpoint_connection = connect(tidb_config)
+                    publish_symbol_checkpoint(
+                        checkpoint_connection, checkpoint_evidence, dataset_id=checkpoint_dataset_id,
+                    )
+                    return
+                except Exception as error:
+                    last_error = error
+                    if checkpoint_connection is not None:
+                        checkpoint_connection.rollback()
+                    _progress(
+                        "tidb_symbol_checkpoint_retry", symbol=symbol, attempt=attempt,
+                        remaining_attempts=3 - attempt, error=f"{type(error).__name__}: {error}"[:300],
+                    )
+                    if attempt < 3:
+                        time.sleep(min(2 ** (attempt - 1), 4))
+                finally:
+                    if checkpoint_connection is not None:
+                        checkpoint_connection.close()
+            assert last_error is not None
+            raise last_error
+
+        checkpoint_writer = write_symbol_checkpoint
+
     result = run(
         args.end_date, mode=args.mode, workers=args.workers,
+        symbol_attempts=args.symbol_attempts,
         shard_index=args.shard_index, shard_count=args.shard_count,
         current_universe=current_universe,
         csi_discovered_notice_ids=csi_discovered_notice_ids,
         primary_calendar=primary_calendar,
         secondary_calendar=secondary_calendar,
+        resume_evidence=resume_evidence,
+        checkpoint_callback=checkpoint_writer,
+        acquisition_policy=args.acquisition_policy,
     )
     manifest = result[0]
+    if checkpoint_dataset_id:
+        manifest["checkpoint_dataset_id"] = checkpoint_dataset_id
     write_outputs(args.output_dir, *result)
     print(json.dumps({key: manifest[key] for key in ("accepted", "mode", "business_end", "symbol_count", "expected_key_count", "bar_count", "tradeability_count", "adjustment_event_count", "bars_sha256", "tradeability_sha256", "adjustments_sha256", "gates")}, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if manifest["accepted"] else 2
