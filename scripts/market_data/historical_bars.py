@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import date, timedelta
 from decimal import Decimal
+from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable
@@ -61,6 +62,80 @@ class SymbolDeadlineInterrupt(BaseException):
     """Private control-flow exception that vendor ``except Exception`` blocks cannot swallow."""
 
 
+@lru_cache(maxsize=1)
+def frozen_archive_source():
+    """Load and validate the bounded archive only when a live request needs it."""
+    from scripts.market_data.sources.frozen_archive_history_source import FrozenArchiveHistorySource
+
+    return FrozenArchiveHistorySource()
+
+
+def fetch_verification_with_archive(
+    source: AkshareHistorySource,
+    symbol: str,
+    start: date,
+    end: date,
+    excluded_sources: set[str],
+) -> list[DailyBar]:
+    """Fetch one independent verification series, with an immutable bounded fallback."""
+    try:
+        return source.fetch_raw(symbol, start, end, exclude_sources=excluded_sources)
+    except Exception as live_error:
+        from scripts.market_data.sources.frozen_archive_history_source import (
+            VERIFICATION_SOURCE,
+            FrozenArchiveHistorySource,
+        )
+
+        if VERIFICATION_SOURCE in excluded_sources or not FrozenArchiveHistorySource.supports(symbol, start, end):
+            raise
+        try:
+            rows = frozen_archive_source().fetch_verification(symbol, start, end)
+        except Exception as archive_error:
+            raise RuntimeError(
+                f"live verification failed for {symbol}: {type(live_error).__name__}: {live_error}; "
+                f"bounded archive verification failed: {type(archive_error).__name__}: {archive_error}"
+            ) from archive_error
+        _progress(
+            "frozen_archive_verification_used",
+            symbol=symbol,
+            live_error=f"{type(live_error).__name__}: {live_error}",
+            rows=len(rows),
+            dataset_sha256=frozen_archive_source().dataset_sha256,
+        )
+        return rows
+
+
+def fetch_bundle_from_live_or_archive(
+    source: AkshareEastmoneyHistorySource,
+    symbol: str,
+    start: date,
+    end: date,
+):
+    """Use the live bundle first and the validated archive only for its exact bounded scope."""
+    try:
+        return source.fetch_bundle(symbol, start, end)
+    except (Exception, SymbolDeadlineInterrupt) as live_error:
+        from scripts.market_data.sources.frozen_archive_history_source import FrozenArchiveHistorySource
+
+        if not FrozenArchiveHistorySource.supports(symbol, start, end):
+            raise
+        try:
+            bundle = frozen_archive_source().fetch_bundle(symbol, start, end)
+        except Exception as archive_error:
+            raise RuntimeError(
+                f"live primary bundle failed for {symbol}: {type(live_error).__name__}: {live_error}; "
+                f"bounded archive primary failed: {type(archive_error).__name__}: {archive_error}"
+            ) from archive_error
+        _progress(
+            "frozen_archive_primary_used",
+            symbol=symbol,
+            live_error=f"{type(live_error).__name__}: {live_error}",
+            rows=len(bundle[0]),
+            dataset_sha256=frozen_archive_source().dataset_sha256,
+        )
+        return bundle
+
+
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
     effective_dates = sorted(snapshots)
     output: dict[tuple[str, date], str] = {}
@@ -90,8 +165,8 @@ def fetch_primary(
         for symbol in symbols:
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
-                    output[symbol] = source.fetch_raw(
-                        symbol, *ranges[symbol], exclude_sources=excluded.get(symbol, set()),
+                    output[symbol] = fetch_verification_with_archive(
+                        source, symbol, *ranges[symbol], excluded.get(symbol, set()),
                     )
             except SymbolDeadlineInterrupt as error:
                 failures[symbol] = f"TimeoutError: {error}"
@@ -101,10 +176,11 @@ def fetch_primary(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
-                source.fetch_raw,
+                fetch_verification_with_archive,
+                source,
                 symbol,
                 *ranges[symbol],
-                exclude_sources=excluded.get(symbol, set()),
+                excluded.get(symbol, set()),
             ): symbol
             for symbol in symbols
         }
@@ -287,6 +363,18 @@ def _close_check_from_canonical(row: dict[str, Any]) -> VerificationCheck:
     )
 
 
+def _confirmed_status_only_facts(rows: list[TradeabilityFact]) -> bool:
+    """Accept zero bars only when every scoped session is explicitly suspended."""
+    return bool(rows) and all(
+        not row.has_primary_bar
+        and row.has_secondary_status
+        and row.is_suspended
+        and not row.can_buy
+        and not row.can_sell
+        for row in rows
+    )
+
+
 def run(
     end: date,
     *,
@@ -360,6 +448,10 @@ def run(
     resumed_bar_keys = {(row.symbol, row.business_date) for row in resumed_bars}
     resumed_fact_keys = {(row.symbol, row.business_date) for row in resumed_facts}
     resumed_reference_symbols = {row.symbol for row in resumed_references}
+    resumed_primary_sources = {
+        str(symbol): str(source)
+        for symbol, source in getattr(resume_evidence, "manifest", {}).get("primary_sources_by_symbol", {}).items()
+    }
     valid_resumed: set[str] = set()
     for symbol in claimed_resumed & symbol_set:
         expected_for_symbol = {key for key in expected if key[0] == symbol}
@@ -378,8 +470,14 @@ def run(
             for row in resumed_bars
             if row.symbol == symbol
         )
+        status_only_complete = (
+            not bars_for_symbol
+            and _confirmed_status_only_facts([
+                row for row in resumed_facts if row.symbol == symbol
+            ])
+        )
         if (
-            bars_for_symbol
+            (bool(bars_for_symbol) or status_only_complete)
             and bars_for_symbol == primary_fact_keys
             and bars_for_symbol <= expected_for_symbol
             and facts_for_symbol == expected_for_symbol
@@ -397,7 +495,10 @@ def run(
     references = [row for row in resumed_references if row.symbol in valid_resumed]
     close_checks = [row for row in resumed_checks if row[0] in valid_resumed and (row[0], row[1]) in expected]
     primary_sources_by_symbol = {
-        symbol: next(row.primary_source for row in bars if row.symbol == symbol)
+        symbol: next(
+            (row.primary_source for row in bars if row.symbol == symbol),
+            resumed_primary_sources.get(symbol, "unknown"),
+        )
         for symbol in sorted(valid_resumed)
     }
     factor_sources_by_symbol = {
@@ -514,7 +615,7 @@ def run(
                     (
                         raw, qfq, hfq, events_for_symbol, reference, status,
                         primary_source_name, factor_source_name,
-                    ) = source.fetch_bundle(symbol, *ranges[symbol])
+                    ) = fetch_bundle_from_live_or_archive(source, symbol, *ranges[symbol])
                     factors = {
                         business_date: (
                             source._factor(qfq[business_date][3], raw[business_date].close),
@@ -633,6 +734,18 @@ def run(
         symbol for symbol, sources in verification_sources_by_symbol.items()
         if any(source in UNKNOWN_VERIFICATION_SOURCES for source in sources)
     )
+    frozen_archive_symbols = sorted({
+        symbol
+        for symbol, source_name in primary_sources_by_symbol.items()
+        if source_name.endswith("_frozen")
+    } | {
+        symbol
+        for symbol, source_names in verification_sources_by_symbol.items()
+        if any(source_name.endswith("_frozen") for source_name in source_names)
+    })
+    frozen_archive_dataset_sha256 = (
+        frozen_archive_source().dataset_sha256 if frozen_archive_symbols else None
+    )
     gates.append(GateResult(
         "verification_source_attribution",
         not unattributed_verification_symbols,
@@ -717,6 +830,8 @@ def run(
         "verification_sources_by_symbol": verification_sources_by_symbol,
         "unattributed_verification_symbols": unattributed_verification_symbols,
         "verification_source_overlap_symbols": verification_source_overlap_symbols,
+        "frozen_archive_symbols": frozen_archive_symbols,
+        "frozen_archive_dataset_sha256": frozen_archive_dataset_sha256,
         "csi_event_index_source": event_index_source,
         "calendar_source": calendar_source,
         "verification_failures": dict(sorted(verification_failures.items())),

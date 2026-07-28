@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import unittest
 from contextlib import contextmanager
 from datetime import date
@@ -10,16 +12,108 @@ from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.adjustment_engine import build_adjusted_series_from_factor_events
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, enrich_repair_plan, fetch_primary, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
+from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, enrich_repair_plan, fetch_bundle_from_live_or_archive, fetch_primary, frozen_archive_source, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
+from scripts.market_data.sources.frozen_archive_history_source import (
+    ARCHIVE_BUSINESS_END,
+    ARCHIVE_PATH,
+    ARCHIVE_SCHEMA_VERSION,
+    FACTOR_SOURCE,
+    PRIMARY_SOURCE,
+    STATUS_ONLY_SOURCE,
+    VERIFICATION_SOURCE,
+    FrozenArchiveHistorySource,
+    validate_archive_document,
+)
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
+    def test_frozen_archive_is_bounded_dual_source_and_hash_verified(self) -> None:
+        source = FrozenArchiveHistorySource()
+        self.assertEqual(source.document["schema_version"], ARCHIVE_SCHEMA_VERSION)
+        self.assertFalse(source.document["authoritative"])
+        self.assertFalse(source.document["simulation_orders_allowed"])
+        expected_counts = {"000939": 231, "002005": 1954, "600485": 188}
+        expected_out_dates = {
+            "000939": date(2020, 12, 17),
+            "002005": None,
+            "600485": date(2021, 6, 1),
+        }
+        for symbol, expected_count in expected_counts.items():
+            raw, qfq, hfq, events, reference, status, primary_source, factor_source = source.fetch_bundle(
+                symbol, date(2018, 1, 1), ARCHIVE_BUSINESS_END,
+            )
+            verification = source.fetch_verification(symbol, date(2018, 1, 1), ARCHIVE_BUSINESS_END)
+            self.assertEqual(len(raw), expected_count)
+            self.assertEqual(len(verification), expected_count)
+            self.assertEqual(set(raw), {row.business_date for row in verification})
+            self.assertTrue(set(raw).issubset(status))
+            self.assertEqual(primary_source, PRIMARY_SOURCE)
+            self.assertEqual(factor_source, FACTOR_SOURCE)
+            self.assertEqual({row.source for row in verification}, {VERIFICATION_SOURCE})
+            self.assertNotEqual(primary_source, VERIFICATION_SOURCE)
+            self.assertTrue(events)
+            self.assertEqual(reference.out_date, expected_out_dates[symbol])
+            self.assertTrue(all(min(*qfq[key], *hfq[key]) > 0 for key in raw))
+
+    def test_frozen_archive_rejects_future_or_unknown_scope(self) -> None:
+        source = FrozenArchiveHistorySource()
+        self.assertFalse(source.supports("000939", date(2018, 1, 1), date(2026, 7, 25)))
+        self.assertFalse(source.supports("600519", date(2018, 1, 1), ARCHIVE_BUSINESS_END))
+        with self.assertRaisesRegex(RuntimeError, "scope rejected"):
+            source.fetch_bundle("002005", date(2026, 7, 24), date(2026, 7, 25))
+
+    def test_frozen_archive_preserves_confirmed_all_session_suspension(self) -> None:
+        source = FrozenArchiveHistorySource()
+        for symbol in ("000939", "002005", "600485"):
+            raw, qfq, hfq, _events, _reference, status, primary_source, factor_source = source.fetch_bundle(
+                symbol, date(2018, 1, 2), date(2018, 6, 8),
+            )
+            self.assertEqual(raw, {})
+            self.assertEqual(qfq, {})
+            self.assertEqual(hfq, {})
+            self.assertEqual(len(status), 105)
+            self.assertTrue(all(row["tradestatus"] == "0" for row in status.values()))
+            self.assertEqual(primary_source, STATUS_ONLY_SOURCE)
+            self.assertEqual(factor_source, FACTOR_SOURCE)
+
+    def test_frozen_archive_rejects_tampering_even_when_hashes_are_recomputed(self) -> None:
+        document = json.loads(ARCHIVE_PATH.read_text(encoding="utf-8"))
+        tampered = copy.deepcopy(document)
+        payload = tampered["symbols"]["000939"]
+        payload["primary_rows"][0]["close"] = "999.0000"
+        payload["content_sha256"] = sha256({
+            key: value for key, value in payload.items() if key != "content_sha256"
+        })
+        tampered["dataset_sha256"] = sha256({
+            key: value for key, value in tampered.items() if key != "dataset_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "archive OHLC mismatch"):
+            validate_archive_document(tampered)
+
+    def test_verification_and_primary_use_archive_only_after_live_failure(self) -> None:
+        frozen_archive_source.cache_clear()
+        ranges = {"000939": (date(2018, 7, 2), date(2020, 12, 16))}
+        with patch.object(AkshareHistorySource, "fetch_raw", side_effect=RuntimeError("cloud endpoints empty")):
+            verification, failures = fetch_primary(["000939"], ranges, workers=1)
+        self.assertEqual(failures, {})
+        self.assertEqual(len(verification["000939"]), 231)
+        self.assertEqual({row.source for row in verification["000939"]}, {VERIFICATION_SOURCE})
+
+        live = AkshareEastmoneyHistorySource(attempts=1)
+        with patch.object(live, "fetch_bundle", side_effect=RuntimeError("cloud endpoints empty")):
+            bundle = fetch_bundle_from_live_or_archive(
+                live, "000939", date(2018, 7, 2), date(2020, 12, 16),
+            )
+        self.assertEqual(len(bundle[0]), 231)
+        self.assertEqual(bundle[6], PRIMARY_SOURCE)
+        self.assertEqual(bundle[7], FACTOR_SOURCE)
+
     def test_symbol_deadline_interrupt_cannot_be_swallowed_by_vendor_exception_handler(self) -> None:
         self.assertTrue(issubclass(SymbolDeadlineInterrupt, BaseException))
         self.assertFalse(issubclass(SymbolDeadlineInterrupt, Exception))

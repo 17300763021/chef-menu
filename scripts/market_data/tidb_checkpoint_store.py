@@ -939,7 +939,15 @@ def symbol_checkpoint_rows(dataset_id: str, evidence: HistoricalEvidence) -> lis
         symbol_adjustments = adjustments.get(symbol, [])
         start, end = _date_bounds(symbol_facts or symbol_bars)
         error_message = primary_failures.get(symbol)
-        status = "failed" if error_message or not symbol_bars else "succeeded"
+        status_only_complete = bool(symbol_facts) and all(
+            not bool(row.get("has_primary_bar"))
+            and bool(row.get("has_secondary_status"))
+            and bool(row.get("is_suspended"))
+            and not bool(row.get("can_buy"))
+            and not bool(row.get("can_sell"))
+            for row in symbol_facts
+        )
+        status = "failed" if error_message or (not symbol_bars and not status_only_complete) else "succeeded"
         accepted = status == "succeeded" and bool(manifest.get("accepted"))
         rows.append((
             dataset_id,
@@ -962,7 +970,9 @@ def symbol_checkpoint_rows(dataset_id: str, evidence: HistoricalEvidence) -> lis
             sha256(symbol_bars) if symbol_bars else None,
             sha256(symbol_facts) if symbol_facts else None,
             sha256(symbol_adjustments) if symbol_adjustments else None,
-            "primary_failure" if error_message else ("missing_bars" if not symbol_bars else None),
+            "primary_failure" if error_message else (
+                "missing_bars" if not symbol_bars and not status_only_complete else None
+            ),
             error_message,
         ))
     return rows
@@ -1114,12 +1124,16 @@ def build_checkpoint_repair_plan(
     dataset_params = tuple(dataset_ids[index] for index in range(shard_count))
     quality_rows = _query_all(connection, f"""
         SELECT facts.dataset_id, facts.symbol, facts.fact_rows, facts.primary_fact_rows,
+               facts.confirmed_suspended_rows,
                COALESCE(bars.bar_rows, 0), COALESCE(bars.matched_primary_rows, 0),
                COALESCE(bars.invalid_bar_rows, 0), COALESCE(checks.verification_rows, 0),
                COALESCE(checks.missing_source_rows, 0), COALESCE(checks.source_overlap_rows, 0)
         FROM (
           SELECT dataset_id, symbol, COUNT(*) AS fact_rows,
-                 SUM(CASE WHEN has_primary_bar=1 THEN 1 ELSE 0 END) AS primary_fact_rows
+                 SUM(CASE WHEN has_primary_bar=1 THEN 1 ELSE 0 END) AS primary_fact_rows,
+                 SUM(CASE WHEN has_primary_bar=0 AND has_secondary_status=1
+                                AND is_suspended=1 AND can_buy=0 AND can_sell=0
+                          THEN 1 ELSE 0 END) AS confirmed_suspended_rows
           FROM m2_tradeability_facts
           WHERE dataset_id IN ({placeholders})
           GROUP BY dataset_id, symbol
@@ -1209,16 +1223,19 @@ def build_checkpoint_repair_plan(
                 quality_valid = inventory is not None
                 if inventory is not None:
                     (
-                        fact_rows, primary_fact_rows, stored_bar_rows,
+                        fact_rows, primary_fact_rows, confirmed_suspended_rows, stored_bar_rows,
                         matched_primary_rows, invalid_bar_rows,
                         stored_verification_rows, missing_verification_sources,
                         verification_source_overlaps,
                     ) = inventory
+                    status_only_valid = bar_rows == 0 and confirmed_suspended_rows == expected_rows
+                    bar_count_valid = 0 < bar_rows <= expected_rows or status_only_valid
                     quality_valid = all((
                         fact_rows == expected_rows,
                         stored_bar_rows == bar_rows,
                         primary_fact_rows == stored_bar_rows,
                         matched_primary_rows == stored_bar_rows,
+                        bar_count_valid,
                         invalid_bar_rows == 0,
                         stored_verification_rows == verification_rows,
                         not verification_required or missing_verification_sources == 0,
@@ -1232,12 +1249,16 @@ def build_checkpoint_repair_plan(
                     _date_text(row[6]) == expected_end,
                     str(row[7]) == "succeeded",
                     int(row[8]) == expected_rows,
-                    0 < bar_rows <= expected_rows,
+                    0 < bar_rows <= expected_rows or (
+                        inventory is not None
+                        and bar_rows == 0
+                        and inventory[2] == expected_rows
+                    ),
                     int(row[10]) == expected_rows,
                     not verification_required or verification_rows == bar_rows,
                     int(row[12]) == 1,
                     bool(row[13]),
-                    _is_sha256(row[14]),
+                    _is_sha256(row[14]) if bar_rows else row[14] is None,
                     _is_sha256(row[15]),
                     row[16] is None,
                     quality_valid,
@@ -1257,11 +1278,19 @@ def build_checkpoint_repair_plan(
                     reason = "checkpoint_scope_mismatch"
                 elif int(row[8]) != expected_rows or int(row[10]) != expected_rows:
                     reason = "expected_inventory_mismatch"
-                elif not 0 < bar_rows <= expected_rows:
+                elif not (
+                    0 < bar_rows <= expected_rows
+                    or (inventory is not None and bar_rows == 0 and inventory[2] == expected_rows)
+                ):
                     reason = "bar_count_invalid"
                 elif verification_required and verification_rows != bar_rows:
                     reason = "verification_incomplete"
-                elif int(row[12]) != 1 or not bool(row[13]) or not _is_sha256(row[14]) or not _is_sha256(row[15]):
+                elif (
+                    int(row[12]) != 1
+                    or not bool(row[13])
+                    or (not _is_sha256(row[14]) if bar_rows else row[14] is not None)
+                    or not _is_sha256(row[15])
+                ):
                     reason = "checkpoint_provenance_incomplete"
                 elif inventory is None:
                     reason = "missing_quality_inventory"
@@ -1368,13 +1397,18 @@ def load_resumable_evidence(connection: Any, dataset_id: str) -> HistoricalEvide
     """Rebuild canonical evidence for successfully captured symbols only."""
     succeeded_rows = _query_all(
         connection,
-        "SELECT symbol FROM m2_history_symbol_checkpoints WHERE dataset_id=%s AND status='succeeded' ORDER BY symbol",
+        "SELECT symbol, primary_source FROM m2_history_symbol_checkpoints "
+        "WHERE dataset_id=%s AND status='succeeded' ORDER BY symbol",
         (dataset_id,),
     )
     succeeded = {str(row[0]) for row in succeeded_rows}
+    primary_sources = {
+        str(row[0]): str(row[1] or "unknown")
+        for row in succeeded_rows
+    }
     if not succeeded:
         return HistoricalEvidence(
-            manifest={"dataset_id": dataset_id, "resumed_symbols": []},
+            manifest={"dataset_id": dataset_id, "resumed_symbols": [], "primary_sources_by_symbol": {}},
             bars=[], tradeability=[], adjustments=[], references=[], verification_checks=[],
         )
 
@@ -1408,7 +1442,11 @@ def load_resumable_evidence(connection: Any, dataset_id: str) -> HistoricalEvide
         FROM m2_history_verification_checks WHERE dataset_id=%s ORDER BY symbol, business_date
     """, (dataset_id,)))
     return HistoricalEvidence(
-        manifest={"dataset_id": dataset_id, "resumed_symbols": sorted(succeeded)},
+        manifest={
+            "dataset_id": dataset_id,
+            "resumed_symbols": sorted(succeeded),
+            "primary_sources_by_symbol": dict(sorted(primary_sources.items())),
+        },
         bars=[{
             "symbol": str(row[0]), "business_date": _date_text(row[1]), "exchange": row[2],
             "index_code": row[3], "open": _number_text(row[4]), "high": _number_text(row[5]),

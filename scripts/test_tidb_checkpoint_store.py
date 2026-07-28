@@ -254,9 +254,9 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
                     ]
                 if "FROM m2_tradeability_facts" in sql:
                     return [
-                        ("shard-0", "000001", 100, 99, 99, 99, 0, 0, 0, 0),
-                        ("shard-0", "000002", 100, 0, 0, 0, 0, 0, 0, 0),
-                        ("shard-1", "600001", 90, 88, 88, 88, 0, 87, 0, 0),
+                        ("shard-0", "000001", 100, 99, 0, 99, 99, 0, 0, 0, 0),
+                        ("shard-0", "000002", 100, 0, 0, 0, 0, 0, 0, 0, 0),
+                        ("shard-1", "600001", 90, 88, 0, 88, 88, 0, 87, 0, 0),
                     ]
                 return []
 
@@ -307,7 +307,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
                         valid_hash, valid_hash, None, None,
                     )]
                 if "FROM m2_tradeability_facts" in sql:
-                    return [("shard-0", "000937", 100, 100, 100, 100, 1, 0, 0, 0)]
+                    return [("shard-0", "000937", 100, 100, 0, 100, 100, 1, 0, 0, 0)]
                 return []
 
         result = build_checkpoint_repair_plan(
@@ -319,6 +319,62 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         )
         self.assertEqual(result["repair_symbol_count"], 1)
         self.assertEqual(result["repair_details"], ["0:000937:adjusted_price_incomplete"])
+
+    def test_confirmed_all_session_suspension_is_a_resumable_zero_bar_checkpoint(self) -> None:
+        fact = {
+            "symbol": "000939", "business_date": "2018-01-02", "index_code": "000905",
+            "has_primary_bar": False, "has_secondary_status": True,
+            "is_suspended": True, "is_st": False,
+            "listing_age_sessions": 100, "limit_rate": "0.100000",
+            "limit_up": "5.4900", "limit_down": "4.4900",
+            "at_limit_up": False, "at_limit_down": False,
+            "one_price_limit_up": False, "one_price_limit_down": False,
+            "can_buy": False, "can_sell": False,
+            "block_reasons": ["missing_primary_bar", "suspended"],
+            "schema_version": "m2-tradeability-v1",
+        }
+        evidence = HistoricalEvidence(
+            manifest={
+                "mode": "full", "shard_index": 0, "shard_count": 1,
+                "business_end": "2026-07-24", "accepted": True,
+                "authoritative": False, "simulation_orders_allowed": False,
+                "primary_sources_by_symbol": {"000939": "baostock_status_only_frozen"},
+                "primary_failures": {},
+            },
+            bars=[], tradeability=[fact], adjustments=[],
+            references=[{
+                "symbol": "000939", "exchange": "SZSE", "name": "000939",
+                "ipo_date": "1999-09-23", "out_date": "2020-12-17", "source": "baostock_frozen",
+            }],
+            verification_checks=[],
+        )
+        checkpoint = symbol_checkpoint_rows("status-only", evidence)[0]
+        self.assertEqual(checkpoint[8], "succeeded")
+        self.assertEqual(checkpoint[11], 0)
+        self.assertIsNone(checkpoint[20])
+
+        class StatusOnlyConnection(FakeConnection):
+            def query_result(self, sql: str):
+                valid_hash = "a" * 64
+                if "FROM m2_history_symbol_checkpoints" in sql:
+                    return [(
+                        "shard-0", "000939", "full", 0, 1,
+                        "2018-01-02", "2018-06-08", "succeeded",
+                105, 0, 105, 0, 1, "baostock_status_only_frozen",
+                        None, valid_hash, None, None,
+                    )]
+                if "FROM m2_tradeability_facts" in sql:
+                    return [("shard-0", "000939", 105, 0, 105, 0, 0, 0, 0, 0, 0)]
+                return []
+
+        result = build_checkpoint_repair_plan(
+            StatusOnlyConnection(),
+            dataset_ids={0: "shard-0"},
+            expectations={0: {"000939": (105, False, "2018-01-02", "2018-06-08")}},
+            mode="full", shard_count=1,
+        )
+        self.assertEqual(result["resumable_symbol_count"], 1)
+        self.assertEqual(result["repair_symbol_count"], 0)
 
     def test_connect_uses_tls_for_tidb_required_ssl(self) -> None:
         captured = {}
@@ -421,7 +477,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         class ResumeConnection(FakeConnection):
             def query_result(self, sql: str):
                 if "FROM m2_history_symbol_checkpoints" in sql:
-                    return [("000001",)]
+                    return [("000001", "akshare_eastmoney")]
                 if "FROM m2_historical_bars" in sql:
                     return [(
                         "000001", "2026-07-15", "SZSE", "000300",
@@ -451,6 +507,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
 
         loaded = load_resumable_evidence(ResumeConnection(), "stable-dataset")
         self.assertEqual(loaded.manifest["resumed_symbols"], ["000001"])
+        self.assertEqual(loaded.manifest["primary_sources_by_symbol"], {"000001": "akshare_eastmoney"})
         self.assertEqual(loaded.bars[0]["close"], "10.5000")
         self.assertEqual(loaded.tradeability[0]["block_reasons"], [])
         self.assertEqual(loaded.verification_checks[0]["verification_close"], "10.5000")
