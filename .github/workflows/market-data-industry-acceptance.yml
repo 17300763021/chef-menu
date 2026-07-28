@@ -1,0 +1,247 @@
+name: M2 Point-In-Time Industry Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sample validates 20 symbols; full validates the frozen 1,403-symbol M2.3 scope"
+        required: true
+        default: sample
+        type: choice
+        options: [sample, full]
+      observed_on:
+        description: "Knowledge-boundary date in Asia/Shanghai; blank uses the current Shanghai date"
+        required: false
+        type: string
+      resume_run_id:
+        description: "Optional prior industry run id whose frozen plan should be resumed"
+        required: false
+        type: string
+      tidb_ru_percent:
+        description: "Current TiDB monthly Request Units percentage"
+        required: true
+        type: string
+      tidb_storage_percent:
+        description: "Current TiDB row-storage percentage"
+        required: true
+        type: string
+      tidb_quota_checked_at:
+        description: "Date both TiDB percentages were checked (YYYY-MM-DD, no older than 7 days)"
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-industry-acceptance.yml
+      - scripts/market_data/industry_*.py
+      - scripts/market_data/tidb_industry_store.py
+      - scripts/market_data/sources/sws_industry_source.py
+      - scripts/market_data/sources/cninfo_industry_source.py
+      - scripts/test_market_data_industry.py
+      - scripts/test_market_data_industry_quota.py
+      - scripts/test_tidb_industry_store.py
+      - scripts/market_data/requirements.lock.txt
+      - .python-version
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: m2-point-in-time-industry-${{ github.event_name }}-${{ inputs.mode || 'tests' }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  deterministic-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Run deterministic M2.5 and prerequisite tests
+        run: |
+          python -m scripts.test_market_data_industry
+          python -m scripts.test_market_data_industry_quota
+          python -m scripts.test_tidb_industry_store
+          python -m scripts.test_market_data_daily_incremental
+          python -m scripts.test_tidb_daily_store
+          python -m scripts.test_historical_market_data
+          python -m scripts.test_historical_quality_gates
+          python -m scripts.test_tidb_checkpoint_store
+          python -m scripts.test_point_in_time_universe
+
+  quota-gate:
+    if: github.event_name == 'workflow_dispatch'
+    needs: deterministic-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - name: Enforce fresh TiDB RU and storage attestations below 80 percent
+        run: >-
+          python -m scripts.market_data.industry_quota_guard
+          --ru-percent "${{ inputs.tidb_ru_percent }}"
+          --storage-percent "${{ inputs.tidb_storage_percent }}"
+          --checked-at "${{ inputs.tidb_quota_checked_at }}"
+
+  plan:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [deterministic-tests, quota-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.export.outputs.matrix }}
+      dataset_id: ${{ steps.export.outputs.dataset_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Validate optional resume run id
+        env:
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: |
+          if [[ -n "$RESUME_RUN_ID" && ! "$RESUME_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "resume_run_id must be numeric"
+            exit 2
+          fi
+      - name: Download prior frozen plan
+        if: inputs.resume_run_id != ''
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: m2-industry-plan-${{ inputs.resume_run_id }}
+          path: industry-plan
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.resume_run_id }}
+      - name: Freeze official sources and deterministic scope
+        if: inputs.resume_run_id == ''
+        env:
+          INPUT_OBSERVED_ON: ${{ inputs.observed_on }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: |
+          args=(--operation plan --mode "${{ inputs.mode }}" --output-dir industry-plan)
+          if [[ -n "$INPUT_OBSERVED_ON" ]]; then
+            args+=(--observed-on "$INPUT_OBSERVED_ON")
+          fi
+          python -u -m scripts.market_data.industry_runner "${args[@]}"
+      - name: Validate resumed frozen plan inputs
+        if: inputs.resume_run_id != ''
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OBSERVED_ON: ${{ inputs.observed_on }}
+        run: |
+          python - <<'PY'
+          import json, os
+          plan = json.load(open("industry-plan/plan.json", encoding="utf-8"))
+          if plan["mode"] != os.environ["INPUT_MODE"]:
+              raise SystemExit(f"resume mode mismatch: plan={plan['mode']} input={os.environ['INPUT_MODE']}")
+          requested = os.environ.get("INPUT_OBSERVED_ON", "").strip()
+          if requested and requested != plan["observed_on"]:
+              raise SystemExit(f"resume observed_on mismatch: plan={plan['observed_on']} input={requested}")
+          PY
+      - name: Export frozen matrix
+        id: export
+        run: |
+          python - <<'PY'
+          import json, os
+          plan = json.load(open("industry-plan/plan.json", encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("matrix=" + json.dumps(plan["matrix"], separators=(",", ":")) + "\n")
+              stream.write("dataset_id=" + plan["dataset_id"] + "\n")
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m2-industry-plan-${{ github.run_id }}
+          path: industry-plan/*
+          if-no-files-found: error
+          retention-days: 7
+
+  shards:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: m2-industry-plan-${{ github.run_id }}
+          path: industry-plan
+      - name: Capture or resume only missing CNINFO symbol verification
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.industry_runner
+          --operation shard
+          --input-dir industry-plan
+          --shard-index "${{ matrix.shard_index }}"
+          --attempts 3
+
+  finalize:
+    needs: [plan, shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: m2-industry-plan-${{ github.run_id }}
+          path: industry-plan
+      - name: Reconcile physical rows and atomically publish one accepted manifest
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.industry_runner
+          --operation finalize
+          --input-dir industry-plan
+          --output-dir industry-acceptance
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m2-industry-manifest-${{ github.run_id }}
+          path: industry-acceptance/manifest.json
+          if-no-files-found: error
+          retention-days: 7
