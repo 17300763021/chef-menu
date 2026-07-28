@@ -42,6 +42,19 @@ on:
       - scripts/test_tidb_industry_store.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-industry-acceptance.yml
+      - scripts/market_data/industry_*.py
+      - scripts/market_data/tidb_industry_store.py
+      - scripts/market_data/sources/sws_industry_source.py
+      - scripts/market_data/sources/cninfo_industry_source.py
+      - scripts/test_market_data_industry.py
+      - scripts/test_market_data_industry_quota.py
+      - scripts/test_tidb_industry_store.py
+      - scripts/market_data/requirements.lock.txt
+      - .python-version
 
 permissions:
   contents: read

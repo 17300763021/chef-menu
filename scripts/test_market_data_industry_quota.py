@@ -57,6 +57,7 @@ class IndustryQuotaGuardTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn("\n  schedule:", workflow)
+        self.assertIn("\n  pull_request:", workflow)
         self.assertIn("resume_run_id:", workflow)
         self.assertIn("max-parallel: 4", workflow)
         self.assertIn("retention-days: 7", workflow)
