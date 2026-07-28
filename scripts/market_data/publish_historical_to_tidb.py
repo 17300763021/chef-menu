@@ -30,11 +30,18 @@ def main() -> int:
         action="store_true",
         help="Publish an accepted merged manifest and physical-shard mappings without duplicating market rows",
     )
+    parser.add_argument(
+        "--checkpoint-manifest-only",
+        action="store_true",
+        help="Register an accepted physical shard after validating already-persisted symbol checkpoints",
+    )
     parser.add_argument("--missing-input-ok", action="store_true")
     parser.add_argument("--publish-attempts", type=int, default=3)
     args = parser.parse_args()
     if args.publish_attempts < 1:
         raise ValueError("--publish-attempts must be at least 1")
+    if args.manifest_only and args.checkpoint_manifest_only:
+        raise ValueError("--manifest-only and --checkpoint-manifest-only are mutually exclusive")
 
     if not (args.input_dir / "manifest.json").exists():
         if args.missing_input_ok:
@@ -63,6 +70,7 @@ def main() -> int:
                 dataset_id=dataset_id,
                 allow_unaccepted_checkpoint=args.allow_unaccepted_checkpoint,
                 manifest_only=args.manifest_only,
+                checkpoint_manifest_only=args.checkpoint_manifest_only,
             )
             break
         except Exception as error:

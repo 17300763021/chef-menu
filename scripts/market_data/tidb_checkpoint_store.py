@@ -967,6 +967,7 @@ def publish_historical_evidence(
     dataset_id: str | None = None,
     allow_unaccepted_checkpoint: bool = False,
     manifest_only: bool = False,
+    checkpoint_manifest_only: bool = False,
 ) -> dict[str, Any]:
     manifest = evidence.manifest
     if manifest.get("simulation_orders_allowed") is not False:
@@ -976,11 +977,17 @@ def publish_historical_evidence(
     if not manifest.get("accepted") and not allow_unaccepted_checkpoint:
         raise RuntimeError("refusing to publish unaccepted evidence without --allow-unaccepted-checkpoint")
     resolved_dataset_id = dataset_id or default_dataset_id(manifest)
+    if manifest_only and checkpoint_manifest_only:
+        raise RuntimeError("logical manifest-only and checkpoint manifest-only modes are mutually exclusive")
     if manifest_only and allow_unaccepted_checkpoint:
         raise RuntimeError("manifest-only publication cannot allow an unaccepted checkpoint")
+    if checkpoint_manifest_only and allow_unaccepted_checkpoint:
+        raise RuntimeError("checkpoint manifest-only publication cannot allow unaccepted evidence")
     shard_rows = merged_shard_rows(resolved_dataset_id, manifest) if manifest_only else []
     if manifest_only:
         validate_physical_shards(connection, manifest, shard_rows)
+    if checkpoint_manifest_only:
+        validate_checkpoint_manifest(connection, resolved_dataset_id, evidence)
     with connection.cursor() as cursor:
         cursor.execute(
             RUN_UPSERT,
@@ -989,12 +996,12 @@ def publish_historical_evidence(
     counts = {
         "runs": 1,
         "shard_mappings": _upsert_many(connection, RUN_SHARD_UPSERT, shard_rows),
-        "bars": 0 if manifest_only else _upsert_many(connection, BAR_UPSERT, _bar_rows(resolved_dataset_id, evidence.bars)),
-        "tradeability": 0 if manifest_only else _upsert_many(connection, TRADEABILITY_UPSERT, _tradeability_rows(resolved_dataset_id, evidence.tradeability)),
-        "adjustments": 0 if manifest_only else _upsert_many(connection, ADJUSTMENT_UPSERT, _adjustment_rows(resolved_dataset_id, evidence.adjustments)),
-        "references": 0 if manifest_only else _upsert_many(connection, REFERENCE_UPSERT, _reference_rows(resolved_dataset_id, evidence.references)),
-        "verification_checks": 0 if manifest_only else _upsert_many(connection, VERIFICATION_UPSERT, _verification_rows(resolved_dataset_id, evidence.verification_checks)),
-        "symbol_checkpoints": 0 if manifest_only else _upsert_many(connection, CHECKPOINT_UPSERT, symbol_checkpoint_rows(resolved_dataset_id, evidence)),
+        "bars": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, BAR_UPSERT, _bar_rows(resolved_dataset_id, evidence.bars)),
+        "tradeability": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, TRADEABILITY_UPSERT, _tradeability_rows(resolved_dataset_id, evidence.tradeability)),
+        "adjustments": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, ADJUSTMENT_UPSERT, _adjustment_rows(resolved_dataset_id, evidence.adjustments)),
+        "references": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, REFERENCE_UPSERT, _reference_rows(resolved_dataset_id, evidence.references)),
+        "verification_checks": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, VERIFICATION_UPSERT, _verification_rows(resolved_dataset_id, evidence.verification_checks)),
+        "symbol_checkpoints": 0 if manifest_only or checkpoint_manifest_only else _upsert_many(connection, CHECKPOINT_UPSERT, symbol_checkpoint_rows(resolved_dataset_id, evidence)),
     }
     connection.commit()
     return {
@@ -1003,7 +1010,7 @@ def publish_historical_evidence(
         "accepted": bool(manifest.get("accepted")),
         "mode": manifest.get("mode"),
         "business_end": manifest.get("business_end"),
-        "storage_mode": "manifest_only_shards" if manifest_only else "physical_rows",
+        "storage_mode": "manifest_only_shards" if manifest_only else "checkpoint_manifest_only" if checkpoint_manifest_only else "physical_rows",
         "counts": counts,
         "simulation_orders_allowed": False,
     }
@@ -1045,6 +1052,158 @@ def _query_all(connection: Any, sql: str, params: tuple[Any, ...]) -> list[tuple
     with connection.cursor() as cursor:
         cursor.execute(sql, params)
         return list(cursor.fetchall())
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def build_checkpoint_repair_plan(
+    connection: Any,
+    *,
+    dataset_ids: Mapping[int, str],
+    expectations: Mapping[int, Mapping[str, tuple[int, bool, str, str]]],
+    mode: str,
+    shard_count: int,
+) -> dict[str, Any]:
+    """Select only failed, missing, or structurally incomplete symbol checkpoints."""
+
+    expected_indices = set(range(shard_count))
+    if set(dataset_ids) != expected_indices or set(expectations) != expected_indices:
+        raise ValueError("checkpoint repair planning requires a complete shard inventory")
+    reverse_ids = {dataset_id: index for index, dataset_id in dataset_ids.items()}
+    if len(reverse_ids) != shard_count:
+        raise ValueError("checkpoint repair dataset ids must be unique")
+    placeholders = ", ".join(["%s"] * shard_count)
+    rows = _query_all(connection, f"""
+        SELECT dataset_id, symbol, mode, shard_index, shard_count, business_start, business_end,
+               status, expected_rows, bar_rows, tradeability_rows, verification_rows,
+               reference_present, primary_source, bars_sha256, tradeability_sha256,
+               error_class, error_message
+        FROM m2_history_symbol_checkpoints
+        WHERE dataset_id IN ({placeholders})
+        ORDER BY shard_index, symbol
+    """, tuple(dataset_ids[index] for index in range(shard_count)))
+
+    observed: dict[tuple[int, str], tuple[Any, ...]] = {}
+    for row in rows:
+        dataset_id = str(row[0])
+        if dataset_id not in reverse_ids:
+            raise RuntimeError(f"unexpected checkpoint dataset id: {dataset_id}")
+        shard_index = reverse_ids[dataset_id]
+        symbol = str(row[1])
+        key = (shard_index, symbol)
+        if symbol not in expectations[shard_index] or key in observed:
+            raise RuntimeError(f"checkpoint scope contains an unexpected or duplicate symbol: {shard_index}:{symbol}")
+        observed[key] = row
+
+    repair_details: list[str] = []
+    resumable = 0
+    repair_indices: list[int] = []
+    repair_symbols = 0
+    for shard_index in range(shard_count):
+        shard_missing = 0
+        for symbol, (expected_rows, verification_required, expected_start, expected_end) in expectations[shard_index].items():
+            row = observed.get((shard_index, symbol))
+            reason = "missing_checkpoint"
+            if row is not None:
+                bar_rows = int(row[9])
+                verification_rows = int(row[11])
+                valid = all((
+                    str(row[2]) == mode,
+                    int(row[3]) == shard_index,
+                    int(row[4]) == shard_count,
+                    _date_text(row[5]) == expected_start,
+                    _date_text(row[6]) == expected_end,
+                    str(row[7]) == "succeeded",
+                    int(row[8]) == expected_rows,
+                    0 < bar_rows <= expected_rows,
+                    int(row[10]) == expected_rows,
+                    not verification_required or verification_rows == bar_rows,
+                    int(row[12]) == 1,
+                    bool(row[13]),
+                    _is_sha256(row[14]),
+                    _is_sha256(row[15]),
+                    row[16] is None,
+                ))
+                if valid:
+                    resumable += 1
+                    continue
+                reason = str(row[16] or row[7] or "invalid_checkpoint")
+            shard_missing += 1
+            repair_symbols += 1
+            repair_details.append(f"{shard_index}:{symbol}:{reason}")
+        if shard_missing:
+            repair_indices.append(shard_index)
+
+    return {
+        "repair_matrix": {
+            "include": [
+                {"shard_index": index, "shard_count": shard_count}
+                for index in repair_indices
+            ],
+        },
+        "repair_shard_count": len(repair_indices),
+        "repair_symbol_count": repair_symbols,
+        "resumable_symbol_count": resumable,
+        "repair_details": repair_details,
+    }
+
+
+def validate_checkpoint_manifest(connection: Any, dataset_id: str, evidence: HistoricalEvidence) -> None:
+    """Fail closed before registering a run whose physical rows were checkpointed earlier."""
+
+    manifest = evidence.manifest
+    if manifest.get("shard_index") is None or manifest.get("accepted") is not True:
+        raise RuntimeError("checkpoint manifest-only publication requires an accepted physical shard")
+    if manifest.get("authoritative") is not False or manifest.get("simulation_orders_allowed") is not False:
+        raise RuntimeError("checkpoint manifest-only publication requires the simulation-only boundary")
+    if str(manifest.get("checkpoint_dataset_id") or "") != dataset_id:
+        raise RuntimeError("checkpoint manifest-only dataset id does not match the physical shard manifest")
+    if manifest.get("acquisition_policy") in {"repair", "finalize"}:
+        required_gates = {"checkpoint_symbol_completion", "checkpoint_verification_completion"}
+        passed_gates = {
+            str(gate.get("name"))
+            for gate in manifest.get("gates", [])
+            if isinstance(gate, Mapping) and gate.get("passed") is True and gate.get("critical") is True
+        }
+        if not required_gates <= passed_gates:
+            raise RuntimeError("checkpoint manifest-only publication requires completed symbol and verification gates")
+    expected_files = (
+        ("bar_count", "bars_sha256", evidence.bars),
+        ("tradeability_count", "tradeability_sha256", evidence.tradeability),
+        ("adjustment_event_count", "adjustments_sha256", evidence.adjustments),
+        ("reference_count", "references_sha256", evidence.references),
+        ("verification_check_count", "verification_checks_sha256", evidence.verification_checks),
+    )
+    for count_key, hash_key, rows in expected_files:
+        if int(manifest.get(count_key, -1)) != len(rows) or str(manifest.get(hash_key)) != sha256(rows):
+            raise RuntimeError(f"checkpoint manifest-only publication found mismatched {count_key}/{hash_key}")
+    aggregate = _query_all(connection, """
+        SELECT COUNT(*),
+               SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END),
+               COALESCE(SUM(expected_rows), 0), COALESCE(SUM(bar_rows), 0),
+               COALESCE(SUM(tradeability_rows), 0), COALESCE(SUM(adjustment_rows), 0),
+               COALESCE(SUM(verification_rows), 0), COALESCE(SUM(reference_present), 0)
+        FROM m2_history_symbol_checkpoints
+        WHERE dataset_id=%s
+    """, (dataset_id,))
+    if len(aggregate) != 1:
+        raise RuntimeError("checkpoint manifest-only publication could not read checkpoint inventory")
+    row = tuple(int(value or 0) for value in aggregate[0])
+    expected = (
+        int(manifest["symbol_count"]),
+        int(manifest["symbol_count"]),
+        int(manifest["expected_key_count"]),
+        int(manifest["bar_count"]),
+        int(manifest["tradeability_count"]),
+        int(manifest["adjustment_event_count"]),
+        int(manifest["verification_check_count"]),
+        int(manifest["reference_count"]),
+    )
+    if row != expected:
+        raise RuntimeError(f"checkpoint manifest-only inventory mismatch: stored={row}, manifest={expected}")
 
 
 def _date_text(value: Any) -> str | None:

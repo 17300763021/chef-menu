@@ -13,6 +13,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import (
     HistoricalEvidence,
     TiDBConfig,
+    build_checkpoint_repair_plan,
     connect,
     default_dataset_id,
     ensure_schema,
@@ -241,6 +242,42 @@ def merged_manifest_evidence() -> HistoricalEvidence:
 
 
 class TiDBCheckpointStoreTests(unittest.TestCase):
+    def test_repair_plan_selects_only_missing_failed_or_incomplete_checkpoints(self) -> None:
+        class RepairConnection(FakeConnection):
+            def query_result(self, sql: str):
+                if "FROM m2_history_symbol_checkpoints" not in sql:
+                    return []
+                valid_hash = "a" * 64
+                return [
+                    ("shard-0", "000001", "full", 0, 2, "2026-01-01", "2026-07-24", "succeeded", 100, 99, 100, 0, 1, "akshare_eastmoney", valid_hash, valid_hash, None, None),
+                    ("shard-0", "000002", "full", 0, 2, "2026-01-01", "2026-07-24", "failed", 100, 0, 100, 0, 0, None, None, valid_hash, "primary_failure", "endpoint closed"),
+                    ("shard-1", "600001", "full", 1, 2, "2026-01-01", "2026-07-24", "succeeded", 90, 88, 90, 87, 1, "akshare_sina", valid_hash, valid_hash, None, None),
+                ]
+
+        result = build_checkpoint_repair_plan(
+            RepairConnection(),
+            dataset_ids={0: "shard-0", 1: "shard-1"},
+            expectations={
+                0: {
+                    "000001": (100, False, "2026-01-01", "2026-07-24"),
+                    "000002": (100, False, "2026-01-01", "2026-07-24"),
+                },
+                1: {"600001": (90, True, "2026-01-01", "2026-07-24")},
+            },
+            mode="full",
+            shard_count=2,
+        )
+
+        self.assertEqual(result["resumable_symbol_count"], 1)
+        self.assertEqual(result["repair_symbol_count"], 2)
+        self.assertEqual(result["repair_shard_count"], 2)
+        self.assertEqual(result["repair_matrix"], {
+            "include": [
+                {"shard_index": 0, "shard_count": 2},
+                {"shard_index": 1, "shard_count": 2},
+            ],
+        })
+
     def test_config_safe_summary_does_not_expose_password(self) -> None:
         config = TiDBConfig(
             host="gateway.example.com",
@@ -412,6 +449,61 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(len(connection.executed_many), 2)
         self.assertTrue(all(len(rows) == 2 for _sql, rows in connection.executed_many))
 
+    def test_checkpoint_manifest_only_registers_run_without_rewriting_market_rows(self) -> None:
+        evidence = sample_evidence(accepted=True)
+        evidence.manifest.update({
+            "symbol_count": 1,
+            "expected_key_count": 1,
+            "bar_count": 1,
+            "tradeability_count": 1,
+            "adjustment_event_count": 1,
+            "reference_count": 1,
+            "verification_check_count": 0,
+            "checkpoint_dataset_id": "physical-shard",
+            "primary_failures": {},
+            "bars_sha256": sha256(evidence.bars),
+            "tradeability_sha256": sha256(evidence.tradeability[:1]),
+            "adjustments_sha256": sha256(evidence.adjustments),
+            "references_sha256": sha256(evidence.references),
+            "verification_checks_sha256": sha256(evidence.verification_checks),
+        })
+        evidence = HistoricalEvidence(
+            manifest=evidence.manifest,
+            bars=evidence.bars,
+            tradeability=evidence.tradeability[:1],
+            adjustments=evidence.adjustments,
+            references=evidence.references,
+            verification_checks=evidence.verification_checks,
+        )
+
+        class CheckpointConnection(FakeConnection):
+            def query_result(self, sql: str):
+                if "SUM(CASE WHEN status='succeeded'" in sql:
+                    return [(1, 1, 1, 1, 1, 1, 0, 1)]
+                return []
+
+        connection = CheckpointConnection()
+        result = publish_historical_evidence(
+            connection,
+            evidence,
+            dataset_id="physical-shard",
+            checkpoint_manifest_only=True,
+        )
+
+        self.assertEqual(result["storage_mode"], "checkpoint_manifest_only")
+        self.assertEqual(result["counts"], {
+            "runs": 1,
+            "shard_mappings": 0,
+            "bars": 0,
+            "tradeability": 0,
+            "adjustments": 0,
+            "references": 0,
+            "verification_checks": 0,
+            "symbol_checkpoints": 0,
+        })
+        self.assertEqual(connection.executed_many, [])
+        self.assertEqual(connection.commits, 1)
+
     def test_manifest_only_publish_fails_closed_on_incomplete_or_mismatched_inventory(self) -> None:
         missing_id = merged_manifest_evidence()
         missing_id.manifest["shard_manifests"][0].pop("checkpoint_dataset_id")
@@ -517,6 +609,13 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertNotIn("--allow-unaccepted-checkpoint", merged_step)
         self.assertIn("path: historical-market-acceptance/manifest.json", merged_upload)
         self.assertNotIn("path: historical-market-acceptance/*", merged_upload)
+
+        self.assertIn("options: [capture, resume]", workflow)
+        self.assertIn("Build TiDB repair matrix from frozen plan", workflow)
+        self.assertIn("--acquisition-policy repair", workflow)
+        self.assertIn("--acquisition-policy finalize", workflow)
+        self.assertIn("--checkpoint-manifest-only", workflow)
+        self.assertIn("max-parallel: 2", workflow.split("repair-shard:", 1)[1].split("finalize-shard:", 1)[0])
 
 
 if __name__ == "__main__":

@@ -329,8 +329,15 @@ class AkshareEastmoneyHistorySource:
         previous: tuple[Decimal, Decimal] | None = None
         for business_date in sorted(set(raw) & set(qfq) & set(hfq)):
             raw_close = raw[business_date].close
-            qfq_factor = self._factor(qfq[business_date][3], raw_close)
-            hfq_factor = self._factor(hfq[business_date][3], raw_close)
+            qfq_close = qfq[business_date][3]
+            hfq_close = hfq[business_date][3]
+            # Public endpoints occasionally emit a zero adjusted close for one
+            # date.  That date has no defensible multiplicative factor, so keep
+            # it absent instead of failing the entire symbol or inventing one.
+            if raw_close <= 0 or qfq_close <= 0 or hfq_close <= 0:
+                continue
+            qfq_factor = self._factor(qfq_close, raw_close)
+            hfq_factor = self._factor(hfq_close, raw_close)
             factors = (qfq_factor, hfq_factor)
             if factors != previous:
                 events.append(AdjustmentEvent(code, business_date, qfq_factor, hfq_factor, source=f"{source}_derived"))

@@ -18,6 +18,16 @@ on:
         required: false
         default: true
         type: boolean
+      operation:
+        description: "capture starts a new scope; resume repairs one frozen prior full run and finalizes from TiDB"
+        required: true
+        default: capture
+        type: choice
+        options: [capture, resume]
+      resume_run_id:
+        description: "Required for resume: GitHub run id containing the original frozen shard plan"
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
@@ -33,9 +43,10 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: m2-historical-market-data-${{ github.event_name }}-${{ inputs.mode || 'sample' }}
+  group: m2-historical-market-data-${{ github.event_name }}-${{ inputs.mode || 'sample' }}-${{ inputs.operation || 'capture' }}
   cancel-in-progress: false
 
 jobs:
@@ -67,7 +78,7 @@ jobs:
           python -m scripts.test_baostock_history_source
 
   sample:
-    if: github.event_name == 'push' || inputs.mode == 'sample'
+    if: github.event_name == 'push' || (inputs.mode == 'sample' && inputs.operation == 'capture')
     needs: deterministic-tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -144,7 +155,7 @@ jobs:
           retention-days: 30
 
   plan:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'sample'
+    if: github.event_name == 'workflow_dispatch' && (inputs.mode != 'sample' || inputs.operation == 'resume')
     needs: deterministic-tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -153,6 +164,11 @@ jobs:
       mode: ${{ steps.export.outputs.mode }}
       end_date: ${{ steps.export.outputs.end_date }}
       checkpoint_scope_sha256: ${{ steps.export.outputs.checkpoint_scope_sha256 }}
+      repair_matrix: ${{ steps.export.outputs.repair_matrix }}
+      repair_required: ${{ steps.export.outputs.repair_required }}
+      repair_shard_count: ${{ steps.export.outputs.repair_shard_count }}
+      repair_symbol_count: ${{ steps.export.outputs.repair_symbol_count }}
+      resumable_symbol_count: ${{ steps.export.outputs.resumable_symbol_count }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -166,16 +182,63 @@ jobs:
         env:
           INPUT_END_DATE: ${{ inputs.end_date }}
         run: echo "end_date=${INPUT_END_DATE:-$(date -u -d 'yesterday' +%F)}" >> "$GITHUB_OUTPUT"
+      - name: Validate resume inputs
+        if: inputs.operation == 'resume'
+        env:
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          PUBLISH_TIDB: ${{ inputs.publish_tidb }}
+        run: |
+          [[ "$RESUME_RUN_ID" =~ ^[0-9]+$ ]] || { echo "resume_run_id must be a numeric GitHub run id"; exit 2; }
+          [[ "$PUBLISH_TIDB" == "true" ]] || { echo "resume requires TiDB checkpoints"; exit 2; }
+      - name: Download original frozen shard plan
+        if: inputs.operation == 'resume'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m2-history-plan-${{ inputs.resume_run_id }}
+          path: original-plan
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.resume_run_id }}
+      - name: Resolve frozen business end
+        id: scope
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CAPTURE_END_DATE: ${{ steps.date.outputs.end_date }}
+        run: |
+          python - <<'PY'
+          import json, os
+          end_date = os.environ["CAPTURE_END_DATE"]
+          if os.environ["OPERATION"] == "resume":
+              end_date = json.load(open("original-plan/shard-plan.json", encoding="utf-8"))["business_end"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("end_date=" + end_date + "\n")
+          PY
       - name: Build deterministic shard plan
+        if: inputs.operation == 'capture'
         run: >-
           python -u -m scripts.market_data.historical_bars
-          --end-date "${{ steps.date.outputs.end_date }}"
+          --end-date "${{ steps.scope.outputs.end_date }}"
           --mode "${{ inputs.mode }}"
           --plan-output shard-plan.json
+      - name: Build TiDB repair matrix from frozen plan
+        if: inputs.operation == 'resume'
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ steps.scope.outputs.end_date }}"
+          --mode "${{ inputs.mode }}"
+          --plan-input original-plan/shard-plan.json
+          --plan-output shard-plan.json
+          --acquisition-policy repair
       - name: Export shard matrix
         id: export
         env:
-          END_DATE: ${{ steps.date.outputs.end_date }}
+          END_DATE: ${{ steps.scope.outputs.end_date }}
         run: |
           python - <<'PY'
           import json, os
@@ -185,21 +248,29 @@ jobs:
               stream.write("mode=" + plan["mode"] + "\n")
               stream.write("end_date=" + os.environ["END_DATE"] + "\n")
               stream.write("checkpoint_scope_sha256=" + plan["checkpoint_scope_sha256"] + "\n")
+              repair_matrix = plan.get("repair_matrix", {"include": []})
+              repair_shards = int(plan.get("repair_shard_count", 0))
+              stream.write("repair_matrix=" + json.dumps(repair_matrix, separators=(",", ":")) + "\n")
+              stream.write("repair_required=" + ("true" if repair_shards else "false") + "\n")
+              stream.write("repair_shard_count=" + str(repair_shards) + "\n")
+              stream.write("repair_symbol_count=" + str(plan.get("repair_symbol_count", 0)) + "\n")
+              stream.write("resumable_symbol_count=" + str(plan.get("resumable_symbol_count", 0)) + "\n")
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: m2-history-plan-${{ github.run_id }}
           path: shard-plan.json
-          retention-days: 30
+          retention-days: 90
 
   shard:
+    if: inputs.operation == 'capture'
     needs: plan
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -232,6 +303,7 @@ jobs:
           --shard-index "${{ matrix.shard_index }}"
           --shard-count "${{ matrix.shard_count }}"
           --output-dir "historical-shard-${{ matrix.shard_index }}"
+          --acquisition-policy capture
           --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
       - name: Retry only failed or missing symbols from TiDB checkpoint
         if: steps.capture.outcome == 'failure' && inputs.publish_tidb
@@ -251,6 +323,7 @@ jobs:
           --shard-index "${{ matrix.shard_index }}"
           --shard-count "${{ matrix.shard_count }}"
           --output-dir "historical-shard-${{ matrix.shard_index }}"
+          --acquisition-policy capture
           --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
       - name: Publish shard checkpoint to TiDB
         if: always() && inputs.publish_tidb
@@ -278,9 +351,162 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  repair-shard:
+    if: inputs.operation == 'resume' && needs.plan.outputs.repair_required == 'true'
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.repair_matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Download fixed repair plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m2-history-plan-${{ github.run_id }}
+          path: shard-plan
+      - name: Repair only failed or missing symbols
+        id: repair
+        continue-on-error: true
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ needs.plan.outputs.end_date }}"
+          --mode "${{ needs.plan.outputs.mode }}"
+          --plan-input shard-plan/shard-plan.json
+          --shard-index "${{ matrix.shard_index }}"
+          --shard-count "${{ matrix.shard_count }}"
+          --output-dir "historical-repair-${{ matrix.shard_index }}"
+          --acquisition-policy repair
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Retry remaining failed symbols once
+        if: steps.repair.outcome == 'failure'
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ needs.plan.outputs.end_date }}"
+          --mode "${{ needs.plan.outputs.mode }}"
+          --plan-input shard-plan/shard-plan.json
+          --shard-index "${{ matrix.shard_index }}"
+          --shard-count "${{ matrix.shard_count }}"
+          --output-dir "historical-repair-${{ matrix.shard_index }}"
+          --acquisition-policy repair
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Register repaired physical shard without rewriting market rows
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.publish_historical_to_tidb
+          --input-dir "historical-repair-${{ matrix.shard_index }}"
+          --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+          --checkpoint-manifest-only
+      - name: Upload repair diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-repair-${{ github.run_id }}-${{ matrix.shard_index }}
+          path: historical-repair-${{ matrix.shard_index }}/manifest.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  finalize-shard:
+    if: always() && inputs.operation == 'resume' && needs.plan.result == 'success' && (needs.repair-shard.result == 'success' || needs.repair-shard.result == 'skipped')
+    needs: [plan, repair-shard]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Download fixed repair plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m2-history-plan-${{ github.run_id }}
+          path: shard-plan
+      - name: Finalize shard from TiDB with public market data disabled
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.historical_bars
+          --end-date "${{ needs.plan.outputs.end_date }}"
+          --mode "${{ needs.plan.outputs.mode }}"
+          --plan-input shard-plan/shard-plan.json
+          --shard-index "${{ matrix.shard_index }}"
+          --shard-count "${{ matrix.shard_count }}"
+          --output-dir "historical-shard-${{ matrix.shard_index }}"
+          --acquisition-policy finalize
+          --tidb-checkpoint-dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+      - name: Register finalized physical shard without rewriting market rows
+        env:
+          TIDB_CHECKPOINT_DATASET_ID: m2-${{ needs.plan.outputs.mode }}-${{ needs.plan.outputs.end_date }}-${{ needs.plan.outputs.checkpoint_scope_sha256 }}-shard-${{ matrix.shard_index }}-of-${{ matrix.shard_count }}
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: >-
+          python -u -m scripts.market_data.publish_historical_to_tidb
+          --input-dir "historical-shard-${{ matrix.shard_index }}"
+          --dataset-id "$TIDB_CHECKPOINT_DATASET_ID"
+          --checkpoint-manifest-only
+      - name: Upload finalized shard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m2-history-shard-${{ github.run_id }}-${{ matrix.shard_index }}
+          path: historical-shard-${{ matrix.shard_index }}/*
+          if-no-files-found: warn
+          retention-days: 30
+
   merge:
-    if: always() && needs.plan.result == 'success'
-    needs: [plan, shard]
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      ((inputs.operation == 'capture' && needs.shard.result == 'success') ||
+       (inputs.operation == 'resume' && needs.finalize-shard.result == 'success'))
+    needs: [plan, shard, repair-shard, finalize-shard]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

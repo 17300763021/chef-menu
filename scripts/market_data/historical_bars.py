@@ -10,6 +10,7 @@ import signal
 import sys
 import time
 from bisect import bisect_right
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -42,6 +43,20 @@ PREFLIGHT_SYMBOLS = 100
 SYMBOL_DEADLINE_SECONDS = 60
 FULL_HISTORY_ACQUISITION_STAGGER_SECONDS = 10
 FULL_HISTORY_ACQUISITION_STAGGER_BUCKETS = 6
+ACQUISITION_POLICIES = ("capture", "repair", "finalize")
+PLAN_RUNTIME_FIELDS = {
+    "acquisition_policy",
+    "repair_matrix",
+    "repair_shard_count",
+    "repair_symbol_count",
+    "resumable_symbol_count",
+    "repair_details",
+    "plan_evidence_sha256",
+}
+
+
+class SymbolDeadlineInterrupt(BaseException):
+    """Private control-flow exception that vendor ``except Exception`` blocks cannot swallow."""
 
 
 def membership_keys(sessions: tuple[date, ...], snapshots: dict[date, dict[str, tuple[str, ...]]]) -> dict[tuple[str, date], str]:
@@ -67,6 +82,8 @@ def fetch_primary(symbols: list[str], ranges: dict[str, tuple[date, date]], work
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
                     output[symbol] = source.fetch_raw(symbol, *ranges[symbol])
+            except SymbolDeadlineInterrupt as error:
+                failures[symbol] = f"TimeoutError: {error}"
             except Exception as error:
                 failures[symbol] = f"{type(error).__name__}: {error}"
         return output, failures
@@ -165,7 +182,7 @@ def symbol_deadline(seconds: int):
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def raise_timeout(signum: int, frame: object) -> None:
-        raise TimeoutError(f"symbol acquisition exceeded {seconds} seconds")
+        raise SymbolDeadlineInterrupt(f"symbol acquisition exceeded {seconds} seconds")
 
     signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -264,7 +281,10 @@ def run(
     secondary_calendar: TradingCalendar | None = None,
     resume_evidence: Any | None = None,
     checkpoint_callback: Callable[..., None] | None = None,
+    acquisition_policy: str = "capture",
 ) -> tuple[dict[str, Any], list[HistoricalBar], list[TradeabilityFact], list[AdjustmentEvent], list[SecurityReference], list[tuple[str, date, Decimal, Decimal]]]:
+    if acquisition_policy not in ACQUISITION_POLICIES:
+        raise ValueError(f"unsupported acquisition policy: {acquisition_policy}")
     start = HISTORY_START if mode in {"smoke", "preflight", "full"} else max(HISTORY_START, end - timedelta(days=150))
     _progress("prerequisites_started", end_date=end.isoformat(), mode=mode)
     using_frozen_calendars = primary_calendar is not None and secondary_calendar is not None
@@ -352,6 +372,16 @@ def run(
         symbol for symbol in verification_targets
         if symbol not in valid_resumed or resumed_check_counts[symbol] < resumed_bar_counts[symbol]
     ]
+    if acquisition_policy == "finalize":
+        missing_resume_symbols = sorted(symbol_set - valid_resumed)
+        if missing_resume_symbols or verification_fetch_targets:
+            problems = []
+            if missing_resume_symbols:
+                problems.append(f"missing or invalid symbol checkpoints: {', '.join(missing_resume_symbols)}")
+            if verification_fetch_targets:
+                problems.append(f"incomplete verification checkpoints: {', '.join(verification_fetch_targets)}")
+            raise RuntimeError("finalize policy forbids public market-data requests; " + "; ".join(problems))
+    checkpoint_failures: dict[str, str] = {}
     verification_delay = 0 if mode == "sample" else (shard_index % 4) * 5
     if verification_fetch_targets and verification_delay:
         _progress("verification_stagger", delay_seconds=verification_delay)
@@ -372,6 +402,23 @@ def run(
                     resumed_bar.symbol, resumed_bar.business_date,
                     resumed_bar.close, verification.close,
                 ))
+        if checkpoint_callback is not None:
+            for symbol in sorted(refreshed_symbols & valid_resumed):
+                symbol_bars = [row for row in bars if row.symbol == symbol]
+                symbol_facts = [row for row in facts if row.symbol == symbol]
+                symbol_adjustments = [row for row in adjustments if row.symbol == symbol]
+                symbol_reference = next((row for row in references if row.symbol == symbol), None)
+                symbol_checks = [row for row in close_checks if row[0] == symbol]
+                try:
+                    checkpoint_callback(
+                        symbol, symbol_bars, symbol_facts, symbol_adjustments,
+                        symbol_reference, symbol_checks,
+                        primary_sources_by_symbol.get(symbol), None,
+                    )
+                    _progress("tidb_verification_checkpoint_refreshed", symbol=symbol, checks=len(symbol_checks))
+                except Exception as error:
+                    checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
+                    _progress("tidb_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
 
     acquisition_symbols = [symbol for symbol in symbols if symbol not in valid_resumed]
     history_delay = history_stagger_seconds(mode, shard_index)
@@ -380,10 +427,10 @@ def run(
         time.sleep(history_delay)
 
     primary_failures: dict[str, str] = {}
-    checkpoint_failures: dict[str, str] = {}
     started_at = time.monotonic()
-    source = AkshareEastmoneyHistorySource(timeout_seconds=20, attempts=2)
+    source = AkshareEastmoneyHistorySource(timeout_seconds=20, attempts=2) if acquisition_symbols else None
     for position, symbol in enumerate(acquisition_symbols, start=1):
+        _progress("symbol_started", symbol=symbol, position=position, total=len(acquisition_symbols))
         last_error: Exception | None = None
         raw: dict[date, DailyBar] = {}
         qfq: dict[date, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
@@ -396,6 +443,7 @@ def run(
         for attempt in range(1, symbol_attempts + 1):
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
+                    assert source is not None
                     raw, qfq, hfq, events_for_symbol, reference, status, primary_source_name = source.fetch_bundle(symbol, *ranges[symbol])
                     factors = {
                         business_date: (
@@ -403,9 +451,17 @@ def run(
                             source._factor(hfq[business_date][3], raw[business_date].close),
                         )
                         for business_date in set(raw) & set(qfq) & set(hfq)
+                        if raw[business_date].close > 0
+                        and qfq[business_date][3] > 0
+                        and hfq[business_date][3] > 0
                     }
                 last_error = None
                 break
+            except SymbolDeadlineInterrupt as error:
+                last_error = TimeoutError(str(error))
+                _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"TimeoutError: {error}")
+                if attempt < symbol_attempts:
+                    time.sleep(2 ** (attempt - 1))
             except Exception as error:
                 last_error = error
                 _progress("symbol_retry", symbol=symbol, attempt=attempt, error=f"{type(error).__name__}: {error}")
@@ -489,6 +545,35 @@ def run(
         aggregate_critical=shard_count == 1,
     )
     gates = [*calendar_gates, *universe_gates, *historical_gates]
+    if acquisition_policy in {"repair", "finalize"}:
+        completed_symbols = set(valid_resumed) | set(primary_sources_by_symbol)
+        incomplete_symbols = sorted(symbol_set - completed_symbols)
+        gates.append(GateResult(
+            "checkpoint_symbol_completion",
+            not primary_failures and not incomplete_symbols,
+            len(incomplete_symbols),
+            "= 0",
+            details=tuple(incomplete_symbols),
+        ))
+        verification_bar_counts = {
+            symbol: sum(1 for row in bars if row.symbol == symbol)
+            for symbol in verification_targets
+        }
+        verification_check_counts = {
+            symbol: sum(1 for row in close_checks if row[0] == symbol)
+            for symbol in verification_targets
+        }
+        incomplete_verification_symbols = sorted(
+            symbol for symbol in verification_targets
+            if verification_check_counts[symbol] != verification_bar_counts[symbol]
+        )
+        gates.append(GateResult(
+            "checkpoint_verification_completion",
+            not incomplete_verification_symbols,
+            len(incomplete_verification_symbols),
+            "= 0",
+            details=tuple(incomplete_verification_symbols),
+        ))
     if checkpoint_callback is not None:
         gates.append(GateResult(
             "tidb_symbol_checkpoint_writes", not checkpoint_failures, len(checkpoint_failures), "= 0",
@@ -516,6 +601,7 @@ def run(
     manifest = {
         "manifest_version": "m2-historical-market-manifest-v1", "authoritative": False,
         "simulation_orders_allowed": False, "mode": mode, "history_start": start.isoformat(),
+        "acquisition_policy": acquisition_policy,
         "business_end": current.as_of_date.isoformat(), "symbol_count": len(symbols),
         "global_symbol_count": len(selected_symbols), "global_expected_key_count": global_expected_key_count,
         "shard_index": shard_index, "shard_count": shard_count,
@@ -595,6 +681,104 @@ def build_plan(end: date, mode: str) -> dict[str, Any]:
     return plan
 
 
+def validate_plan_scope(plan: dict[str, Any]) -> None:
+    scope_hash = str(plan.get("checkpoint_scope_sha256") or "")
+    base_plan = {key: value for key, value in plan.items() if key not in PLAN_RUNTIME_FIELDS and key != "checkpoint_scope_sha256"}
+    actual_hash = sha256(base_plan)
+    if len(scope_hash) != 64 or actual_hash != scope_hash:
+        raise ValueError(f"checkpoint plan scope hash mismatch: expected {scope_hash or '<missing>'}, got {actual_hash}")
+    evidence_hash = plan.get("plan_evidence_sha256")
+    if evidence_hash is not None:
+        evidence_payload = {key: value for key, value in plan.items() if key != "plan_evidence_sha256"}
+        actual_evidence_hash = sha256(evidence_payload)
+        if str(evidence_hash) != actual_evidence_hash:
+            raise ValueError(f"repair plan evidence hash mismatch: expected {evidence_hash}, got {actual_evidence_hash}")
+
+
+def shard_checkpoint_dataset_id(plan: dict[str, Any], shard_index: int) -> str:
+    validate_plan_scope(plan)
+    return (
+        f"m2-{plan['mode']}-{plan['business_end']}-{plan['checkpoint_scope_sha256']}"
+        f"-shard-{shard_index}-of-{plan['shard_count']}"
+    )
+
+
+def checkpoint_expectations(plan: dict[str, Any]) -> dict[int, dict[str, tuple[int, bool, str, str]]]:
+    """Rebuild exact per-shard checkpoint expectations from one frozen plan without network I/O."""
+
+    validate_plan_scope(plan)
+    if plan.get("mode") == "sample":
+        raise ValueError("sample mode does not use a resumable shard plan")
+    current = current_universe_from_canonical(plan["current_snapshot"])
+    primary_calendar = trading_calendar_from_canonical(plan["primary_calendar"])
+    events, _discovered, _source = CsiIndexSource().fetch_indexed_events(
+        current.as_of_date,
+        {int(value) for value in plan.get("csi_discovered_notice_ids", [])},
+    )
+    snapshots = reconstruct(current, events)
+    sessions = tuple(value for value in primary_calendar.open_dates if HISTORY_START <= value <= current.as_of_date)
+    expected = membership_keys(sessions, snapshots)
+    all_symbols = sorted({symbol for symbol, _ in expected})
+    mode = str(plan["mode"])
+    requested_limit = SMOKE_SYMBOLS if mode == "smoke" else PREFLIGHT_SYMBOLS if mode == "preflight" else len(all_symbols)
+    selected_symbols = bounded_symbols(all_symbols, min(len(all_symbols), requested_limit))
+    if len(selected_symbols) != int(plan["symbol_count"]):
+        raise ValueError("frozen plan symbol count no longer reconstructs deterministically")
+    verification_targets = set(verification_symbols(selected_symbols, "full"))
+    expected_row_counts = Counter(symbol for symbol, _day in expected)
+    expected_bounds: dict[str, tuple[date, date]] = {}
+    for symbol, business_date in expected:
+        current_bounds = expected_bounds.get(symbol)
+        if current_bounds is None:
+            expected_bounds[symbol] = (business_date, business_date)
+        else:
+            expected_bounds[symbol] = (min(current_bounds[0], business_date), max(current_bounds[1], business_date))
+    shard_count = int(plan["shard_count"])
+    result: dict[int, dict[str, tuple[int, bool, str, str]]] = {}
+    for shard_index in range(shard_count):
+        shard = shard_symbols(selected_symbols, shard_index, shard_count)
+        result[shard_index] = {
+            symbol: (
+                expected_row_counts[symbol],
+                symbol in verification_targets,
+                expected_bounds[symbol][0].isoformat(),
+                expected_bounds[symbol][1].isoformat(),
+            )
+            for symbol in shard
+        }
+    return result
+
+
+def enrich_repair_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Attach a TiDB-derived repair matrix without changing the frozen checkpoint scope."""
+
+    from scripts.market_data.tidb_checkpoint_store import (
+        TiDBConfig,
+        build_checkpoint_repair_plan,
+        connect,
+    )
+
+    expectations = checkpoint_expectations(plan)
+    dataset_ids = {index: shard_checkpoint_dataset_id(plan, index) for index in expectations}
+    connection = connect(TiDBConfig.from_env())
+    try:
+        repair = build_checkpoint_repair_plan(
+            connection,
+            dataset_ids=dataset_ids,
+            expectations=expectations,
+            mode=str(plan["mode"]),
+            shard_count=int(plan["shard_count"]),
+        )
+    finally:
+        connection.close()
+    enriched = dict(plan)
+    enriched.update(repair)
+    enriched["acquisition_policy"] = "repair"
+    enriched["plan_evidence_sha256"] = sha256(enriched)
+    validate_plan_scope(enriched)
+    return enriched
+
+
 def _write_gzip(path: Path, value: Any) -> None:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     with path.open("wb") as raw:
@@ -637,6 +821,7 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--plan-output", type=Path)
     parser.add_argument("--plan-input", type=Path)
+    parser.add_argument("--acquisition-policy", choices=ACQUISITION_POLICIES, default="capture")
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
     parser.add_argument("--symbol-attempts", type=int, default=1)
     parser.add_argument(
@@ -646,7 +831,19 @@ def main() -> int:
     )
     args = parser.parse_args()
     if args.plan_output:
-        plan = build_plan(args.end_date, args.mode)
+        if args.plan_input:
+            plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
+            validate_plan_scope(plan)
+            if plan.get("mode") != args.mode:
+                raise ValueError(f"plan mode {plan.get('mode')} does not match requested mode {args.mode}")
+            if plan.get("business_end") != args.end_date.isoformat():
+                raise ValueError(f"plan end date {plan.get('business_end')} does not match requested end date {args.end_date}")
+        else:
+            if args.acquisition_policy != "capture":
+                raise ValueError("repair/finalize plan generation requires --plan-input with a frozen checkpoint plan")
+            plan = build_plan(args.end_date, args.mode)
+        if args.acquisition_policy == "repair":
+            plan = enrich_repair_plan(plan)
         args.plan_output.parent.mkdir(parents=True, exist_ok=True)
         args.plan_output.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True), flush=True)
@@ -657,6 +854,7 @@ def main() -> int:
     secondary_calendar = None
     if args.plan_input:
         plan = json.loads(args.plan_input.read_text(encoding="utf-8"))
+        validate_plan_scope(plan)
         if plan.get("mode") != args.mode:
             raise ValueError(f"plan mode {plan.get('mode')} does not match requested mode {args.mode}")
         if plan.get("business_end") != args.end_date.isoformat():
@@ -673,7 +871,23 @@ def main() -> int:
             primary_calendar = trading_calendar_from_canonical(primary_calendar_snapshot)
         if secondary_calendar_snapshot:
             secondary_calendar = trading_calendar_from_canonical(secondary_calendar_snapshot)
+        if args.acquisition_policy == "repair":
+            repair_indices = {
+                int(item["shard_index"])
+                for item in plan.get("repair_matrix", {}).get("include", [])
+            }
+            if args.shard_index not in repair_indices:
+                raise ValueError(f"shard {args.shard_index} is not present in the frozen repair matrix")
     checkpoint_dataset_id = args.tidb_checkpoint_dataset_id.strip()
+    if checkpoint_dataset_id and args.plan_input:
+        expected_dataset_id = shard_checkpoint_dataset_id(plan, args.shard_index)
+        if checkpoint_dataset_id != expected_dataset_id:
+            raise ValueError(
+                f"TiDB checkpoint dataset id does not match frozen plan: "
+                f"expected {expected_dataset_id}, got {checkpoint_dataset_id}"
+            )
+    if args.acquisition_policy in {"repair", "finalize"} and not checkpoint_dataset_id:
+        raise ValueError(f"{args.acquisition_policy} policy requires a stable TiDB checkpoint dataset id")
     resume_evidence = None
     checkpoint_writer: Callable[..., None] | None = None
     if checkpoint_dataset_id:
@@ -771,6 +985,7 @@ def main() -> int:
         secondary_calendar=secondary_calendar,
         resume_evidence=resume_evidence,
         checkpoint_callback=checkpoint_writer,
+        acquisition_policy=args.acquisition_policy,
     )
     manifest = result[0]
     if checkpoint_dataset_id:

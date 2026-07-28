@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from unittest.mock import patch
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.historical_contracts import HistoricalBar, SecurityReference
-from scripts.market_data.historical_bars import build_plan, bounded_symbols, current_universe_from_canonical, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
+from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, fetch_primary, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
 from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
@@ -16,6 +17,24 @@ from scripts.market_data.universe_contracts import CurrentUniverse
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
+    def test_symbol_deadline_interrupt_cannot_be_swallowed_by_vendor_exception_handler(self) -> None:
+        self.assertTrue(issubclass(SymbolDeadlineInterrupt, BaseException))
+        self.assertFalse(issubclass(SymbolDeadlineInterrupt, Exception))
+
+        @contextmanager
+        def immediate_deadline(_seconds: int):
+            raise SymbolDeadlineInterrupt("fixture deadline")
+            yield
+
+        with patch("scripts.market_data.historical_bars.symbol_deadline", immediate_deadline):
+            rows, failures = fetch_primary(
+                ["000001"],
+                {"000001": (date(2026, 7, 20), date(2026, 7, 21))},
+                workers=1,
+            )
+        self.assertEqual(rows, {})
+        self.assertEqual(failures, {"000001": "TimeoutError: fixture deadline"})
+
     def test_adjusted_prices_are_derived_without_overwriting_raw(self) -> None:
         row = HistoricalBar.build(
             symbol="600519", business_date=date(2026, 7, 15), index_code="000300",
@@ -221,6 +240,39 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(events[0].hfq_factor, Decimal("2.000000"))
         self.assertEqual(events[0].source, "akshare_eastmoney_derived")
 
+    def test_nonpositive_adjusted_date_is_omitted_without_failing_entire_symbol(self) -> None:
+        source = AkshareEastmoneyHistorySource()
+        raw = {
+            date(2026, 7, 20): DailyBar(
+                source="akshare_eastmoney", symbol="000937", exchange="SZSE",
+                business_date=date(2026, 7, 20), open=Decimal("10"), high=Decimal("11"),
+                low=Decimal("9"), close=Decimal("10"), previous_close=None,
+                volume_shares=100, amount_cny=Decimal("1000"), turnover_percent=Decimal("1"),
+                trade_status="trading", is_st=None,
+            ),
+            date(2026, 7, 21): DailyBar(
+                source="akshare_eastmoney", symbol="000937", exchange="SZSE",
+                business_date=date(2026, 7, 21), open=Decimal("11"), high=Decimal("12"),
+                low=Decimal("10"), close=Decimal("11"), previous_close=None,
+                volume_shares=100, amount_cny=Decimal("1100"), turnover_percent=Decimal("1"),
+                trade_status="trading", is_st=None,
+            ),
+        }
+        qfq = {
+            date(2026, 7, 20): (Decimal("0"),) * 4,
+            date(2026, 7, 21): (Decimal("11"), Decimal("12"), Decimal("10"), Decimal("11")),
+        }
+        hfq = {
+            date(2026, 7, 20): (Decimal("20"), Decimal("22"), Decimal("18"), Decimal("20")),
+            date(2026, 7, 21): (Decimal("22"), Decimal("24"), Decimal("20"), Decimal("22")),
+        }
+
+        events = source.derive_adjustments("000937", raw, qfq, hfq)
+
+        self.assertEqual([event.effective_date for event in events], [date(2026, 7, 21)])
+        self.assertEqual(events[0].qfq_factor, Decimal("1.000000"))
+        self.assertEqual(events[0].hfq_factor, Decimal("2.000000"))
+
     def test_primary_history_run_does_not_require_baostock_history_login(self) -> None:
         calendar = TradingCalendar.build(
             "akshare_calendar", date(2026, 7, 20), date(2026, 7, 22),
@@ -360,6 +412,22 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual([row.canonical() for row in resumed_references], [row.canonical() for row in references])
         self.assertEqual(resumed_checks, close_checks)
 
+        with (
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+            patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", side_effect=AssertionError("finalize must not instantiate a public source")),
+            patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("finalize must not fetch verification data")),
+        ):
+            finalized_manifest, *_finalized = run(
+                date(2026, 7, 22), mode="sample", current_universe=current,
+                primary_calendar=calendar, secondary_calendar=calendar,
+                resume_evidence=resume_evidence, acquisition_policy="finalize",
+            )
+        self.assertEqual(finalized_manifest["acquisition_policy"], "finalize")
+        self.assertEqual(finalized_manifest["acquired_symbol_count"], 0)
+        completion_gate = next(gate for gate in finalized_manifest["gates"] if gate["name"] == "checkpoint_symbol_completion")
+        self.assertTrue(completion_gate["passed"])
+
         incomplete_verification = HistoricalEvidence(
             manifest=resume_evidence.manifest,
             bars=resume_evidence.bars,
@@ -368,7 +436,24 @@ class HistoricalMarketDataTests(unittest.TestCase):
             references=resume_evidence.references,
             verification_checks=resume_evidence.verification_checks[:1],
         )
+        with (
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+            patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", side_effect=AssertionError("finalize must not instantiate a public source")),
+            patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("finalize must fail before public verification")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "finalize policy forbids public market-data requests"):
+                run(
+                    date(2026, 7, 22), mode="sample", current_universe=current,
+                    primary_calendar=calendar, secondary_calendar=calendar,
+                    resume_evidence=incomplete_verification, acquisition_policy="finalize",
+                )
         verification_rows = list(FakePrimarySource().fetch_raw("600519", date(2026, 7, 20), date(2026, 7, 22)))
+        refreshed_checkpoints = []
+
+        def capture_refreshed_checkpoint(*values):
+            refreshed_checkpoints.append(values)
+
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
@@ -379,10 +464,15 @@ class HistoricalMarketDataTests(unittest.TestCase):
                 date(2026, 7, 22), mode="sample", current_universe=current,
                 primary_calendar=calendar, secondary_calendar=calendar,
                 resume_evidence=incomplete_verification,
+                checkpoint_callback=capture_refreshed_checkpoint,
+                acquisition_policy="repair",
             )
         cross_source_gate = next(gate for gate in refreshed_manifest["gates"] if gate["name"] == "historical_cross_source_coverage")
         self.assertTrue(cross_source_gate["passed"])
         self.assertEqual(refreshed_checks, close_checks)
+        self.assertEqual(len(refreshed_checkpoints), 1)
+        self.assertEqual(refreshed_checkpoints[0][0], "600519")
+        self.assertEqual(len(refreshed_checkpoints[0][5]), 3)
 
 
 if __name__ == "__main__":
