@@ -286,6 +286,35 @@ class AkshareEastmoneyHistorySource:
             events.append(AdjustmentEvent(code, effective_date, qfq_factor, hfq_factor, source="akshare_sina_factor"))
         return events
 
+    def fetch_raw_with_fallback(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+    ) -> tuple[dict[date, DailyBar], str]:
+        """Fetch one single-source raw series without requesting factor history."""
+        code = normalize_symbol(symbol)
+        failures: list[str] = []
+        try:
+            return {row.business_date: row for row in self.fetch_raw(code, start, end)}, "akshare_eastmoney"
+        except Exception as error:
+            failures.append(f"akshare_eastmoney: {type(error).__name__}: {error}")
+        try:
+            frame = self._sina_frame(code, start, end, "")
+            return {row.business_date: row for row in self._sina_raw_bars(code, frame)}, "akshare_sina"
+        except Exception as error:
+            failures.append(f"akshare_sina: {type(error).__name__}: {error}")
+        from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+        try:
+            rows = TencentHistorySource(
+                timeout_seconds=self.timeout_seconds,
+                attempts=min(self.attempts, 2),
+            ).fetch_raw(code, start, end)
+            return {row.business_date: row for row in rows}, "tencent_archive"
+        except Exception as error:
+            failures.append(f"tencent_archive: {type(error).__name__}: {error}")
+        raise RuntimeError(f"raw sources failed for {code}: {'; '.join(failures)}")
+
     def fetch_bundle(
         self,
         symbol: str,
@@ -311,31 +340,11 @@ class AkshareEastmoneyHistorySource:
 
         code = normalize_symbol(symbol)
         failures: list[str] = []
-        raw: dict[date, DailyBar] | None = None
-        source_name: str | None = None
-        for source_name in ("akshare_eastmoney", "akshare_sina"):
-            try:
-                if source_name == "akshare_eastmoney":
-                    raw = {row.business_date: row for row in self.fetch_raw(code, start, end)}
-                else:
-                    raw = {row.business_date: row for row in self._sina_raw_bars(code, self._sina_frame(code, start, end, ""))}
-                break
-            except Exception as error:
-                failures.append(f"{source_name}: {type(error).__name__}: {error}")
-                raw = None
-        if raw is None:
-            from scripts.market_data.sources.tencent_history_source import TencentHistorySource
-            try:
-                raw = {
-                    row.business_date: row
-                    for row in TencentHistorySource(
-                        timeout_seconds=self.timeout_seconds, attempts=min(self.attempts, 2),
-                    ).fetch_raw(code, start, end)
-                }
-                source_name = "tencent_archive"
-            except Exception as error:
-                failures.append(f"tencent_archive: {type(error).__name__}: {error}")
-                raise RuntimeError(f"AKShare primary bundle failed for {code}: {'; '.join(failures)}") from error
+        try:
+            raw, source_name = self.fetch_raw_with_fallback(code, start, end)
+        except Exception as error:
+            failures.append(f"raw_bundle: {type(error).__name__}: {error}")
+            raise RuntimeError(f"AKShare primary bundle failed for {code}: {'; '.join(failures)}") from error
 
         factor_source = "akshare_sina_factor_multiplicative"
         try:
@@ -346,7 +355,6 @@ class AkshareEastmoneyHistorySource:
         except Exception as error:
             failures.append(f"{factor_source}: {type(error).__name__}: {error}")
             raise RuntimeError(f"AKShare factor bundle failed for {code}: {'; '.join(failures)}") from error
-        assert source_name is not None
         reference = self.build_reference(code, raw, source_name=source_name)
         status = self.build_status_from_raw(raw)
         return raw, qfq, hfq, events, reference, status, source_name, factor_source
