@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
 from scripts.market_data.daily_incremental import DailyIncrementalPlan
-from scripts.market_data.daily_incremental_runner import _select_target, capture_symbol
+from scripts.market_data.daily_incremental_runner import (
+    DailyPrerequisiteTimeout,
+    _select_target,
+    capture_symbol,
+    run,
+)
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_daily_store import (
@@ -125,6 +133,27 @@ def complete_evidence() -> DailyEvidence:
 
 
 class TiDBDailyStoreTests(unittest.TestCase):
+    def test_prerequisite_deadline_cannot_be_swallowed_by_vendor_handlers(self) -> None:
+        self.assertTrue(issubclass(DailyPrerequisiteTimeout, BaseException))
+        self.assertFalse(issubclass(DailyPrerequisiteTimeout, Exception))
+
+        @contextmanager
+        def immediate_deadline(_seconds: int):
+            raise DailyPrerequisiteTimeout("fixture calendar deadline")
+            yield
+
+        with patch(
+            "scripts.market_data.daily_incremental_runner.prerequisite_deadline",
+            immediate_deadline,
+        ):
+            with self.assertRaisesRegex(DailyPrerequisiteTimeout, "fixture calendar deadline"):
+                run(
+                    observed_at=datetime(2026, 7, 28, 17, 0, tzinfo=SHANGHAI),
+                    base_history_dataset_id="base-history",
+                    output_dir=Path("unused-daily-output"),
+                    requested_target=TARGET,
+                )
+
     def test_dataset_id_is_stable_and_scope_bound(self) -> None:
         self.assertEqual(
             default_daily_dataset_id(TARGET, "a" * 64),

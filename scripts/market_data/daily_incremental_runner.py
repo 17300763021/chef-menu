@@ -68,9 +68,14 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
     "993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged"
 )
 SYMBOL_DEADLINE_SECONDS = 90
+CALENDAR_DEADLINE_SECONDS = 180
 
 
 class DailySymbolTimeout(BaseException):
+    pass
+
+
+class DailyPrerequisiteTimeout(BaseException):
     pass
 
 
@@ -89,6 +94,33 @@ def symbol_deadline(seconds: int):
 
     def raise_timeout(signum: int, frame: object) -> None:
         raise DailySymbolTimeout(f"daily symbol acquisition exceeded {seconds} seconds")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+@contextmanager
+def prerequisite_deadline(seconds: int):
+    """Bound cloud-only prerequisite calls that may block inside vendor sockets."""
+    try:
+        import signal
+    except ImportError:
+        yield
+        return
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(signum: int, frame: object) -> None:
+        raise DailyPrerequisiteTimeout(
+            f"daily calendar prerequisites exceeded {seconds} seconds"
+        )
 
     signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -360,7 +392,19 @@ def run(
     if symbol_attempts < 1 or symbol_attempts > 3:
         raise ValueError("symbol attempts must be between 1 and 3")
     observed = observed_at.astimezone(SHANGHAI)
-    primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_prerequisites_started",
+        phase="calendars",
+        observed_date=observed.date().isoformat(),
+        deadline_seconds=CALENDAR_DEADLINE_SECONDS,
+    )
+    with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
+        primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_calendars_loaded",
+        primary_sessions=len(primary_calendar.open_dates),
+        secondary_sessions=len(secondary_calendar.open_dates),
+    )
     if not accepted(calendar_gates):
         raise RuntimeError("daily primary and secondary calendars are not aligned")
 
@@ -385,10 +429,17 @@ def run(
         _progress(**result)
         return result
 
+    _progress("daily_prerequisites_started", phase="point_in_time_universe")
     csi = CsiIndexSource()
     current = csi.fetch_current()
     events, discovered, _event_source = csi.fetch_indexed_events(current.as_of_date)
     snapshots = reconstruct(current, events)
+    _progress(
+        "daily_universe_loaded",
+        current_as_of_date=current.as_of_date.isoformat(),
+        event_count=len(events),
+        discovered_notice_count=len(discovered),
+    )
     base_plan = build_incremental_plan(
         observed_at=observed, primary_calendar=primary_calendar,
         secondary_calendar=secondary_calendar, snapshots=snapshots, target_session=target,
