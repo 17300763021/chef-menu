@@ -298,8 +298,9 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 if "FROM m2_daily_tradeability_facts" in sql:
                     return [(
                         fact["symbol"], TARGET, fact["index_code"], 1, 1, 0, 0,
-                        fact["listing_age_sessions"], Decimal(fact["limit_rate"]),
-                        Decimal(fact["limit_up"]), Decimal(fact["limit_down"]),
+                        fact["listing_age_sessions"], Decimal(fact["limit_rate"]).quantize(Decimal("0.000001")),
+                        Decimal(fact["limit_up"]).quantize(Decimal("0.0001")),
+                        Decimal(fact["limit_down"]).quantize(Decimal("0.0001")),
                         0, 0, 0, 0, 1, 1, "[]", fact["schema_version"], sha256(fact),
                     )]
                 if "FROM m2_daily_verification_bars" in sql:
@@ -326,6 +327,23 @@ class TiDBDailyStoreTests(unittest.TestCase):
             load_daily_checkpoint_evidence(
                 FakeConnection(router_with_primary_hash("0" * 64)), "daily-scope",
             )
+
+    def test_tradeability_precision_loss_is_rejected_before_publication(self) -> None:
+        evidence = complete_evidence()
+        invalid_fact = {**evidence.tradeability[0], "limit_rate": "0.100001"}
+        invalid = DailyEvidence(
+            manifest=evidence.manifest, primary_bars=evidence.primary_bars,
+            tradeability=[invalid_fact], verification_bars=evidence.verification_bars,
+            adjusted_bars=evidence.adjusted_bars, adjustments=evidence.adjustments,
+        )
+        connection = FakeConnection()
+        with self.assertRaisesRegex(ValueError, "two-decimal tradeability contract"):
+            publish_daily_symbol_checkpoint(
+                connection, invalid, dataset_id="daily-scope", symbol="000001",
+                target_session=TARGET, verification_required=True,
+                reported_previous_close=Decimal("10"), status="succeeded",
+            )
+        self.assertEqual(connection.executed, [])
 
     def test_latest_lineage_falls_back_to_accepted_research_history(self) -> None:
         def router(sql: str, params: Any):

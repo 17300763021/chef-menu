@@ -11,7 +11,7 @@ import gzip
 import json
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -21,6 +21,7 @@ from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
 DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v1"
+TRADEABILITY_QUANTUM = Decimal("0.01")
 
 
 def _compact(value: Any) -> str:
@@ -37,6 +38,47 @@ def _bool(value: Any) -> int | None:
 
 def _date_text(value: Any) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _tradeability_decimal(value: Any, field: str) -> str | None:
+    """Return the point-in-time price-limit contract's stable two-decimal form."""
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+        normalized = parsed.quantize(TRADEABILITY_QUANTUM)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"invalid {field}: {value!r}") from error
+    if not parsed.is_finite() or parsed != normalized:
+        raise ValueError(f"{field} exceeds the two-decimal tradeability contract: {value!r}")
+    return format(normalized, "f")
+
+
+def _canonical_tradeability_fact(row: Mapping[str, Any]) -> dict[str, Any]:
+    reasons = row["block_reasons"]
+    if not isinstance(reasons, (list, tuple)) or not all(isinstance(reason, str) for reason in reasons):
+        raise ValueError("tradeability block_reasons must be a list or tuple of strings")
+    return {
+        "symbol": str(row["symbol"]),
+        "business_date": _date_text(row["business_date"]),
+        "index_code": str(row["index_code"]),
+        "has_primary_bar": bool(row["has_primary_bar"]),
+        "has_secondary_status": bool(row["has_secondary_status"]),
+        "is_suspended": bool(row["is_suspended"]),
+        "is_st": None if row.get("is_st") is None else bool(row["is_st"]),
+        "listing_age_sessions": int(row["listing_age_sessions"]),
+        "limit_rate": _tradeability_decimal(row.get("limit_rate"), "limit_rate"),
+        "limit_up": _tradeability_decimal(row.get("limit_up"), "limit_up"),
+        "limit_down": _tradeability_decimal(row.get("limit_down"), "limit_down"),
+        "at_limit_up": bool(row["at_limit_up"]),
+        "at_limit_down": bool(row["at_limit_down"]),
+        "one_price_limit_up": bool(row["one_price_limit_up"]),
+        "one_price_limit_down": bool(row["one_price_limit_down"]),
+        "can_buy": bool(row["can_buy"]),
+        "can_sell": bool(row["can_sell"]),
+        "block_reasons": list(reasons),
+        "schema_version": str(row["schema_version"]),
+    }
 
 
 def _read_gzip_json(path: Path) -> list[dict[str, Any]]:
@@ -402,6 +444,7 @@ def _adjusted_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[t
 
 
 def _fact_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    canonical_rows = [_canonical_tradeability_fact(row) for row in rows]
     return [(
         dataset_id, row["symbol"], row["business_date"], row["index_code"],
         _bool(row["has_primary_bar"]), _bool(row["has_secondary_status"]),
@@ -411,7 +454,7 @@ def _fact_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple
         _bool(row["one_price_limit_up"]), _bool(row["one_price_limit_down"]),
         _bool(row["can_buy"]), _bool(row["can_sell"]), _compact(row["block_reasons"]),
         row["schema_version"], sha256(row),
-    ) for row in rows]
+    ) for row in canonical_rows]
 
 
 def _event_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
@@ -454,7 +497,10 @@ def publish_daily_symbol_checkpoint(
         raise ValueError(f"daily symbol checkpoint contains other symbols: {sorted(observed_symbols)}")
     primary_rows = [row for row in evidence.primary_bars if row.get("symbol") == symbol]
     adjusted_rows = [row for row in evidence.adjusted_bars if row.get("symbol") == symbol]
-    fact_rows = [row for row in evidence.tradeability if row.get("symbol") == symbol]
+    fact_rows = [
+        _canonical_tradeability_fact(row)
+        for row in evidence.tradeability if row.get("symbol") == symbol
+    ]
     verification_rows = [row for row in evidence.verification_bars if row.get("symbol") == symbol]
     event_rows = [row for row in evidence.adjustments if row.get("symbol") == symbol]
     if len(primary_rows) > 1 or len(adjusted_rows) > 1 or len(fact_rows) > 1 or len(verification_rows) > 1:
@@ -596,17 +642,17 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "hfq_close": _decimal(row[21]), "primary_source": row[22],
         "factor_source": row[23], "schema_version": row[24],
     } for row in adjusted]
-    canonical_facts = [{
+    canonical_facts = [_canonical_tradeability_fact({
         "symbol": str(row[0]), "business_date": _date_text(row[1]), "index_code": row[2],
         "has_primary_bar": bool(row[3]), "has_secondary_status": bool(row[4]),
         "is_suspended": bool(row[5]), "is_st": None if row[6] is None else bool(row[6]),
-        "listing_age_sessions": int(row[7]), "limit_rate": _decimal(row[8]),
-        "limit_up": _decimal(row[9]), "limit_down": _decimal(row[10]),
+        "listing_age_sessions": int(row[7]), "limit_rate": row[8],
+        "limit_up": row[9], "limit_down": row[10],
         "at_limit_up": bool(row[11]), "at_limit_down": bool(row[12]),
         "one_price_limit_up": bool(row[13]), "one_price_limit_down": bool(row[14]),
         "can_buy": bool(row[15]), "can_sell": bool(row[16]),
         "block_reasons": json.loads(row[17]), "schema_version": row[18],
-    } for row in facts]
+    }) for row in facts]
     canonical_verification = [daily_bar(row) for row in verification]
     canonical_events = [{
         "symbol": str(row[0]), "effective_date": _date_text(row[1]),
