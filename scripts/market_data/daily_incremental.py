@@ -27,8 +27,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v1"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v1"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v2"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v2"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
@@ -84,19 +84,21 @@ class DailyIncrementalPlan:
         return dict(self.expected_membership)
 
     def scope_canonical(self) -> dict[str, Any]:
+        """Return the stable business identity of one target-session capture.
+
+        Observation-time provenance remains in ``canonical`` and the manifest,
+        but it must not create a second checkpoint namespace when the target
+        session, predecessor, membership, and verification sample are unchanged.
+        """
         return {
             "schema_version": self.schema_version,
             "target_session": self.target_session.isoformat(),
             "previous_session": self.previous_session.isoformat(),
-            "snapshot_effective_session": self.snapshot_effective_session.isoformat(),
             "expected_membership": [
                 {"symbol": symbol, "index_code": index_code}
                 for symbol, index_code in self.expected_membership
             ],
             "verification_symbols": list(self.verification_symbols),
-            "primary_calendar_sha256": self.primary_calendar_sha256,
-            "secondary_calendar_sha256": self.secondary_calendar_sha256,
-            "universe_sha256": self.universe_sha256,
         }
 
     @property
@@ -107,6 +109,10 @@ class DailyIncrementalPlan:
         return {
             **self.scope_canonical(),
             "observed_at": self.observed_at.isoformat(),
+            "snapshot_effective_session": self.snapshot_effective_session.isoformat(),
+            "primary_calendar_sha256": self.primary_calendar_sha256,
+            "secondary_calendar_sha256": self.secondary_calendar_sha256,
+            "universe_sha256": self.universe_sha256,
             "accepted_existing_symbols": list(self.accepted_existing_symbols),
             "fetch_symbols": list(self.fetch_symbols),
             "scope_sha256": self.scope_sha256,

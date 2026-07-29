@@ -26,6 +26,43 @@ from scripts.market_data.contracts import (
     normalize_symbol,
     parse_date,
 )
+from scripts.market_data.calendar_contracts import TradingCalendar
+
+
+class TencentIndexCalendarSource:
+    """Independent SSE calendar derived from Tencent index archives."""
+
+    name = "tencent_sse_index_calendar"
+
+    def __init__(self, timeout_seconds: float = 20.0, attempts: int = 2) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.attempts = attempts
+
+    def fetch(self, start: date, end: date) -> TradingCalendar:
+        if start > end:
+            raise ValueError("calendar start_date is after end_date")
+        source = TencentHistorySource(
+            timeout_seconds=self.timeout_seconds,
+            attempts=self.attempts,
+        )
+        dates: set[date] = set()
+        for year in range(start.year, end.year + 1):
+            chunk_start = max(start, date(year, 1, 1))
+            chunk_end = min(end, date(year, 12, 31))
+            chunk_dates: set[date] = set()
+            for row in source._request_block("sh000001", chunk_start, chunk_end, ""):
+                if not isinstance(row, list) or not row:
+                    raise RuntimeError("Tencent SSE index calendar returned a malformed row")
+                business_date = parse_date(row[0])
+                if chunk_start <= business_date <= chunk_end:
+                    chunk_dates.add(business_date)
+            if not chunk_dates:
+                raise RuntimeError(
+                    "Tencent SSE index calendar returned no dated rows for "
+                    f"{chunk_start.isoformat()}..{chunk_end.isoformat()}"
+                )
+            dates.update(chunk_dates)
+        return TradingCalendar.build(self.name, start, end, dates)
 
 
 class TencentHistorySource:

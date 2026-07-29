@@ -29,6 +29,7 @@ from scripts.market_data.tidb_daily_store import (
     load_previous_adjusted_states,
     publish_daily_run,
     publish_daily_symbol_checkpoint,
+    recover_compatible_daily_checkpoints,
 )
 from scripts.market_data.tradeability import derive_tradeability
 
@@ -218,7 +219,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         }
         manifest = {
             **evidence.manifest, **values,
-            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v1",
+            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v2",
             "target_session": TARGET.isoformat(), "previous_session": PREVIOUS.isoformat(),
             "snapshot_effective_session": PREVIOUS.isoformat(), "scope_sha256": scope_hash,
             "expected_symbol_count": 1, "quality_sha256": "e" * 64,
@@ -298,6 +299,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 if "FROM m2_daily_symbol_checkpoints" in sql:
                     return [(
                         "000001", "succeeded", 1, Decimal("10"), None, None,
+                        None, None, None,
                         sha256([primary]), sha256([adjusted]), sha256([fact]),
                         sha256([verification]), None,
                     )]
@@ -356,6 +358,105 @@ class TiDBDailyStoreTests(unittest.TestCase):
             load_daily_checkpoint_evidence(
                 FakeConnection(router_with_primary_hash("0" * 64)), "daily-scope",
             )
+
+    def test_recovery_prefers_valid_eastmoney_evidence_and_preserves_origin(self) -> None:
+        empty = DailyEvidence(
+            manifest={"authoritative": False, "simulation_orders_allowed": False},
+            primary_bars=[], tradeability=[], verification_bars=[],
+            adjusted_bars=[], adjustments=[],
+        )
+        empty_metadata = {
+            "succeeded_symbols": [], "blocked_symbols": [],
+            "verification_required_symbols": [], "reported_previous_closes": {},
+            "status_sources": {}, "reported_previous_close_sources": {},
+            "checkpoint_origin_dataset_ids": {}, "errors": {},
+        }
+        eastmoney = complete_evidence()
+        sina = complete_evidence()
+        sina.primary_bars[0]["source"] = "akshare_sina"
+        sina.adjusted_bars[0]["primary_source"] = "akshare_sina"
+
+        def metadata(source: str) -> dict[str, Any]:
+            return {
+                **empty_metadata,
+                "succeeded_symbols": ["000001"],
+                "verification_required_symbols": ["000001"],
+                "reported_previous_closes": {"000001": Decimal("10")},
+                "status_sources": {"000001": "baostock_daily_status"},
+                "reported_previous_close_sources": {
+                    "000001": "baostock_reported_preclose",
+                },
+            }
+
+        def load(_connection: Any, dataset_id: str):
+            if dataset_id == "stable":
+                return empty, empty_metadata
+            if dataset_id == "corrupt":
+                raise RuntimeError("fixture hash mismatch")
+            if dataset_id == "old-sina":
+                return sina, metadata("akshare_sina")
+            if dataset_id == "new-eastmoney":
+                return eastmoney, metadata("akshare_eastmoney")
+            raise AssertionError(dataset_id)
+
+        connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                side_effect=load,
+            ),
+            patch(
+                "scripts.market_data.tidb_daily_store._query_all",
+                return_value=[("corrupt",), ("new-eastmoney",), ("old-sina",)],
+            ),
+        ):
+            result = recover_compatible_daily_checkpoints(
+                connection, dataset_id="stable", target_session=TARGET,
+                expected_membership={"000001": "000300"},
+                verification_symbols=("000001",),
+                previous_states={"000001": previous_state()},
+            )
+
+        self.assertEqual(result["recovered"], 1)
+        self.assertEqual(result["recovered_by_source_dataset"], {"new-eastmoney": 1})
+        self.assertIn("fixture hash mismatch", result["rejected_datasets"]["corrupt"])
+        checkpoint_batches = [
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_symbol_checkpoints" in sql
+        ]
+        self.assertEqual(len(checkpoint_batches), 1)
+        self.assertEqual(checkpoint_batches[0][0][12], "new-eastmoney")
+        primary_batches = [
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_primary_bars" in sql
+        ]
+        self.assertEqual(primary_batches[0][0][3], "akshare_eastmoney")
+        self.assertEqual(connection.commits, 1)
+
+        incompatible = PreviousAdjustedState(
+            symbol="000001", business_date=PREVIOUS, raw_close=Decimal("9"),
+            qfq_factor=Decimal("1"), hfq_factor=Decimal("1"),
+            source_dataset_id="different-lineage",
+        )
+        rejected_connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                side_effect=load,
+            ),
+            patch(
+                "scripts.market_data.tidb_daily_store._query_all",
+                return_value=[("new-eastmoney",)],
+            ),
+        ):
+            rejected = recover_compatible_daily_checkpoints(
+                rejected_connection, dataset_id="stable", target_session=TARGET,
+                expected_membership={"000001": "000300"},
+                verification_symbols=("000001",),
+                previous_states={"000001": incompatible},
+            )
+        self.assertEqual(rejected["recovered"], 0)
+        self.assertEqual(rejected_connection.commits, 0)
 
     def test_tradeability_precision_loss_is_rejected_before_publication(self) -> None:
         evidence = complete_evidence()
@@ -429,6 +530,14 @@ class FakePrimary:
     def fetch_raw_with_fallback(self, symbol: str, start: date, end: date):
         return {TARGET: raw_bar(symbol)}, "akshare_eastmoney"
 
+    def fetch_daily_raw_with_reference(self, symbol: str, previous: date, target: date):
+        return (
+            {TARGET: raw_bar(symbol)},
+            "akshare_eastmoney",
+            Decimal("10"),
+            "akshare_eastmoney_change_amount",
+        )
+
     def fetch_sina_adjustments(self, symbol: str, end: date):
         return [] if self.event is None else [self.event]
 
@@ -453,6 +562,37 @@ class FakeSecondary:
 
 
 class DailyCaptureTests(unittest.TestCase):
+    def test_baostock_blacklist_falls_back_without_opening_tradeability(self) -> None:
+        evidence, reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeVerification(), secondary_source=None,
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual((reported, status, error), (Decimal("10"), "succeeded", None))
+        self.assertEqual(evidence.manifest["status_source"], "akshare_eastmoney_dated_suspension")
+        self.assertEqual(evidence.manifest["previous_close_source"], "akshare_eastmoney_change_amount")
+        self.assertIsNone(evidence.tradeability[0]["is_st"])
+        self.assertFalse(evidence.tradeability[0]["can_buy"])
+        self.assertFalse(evidence.tradeability[0]["can_sell"])
+        self.assertIn("unknown_st_status", evidence.tradeability[0]["block_reasons"])
+
+    def test_eastmoney_confirmed_suspension_never_fabricates_a_bar(self) -> None:
+        evidence, reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeVerification(), secondary_source=None,
+            fallback_suspended_symbols=frozenset({"000001"}), fallback_status_available=True,
+            previous_states={}, ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual((reported, status, error), (None, "succeeded", None))
+        self.assertEqual(evidence.primary_bars, [])
+        self.assertTrue(evidence.tradeability[0]["is_suspended"])
+        self.assertFalse(evidence.tradeability[0]["can_buy"])
+        self.assertFalse(evidence.tradeability[0]["can_sell"])
+
     def test_capture_accepts_normal_and_verified_corporate_action_sessions(self) -> None:
         kwargs = {
             "plan": plan(), "symbol": "000001", "verification_source": FakeVerification(),

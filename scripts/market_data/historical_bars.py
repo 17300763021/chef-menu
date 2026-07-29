@@ -31,7 +31,7 @@ from scripts.market_data.quality_gates import GateResult, accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.akshare_calendar_source import AkshareCalendarSource
 from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
-from scripts.market_data.sources.baostock_calendar_source import BaostockCalendarSource
+from scripts.market_data.sources.tencent_history_source import TencentIndexCalendarSource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -255,7 +255,7 @@ def load_calendars(
     secondary_calendar: TradingCalendar | None = None,
 ) -> tuple[TradingCalendar, TradingCalendar, list[GateResult], dict[str, str]]:
     primary = primary_calendar or AkshareCalendarSource().fetch(HISTORY_START, end)
-    secondary = secondary_calendar or BaostockCalendarSource().fetch(HISTORY_START, end)
+    secondary = secondary_calendar or TencentIndexCalendarSource().fetch(HISTORY_START, end)
     calendar_gates = evaluate_calendars(primary, secondary)
     calendar_source = {
         "primary_calendar_sha256": sha256(primary.canonical()),

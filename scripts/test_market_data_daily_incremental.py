@@ -219,6 +219,24 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertEqual(friday.target_session, weekend.target_session)
         self.assertEqual(friday.scope_sha256, weekend.scope_sha256)
 
+    def test_scope_identity_ignores_provenance_but_not_membership(self) -> None:
+        baseline = small_plan()
+        changed_provenance = replace(
+            baseline,
+            observed_at=datetime(2026, 7, 29, 17, 0, tzinfo=SHANGHAI),
+            snapshot_effective_session=TARGET,
+            primary_calendar_sha256="d" * 64,
+            secondary_calendar_sha256="e" * 64,
+            universe_sha256="f" * 64,
+        )
+        self.assertEqual(baseline.scope_sha256, changed_provenance.scope_sha256)
+        self.assertNotEqual(baseline.canonical(), changed_provenance.canonical())
+        changed_membership = replace(
+            baseline,
+            expected_membership=(("000001", "000300"), ("600519", "000300")),
+        )
+        self.assertNotEqual(baseline.scope_sha256, changed_membership.scope_sha256)
+
     def test_invalid_universe_size_or_overlap_fails_closed(self) -> None:
         snapshots = self.full_snapshots()
         snapshots[PREVIOUS]["000905"] = snapshots[PREVIOUS]["000905"][:-1]

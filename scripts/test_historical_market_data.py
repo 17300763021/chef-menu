@@ -27,12 +27,69 @@ from scripts.market_data.sources.frozen_archive_history_source import (
     FrozenArchiveHistorySource,
     validate_archive_document,
 )
-from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource, TencentIndexCalendarSource
 from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
+    @staticmethod
+    def _daily_bar(business_date: date, close: str, source: str = "akshare_eastmoney") -> DailyBar:
+        return DailyBar(
+            source=source, symbol="000001", exchange="SZSE",
+            business_date=business_date, open=Decimal(close), high=Decimal(close),
+            low=Decimal(close), close=Decimal(close), previous_close=None,
+            volume_shares=100, amount_cny=Decimal("1000"),
+            turnover_percent=Decimal("0.1"), trade_status="trading", is_st=None,
+        )
+
+    def test_daily_eastmoney_reference_uses_reported_change_amount(self) -> None:
+        target = date(2026, 7, 27)
+        bar = self._daily_bar(target, "11.11")
+
+        class Frame:
+            columns = [f"column-{index}" for index in range(10)] + ["涨跌额"]
+
+            @staticmethod
+            def to_dict(*, orient: str):
+                self.assertEqual(orient, "records")
+                return [{"涨跌额": "0.01"}]
+
+        source = AkshareEastmoneyHistorySource(attempts=1)
+        with (
+            patch.object(source, "_frame", return_value=Frame()),
+            patch(
+                "scripts.market_data.sources.akshare_history_source.normalize_akshare_row",
+                return_value=bar,
+            ),
+        ):
+            rows, source_name, reported, reference_source = source.fetch_daily_raw_with_reference(
+                "000001", date(2026, 7, 24), target,
+            )
+        self.assertEqual(rows, {target: bar})
+        self.assertEqual(source_name, "akshare_eastmoney")
+        self.assertEqual(reported, Decimal("11.1000"))
+        self.assertEqual(reference_source, "akshare_eastmoney_change_amount")
+
+    def test_daily_reference_falls_back_to_exact_sina_predecessor(self) -> None:
+        previous = date(2026, 7, 24)
+        target = date(2026, 7, 27)
+        predecessor = self._daily_bar(previous, "10.00", "akshare_sina")
+        target_bar = self._daily_bar(target, "10.20", "akshare_sina")
+        source = AkshareEastmoneyHistorySource(attempts=1)
+        with (
+            patch.object(source, "_frame", side_effect=RuntimeError("Eastmoney offline")),
+            patch.object(source, "_sina_frame", return_value=object()),
+            patch.object(source, "_sina_raw_bars", return_value=[predecessor, target_bar]),
+        ):
+            rows, source_name, reported, reference_source = source.fetch_daily_raw_with_reference(
+                "000001", previous, target,
+            )
+        self.assertEqual(rows, {previous: predecessor, target: target_bar})
+        self.assertEqual(source_name, "akshare_sina")
+        self.assertEqual(reported, Decimal("10.00"))
+        self.assertEqual(reference_source, "akshare_sina_exact_predecessor_close")
+
     def test_frozen_archive_is_bounded_dual_source_and_hash_verified(self) -> None:
         source = FrozenArchiveHistorySource()
         self.assertEqual(source.document["schema_version"], ARCHIVE_SCHEMA_VERSION)
@@ -216,7 +273,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FailingCalendarSource),
-            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FailingCalendarSource),
+            patch("scripts.market_data.historical_bars.TencentIndexCalendarSource", FailingCalendarSource),
         ):
             primary, secondary, gates, _source = load_calendars(
                 date(2026, 7, 3),
@@ -237,9 +294,9 @@ class HistoricalMarketDataTests(unittest.TestCase):
             def fetch(self, start: date, end: date) -> TradingCalendar:
                 return FakeCalendar.build("akshare_calendar")
 
-        class FakeBaostockCalendarSource:
+        class FakeTencentCalendarSource:
             def fetch(self, start: date, end: date) -> TradingCalendar:
-                return FakeCalendar.build("baostock_calendar")
+                return FakeCalendar.build("tencent_sse_index_calendar")
 
         class FakeCsiSource:
             def fetch_current(self) -> CurrentUniverse:
@@ -261,7 +318,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FakeCalendarSource),
-            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FakeBaostockCalendarSource),
+            patch("scripts.market_data.historical_bars.TencentIndexCalendarSource", FakeTencentCalendarSource),
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
         ):
             plan = build_plan(date(2026, 7, 16), "preflight")
@@ -271,7 +328,10 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
         self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
         self.assertEqual(plan["primary_calendar"]["source"], "akshare_calendar")
-        self.assertEqual(plan["secondary_calendar"]["source"], "baostock_calendar")
+        self.assertEqual(
+            plan["secondary_calendar"]["source"],
+            "tencent_sse_index_calendar",
+        )
         self.assertNotEqual(plan["calendar_source"]["primary_calendar_sha256"], plan["calendar_source"]["secondary_calendar_sha256"])
         self.assertEqual(plan["csi_discovered_notice_ids"], [11518])
         self.assertEqual(plan["csi_event_index_source"]["accepted_manifest_event_sha256"], "fixture")
