@@ -74,6 +74,10 @@ SYMBOL_DEADLINE_SECONDS = 90
 CALENDAR_DEADLINE_SECONDS = 180
 
 
+def daily_membership_symbols(expected_membership: Iterable[tuple[str, str]]) -> tuple[str, ...]:
+    return tuple(sorted(symbol for symbol, _index_code in expected_membership))
+
+
 def select_daily_shard_symbols(
     scope_symbols: Iterable[str], pending_symbols: Iterable[str],
     shard_index: int, shard_count: int,
@@ -576,7 +580,7 @@ def run(
         recovery_rejected_datasets=recovery["rejected_datasets"],
     )
 
-    all_scope_symbols = sorted(plan.expected_membership)
+    all_scope_symbols = list(daily_membership_symbols(plan.expected_membership))
     assigned_symbols = set(all_scope_symbols[shard_index::shard_count])
     selected_fetch_symbols = list(select_daily_shard_symbols(
         all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
@@ -599,7 +603,7 @@ def run(
         secondary_source: BaostockHistorySource | None = None
         fallback_suspended_symbols: frozenset[str] = frozenset()
         fallback_status_available = False
-        if plan.fetch_symbols:
+        if selected_fetch_symbols:
             try:
                 fallback_suspended_symbols = EastmoneySuspensionSource(
                     attempts=3, timeout_seconds=25,

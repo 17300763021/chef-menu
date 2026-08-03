@@ -7,7 +7,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from scripts.market_data.daily_catchup_runner import catch_up
-from scripts.market_data.daily_incremental_runner import select_daily_shard_symbols
+from scripts.market_data.daily_incremental_runner import (
+    daily_membership_symbols,
+    select_daily_shard_symbols,
+)
 
 
 class DailyCatchupTests(unittest.TestCase):
@@ -27,7 +30,8 @@ class DailyCatchupTests(unittest.TestCase):
                     catch_up(max_sessions=2, base_history_dataset_id="base", output_dir=Path(tmp), symbol_attempts=2)
 
     def test_stable_shards_do_not_change_when_other_checkpoints_finish(self) -> None:
-        scope = [f"{value:06d}" for value in range(12)]
+        membership = [(f"{value:06d}", "000300" if value < 6 else "000905") for value in range(12)]
+        scope = list(daily_membership_symbols(membership))
         partitions = [set(select_daily_shard_symbols(scope, scope, index, 4)) for index in range(4)]
         self.assertEqual(set.union(*partitions), set(scope))
         self.assertEqual(sum(len(partition) for partition in partitions), len(scope))
