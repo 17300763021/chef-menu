@@ -59,7 +59,8 @@ def build_release(connection: Any, business_date: date) -> dict[str, Any]:
         daily = _one(cursor, """SELECT dataset_id,target_session,base_history_dataset_id,authoritative,simulation_orders_allowed,manifest_sha256
             FROM m2_daily_runs WHERE accepted=1 ORDER BY target_session DESC LIMIT 1""")
         flow = _one(cursor, """SELECT dataset_id,business_date,data_available,authoritative,simulation_orders_allowed,manifest_sha256
-            FROM m2_flow_runs WHERE boundary_accepted=1 ORDER BY business_date DESC, published_at DESC LIMIT 1""")
+            FROM m2_flow_runs WHERE boundary_accepted=1 AND business_date=%s
+            ORDER BY published_at DESC LIMIT 1""", (business_date,))
     component_rows = {
         "history": {"dataset_id": str(history[0]), "through": str(history[1]), "manifest_sha256": str(history[4])},
         "industry": {"dataset_id": str(industry[0]), "through": str(industry[1]), "manifest_sha256": str(industry[5])},

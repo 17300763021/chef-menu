@@ -12,6 +12,7 @@ class _Cursor:
     def __init__(self, rows):
         self.rows = rows
         self.current = []
+        self.calls = []
 
     def __enter__(self):
         return self
@@ -20,6 +21,7 @@ class _Cursor:
         return False
 
     def execute(self, query, _params=()):
+        self.calls.append((query, _params))
         if query.lstrip().startswith("CREATE TABLE"):
             self.current = []
             return
@@ -56,11 +58,14 @@ def _rows():
 
 class M2ReleaseGateTests(unittest.TestCase):
     def test_accepts_one_research_only_lineage(self):
-        manifest = build_release(_Connection(_rows()), date(2026, 8, 3))
+        connection = _Connection(_rows())
+        manifest = build_release(connection, date(2026, 8, 3))
         self.assertTrue(manifest["accepted"])
         self.assertFalse(manifest["authoritative"])
         self.assertFalse(manifest["simulation_orders_allowed"])
         self.assertFalse(manifest["components"]["flow"]["data_available"])
+        flow_call = next(call for call in connection.cursor_value.calls if "FROM m2_flow_runs" in call[0])
+        self.assertEqual(flow_call[1], (date(2026, 8, 3),))
 
     def test_rejects_mixed_history_lineage(self):
         rows = _rows()
