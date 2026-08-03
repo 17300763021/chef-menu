@@ -37,6 +37,12 @@ class M2WorkflowTests(unittest.TestCase):
         self.assertIn("--storage-percent", text)
         self.assertIn("max_sessions", text)
 
+    def test_full_fundamentals_use_short_resumable_shards_without_more_parallel_pressure(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "market-data-fundamental-acceptance.yml").read_text(encoding="utf-8")
+        self.assertIn('else 16', text)
+        self.assertIn("max-parallel: 4", text)
+        self.assertIn("timeout-minutes: 180", text)
+
 
 if __name__ == "__main__":
     unittest.main()
