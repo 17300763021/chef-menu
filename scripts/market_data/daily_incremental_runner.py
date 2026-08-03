@@ -74,6 +74,17 @@ SYMBOL_DEADLINE_SECONDS = 90
 CALENDAR_DEADLINE_SECONDS = 180
 
 
+def select_daily_shard_symbols(
+    scope_symbols: Iterable[str], pending_symbols: Iterable[str],
+    shard_index: int, shard_count: int,
+) -> tuple[str, ...]:
+    """Select a stable shard from the full scope, independent of checkpoint timing."""
+    if shard_count < 1 or shard_count > 4 or not 0 <= shard_index < shard_count:
+        raise ValueError("daily shard coordinates must use between 1 and 4 stable shards")
+    assigned = set(sorted(scope_symbols)[shard_index::shard_count])
+    return tuple(symbol for symbol in sorted(set(pending_symbols)) if symbol in assigned)
+
+
 class DailySymbolTimeout(BaseException):
     pass
 
@@ -447,11 +458,19 @@ def run(
     requested_target: date | None = None,
     initialize_schema: bool = False,
     symbol_attempts: int = 2,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    defer_finalize: bool = False,
+    finalize_only: bool = False,
 ) -> dict[str, Any]:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
     if symbol_attempts < 1 or symbol_attempts > 3:
         raise ValueError("symbol attempts must be between 1 and 3")
+    if shard_count < 1 or shard_count > 4 or not 0 <= shard_index < shard_count:
+        raise ValueError("daily shard coordinates must use between 1 and 4 stable shards")
+    if defer_finalize and finalize_only:
+        raise ValueError("daily capture cannot defer and finalize in the same invocation")
     observed = observed_at.astimezone(SHANGHAI)
     _progress(
         "daily_prerequisites_started",
@@ -557,6 +576,23 @@ def run(
         recovery_rejected_datasets=recovery["rejected_datasets"],
     )
 
+    all_scope_symbols = sorted(plan.expected_membership)
+    assigned_symbols = set(all_scope_symbols[shard_index::shard_count])
+    selected_fetch_symbols = list(select_daily_shard_symbols(
+        all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
+    ))
+    if finalize_only and plan.fetch_symbols:
+        raise RuntimeError(
+            f"daily capture is incomplete; remaining_symbols={len(plan.fetch_symbols)}"
+        )
+    if finalize_only:
+        selected_fetch_symbols = []
+    _progress(
+        "daily_shard_scope_ready", shard_index=shard_index, shard_count=shard_count,
+        assigned_symbols=len(assigned_symbols), pending_symbols=len(selected_fetch_symbols),
+        finalize_only=finalize_only,
+    )
+
     primary_source = AkshareEastmoneyHistorySource(timeout_seconds=25, attempts=2)
     verification_source = AkshareHistorySource(timeout_seconds=25, attempts=2)
     with ExitStack() as source_stack:
@@ -597,7 +633,7 @@ def run(
                         error=f"{type(fallback_error).__name__}: {fallback_error}",
                         trading_policy="missing_status_blocks_buy_and_sell",
                     )
-        for position, symbol in enumerate(plan.fetch_symbols, start=1):
+        for position, symbol in enumerate(selected_fetch_symbols, start=1):
             final_error: Exception | str | None = None
             for attempt in range(1, symbol_attempts + 1):
                 try:
@@ -660,8 +696,18 @@ def run(
                     failed_connection.close()
             _progress(
                 "daily_symbol_completed", symbol=symbol, completed=position,
-                total=len(plan.fetch_symbols),
+                total=len(selected_fetch_symbols), shard_index=shard_index,
             )
+
+    if defer_finalize:
+        result = {
+            "event": "daily_shard_capture_completed", "dataset_id": dataset_id,
+            "target_session": target.isoformat(), "shard_index": shard_index,
+            "shard_count": shard_count, "attempted_symbols": len(selected_fetch_symbols),
+            "simulation_orders_allowed": False,
+        }
+        _progress(**result)
+        return result
 
     connection = connect(config)
     try:
@@ -760,14 +806,22 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("daily-market-increment"))
     parser.add_argument("--init-schema", action="store_true")
     parser.add_argument("--symbol-attempts", type=int, default=2)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--defer-finalize", action="store_true")
+    parser.add_argument("--finalize-only", action="store_true")
     args = parser.parse_args()
     observed_at = args.observed_at or datetime.now(SHANGHAI)
     result = run(
         observed_at=observed_at, base_history_dataset_id=args.base_history_dataset_id,
         output_dir=args.output_dir, requested_target=args.target_session,
         initialize_schema=args.init_schema, symbol_attempts=args.symbol_attempts,
+        shard_index=args.shard_index, shard_count=args.shard_count,
+        defer_finalize=args.defer_finalize, finalize_only=args.finalize_only,
     )
-    return 0 if result.get("accepted", result.get("event") == "daily_noop") else 2
+    return 0 if result.get(
+        "accepted", result.get("event") in {"daily_noop", "daily_shard_capture_completed"}
+    ) else 2
 
 
 if __name__ == "__main__":

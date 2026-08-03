@@ -123,7 +123,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || vars.M2_DAILY_ENABLED == 'true'
     needs: [deterministic-tests, quota-gate]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -145,19 +145,16 @@ jobs:
           TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: |
+          args=(
+            --max-sessions "${INPUT_MAX_SESSIONS:-1}"
+            --parallel-shards 4
+            --output-dir daily-market-increment
+            --symbol-attempts 2
+          )
           if [[ -n "$INPUT_TARGET_SESSION" ]]; then
-            if [[ "${INPUT_MAX_SESSIONS:-1}" != "1" ]]; then
-              echo "target_session cannot be combined with max_sessions > 1"
-              exit 2
-            fi
-            python -u -m scripts.market_data.daily_incremental_runner \
-              --init-schema --output-dir daily-market-increment/session-1 \
-              --symbol-attempts 2 --target-session "$INPUT_TARGET_SESSION"
-          else
-            python -u -m scripts.market_data.daily_catchup_runner \
-              --max-sessions "${INPUT_MAX_SESSIONS:-1}" \
-              --output-dir daily-market-increment --symbol-attempts 2
+            args+=(--target-session "$INPUT_TARGET_SESSION")
           fi
+          python -u -m scripts.market_data.daily_catchup_runner "${args[@]}"
       - name: Upload compact non-authoritative daily manifest
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

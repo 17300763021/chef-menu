@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts.market_data.daily_catchup_runner import catch_up
+from scripts.market_data.daily_incremental_runner import select_daily_shard_symbols
 
 
 class DailyCatchupTests(unittest.TestCase):
@@ -23,6 +25,34 @@ class DailyCatchupTests(unittest.TestCase):
             with patch("scripts.market_data.daily_catchup_runner.run", return_value={"accepted": False, "dataset_id": "bad"}):
                 with self.assertRaisesRegex(RuntimeError, "stopped"):
                     catch_up(max_sessions=2, base_history_dataset_id="base", output_dir=Path(tmp), symbol_attempts=2)
+
+    def test_stable_shards_do_not_change_when_other_checkpoints_finish(self) -> None:
+        scope = [f"{value:06d}" for value in range(12)]
+        partitions = [set(select_daily_shard_symbols(scope, scope, index, 4)) for index in range(4)]
+        self.assertEqual(set.union(*partitions), set(scope))
+        self.assertEqual(sum(len(partition) for partition in partitions), len(scope))
+        remaining = scope[3:]
+        for index in range(4):
+            self.assertEqual(
+                set(select_daily_shard_symbols(scope, remaining, index, 4)),
+                partitions[index] & set(remaining),
+            )
+
+    def test_parallel_capture_precedes_one_global_finalize(self) -> None:
+        connection = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("scripts.market_data.daily_catchup_runner.connect", return_value=connection), \
+                patch("scripts.market_data.daily_catchup_runner.ensure_daily_schema"), \
+                patch("scripts.market_data.daily_catchup_runner._capture_parallel") as capture, \
+                patch("scripts.market_data.daily_catchup_runner.run", return_value={"accepted": True, "dataset_id": "d1"}) as finalize:
+            summary = catch_up(
+                max_sessions=1, base_history_dataset_id="base", output_dir=Path(tmp),
+                symbol_attempts=2, parallel_shards=4, requested_target=date(2026, 7, 28),
+            )
+        capture.assert_called_once()
+        self.assertTrue(finalize.call_args.kwargs["finalize_only"])
+        self.assertEqual(summary["results"][0]["dataset_id"], "d1")
+        connection.close.assert_called_once()
 
 
 if __name__ == "__main__":
