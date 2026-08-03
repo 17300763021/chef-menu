@@ -319,6 +319,33 @@ class IndustrySourceNormalizationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "conflicting industry rows"):
             normalize_cninfo_changes(pd.DataFrame([first, second]), "000001")
 
+    def test_same_code_from_current_and_legacy_standards_merges_without_fabricating_standard(self) -> None:
+        current = IndustryVerification(
+            "000002", date(1991, 1, 29), "430101", "房地产", "房地产开发", "住宅开发",
+            "申银万国行业分类标准", "008003",
+        )
+        legacy = replace(
+            current, level3_name="房地产开发", standard_name="申银万国行业分类标准(旧)",
+            standard_code="008018",
+        )
+
+        assignments = assignments_from_cninfo_changes([current, legacy])
+
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].industry_code, "430101")
+        self.assertIsNone(assignments[0].standard_name)
+        self.assertIsNone(assignments[0].standard_code)
+
+    def test_different_codes_on_same_cninfo_date_fail_closed(self) -> None:
+        first = IndustryVerification(
+            "000002", date(1991, 1, 29), "430101", "房地产", "房地产开发", "住宅开发",
+            "申银万国行业分类标准", "008003",
+        )
+        second = replace(first, industry_code="430201", standard_code="008018")
+
+        with self.assertRaisesRegex(RuntimeError, "conflicting primary assignment codes"):
+            assignments_from_cninfo_changes([first, second])
+
 
 if __name__ == "__main__":
     unittest.main()

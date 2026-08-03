@@ -30,6 +30,7 @@ from scripts.market_data.industry_contracts import (
     SwsAssignmentRecord,
 )
 from scripts.market_data.manifest import sha256
+from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.cninfo_industry_source import (
     CninfoIndustrySource,
     assignments_from_cninfo_changes,
@@ -142,7 +143,14 @@ def build_plan(
         connection.close()
     if len(full_scope) != MODE_COUNTS["full"]:
         raise RuntimeError(f"accepted M2.3 base scope changed: expected 1403, got {len(full_scope)}")
-    scope = full_scope if mode == "full" else full_scope[:MODE_COUNTS[mode]]
+    if mode == "full":
+        scope = full_scope
+    else:
+        full_by_symbol = {item.symbol: item for item in full_scope}
+        missing_sample = [symbol for symbol in SAMPLE_SYMBOLS if symbol not in full_by_symbol]
+        if missing_sample:
+            raise RuntimeError(f"accepted M2.3 base scope is missing fixed sample symbols: {missing_sample}")
+        scope = [full_by_symbol[symbol] for symbol in SAMPLE_SYMBOLS]
     nodes = list(CninfoIndustrySource(attempts=3).fetch_catalog())
     scope_hash = sha256(canonical_scope(scope))
     nodes_hash = sha256([row.canonical() for row in nodes])

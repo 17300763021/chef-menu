@@ -22,23 +22,27 @@ def assignments_from_cninfo_changes(
     rows: tuple[IndustryVerification, ...] | list[IndustryVerification],
 ) -> tuple[SwsAssignmentRecord, ...]:
     """Convert first-party CNINFO Shenwan change events into primary assignments."""
-    assignments: dict[tuple[str, date], SwsAssignmentRecord] = {}
+    grouped: dict[tuple[str, date], list[IndustryVerification]] = {}
     for row in rows:
+        grouped.setdefault((row.symbol, row.change_date), []).append(row)
+    assignments: list[SwsAssignmentRecord] = []
+    for key, candidates in sorted(grouped.items()):
+        codes = {row.industry_code for row in candidates}
+        if len(codes) != 1:
+            raise RuntimeError(f"CNINFO returned conflicting primary assignment codes for {key}: {sorted(codes)}")
+        standard_names = {row.standard_name for row in candidates if row.standard_name}
+        standard_codes = {row.standard_code for row in candidates if row.standard_code}
         assignment = SwsAssignmentRecord.build(
-            symbol=row.symbol,
-            source_effective_from=row.change_date,
-            industry_code=row.industry_code,
+            symbol=key[0],
+            source_effective_from=key[1],
+            industry_code=next(iter(codes)),
             source_updated_at=None,
             source="cninfo_official_api",
-            standard_name=row.standard_name,
-            standard_code=row.standard_code,
+            standard_name=next(iter(standard_names)) if len(standard_names) == 1 else None,
+            standard_code=next(iter(standard_codes)) if len(standard_codes) == 1 else None,
         )
-        key = (assignment.symbol, assignment.source_effective_from)
-        existing = assignments.get(key)
-        if existing is not None and existing.canonical() != assignment.canonical():
-            raise RuntimeError(f"CNINFO returned conflicting primary assignments for {key}")
-        assignments[key] = assignment
-    return tuple(sorted(assignments.values(), key=lambda value: (value.symbol, value.source_effective_from)))
+        assignments.append(assignment)
+    return tuple(assignments)
 
 
 def _text(value: object) -> str | None:
