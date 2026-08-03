@@ -329,9 +329,9 @@ def build_incremental_evidence(
     list[HistoricalBar], list[AdjustmentEvent],
 ]:
     """Build deterministic non-authoritative evidence for one completed daily scope."""
-    primary_rows = sorted(primary_bars, key=lambda row: (row.symbol, row.business_date, row.source))
+    primary_rows = sorted(primary_bars, key=lambda row: (row.source, row.symbol, row.business_date))
     fact_rows = sorted(tradeability_facts, key=lambda row: (row.symbol, row.business_date))
-    verification_rows = sorted(verification_bars, key=lambda row: (row.symbol, row.business_date, row.source))
+    verification_rows = sorted(verification_bars, key=lambda row: (row.source, row.symbol, row.business_date))
     adjusted_rows = sorted(adjusted_bars, key=lambda row: (row.symbol, row.business_date))
     event_rows = sorted(adjustment_events, key=lambda row: (row.symbol, row.effective_date, row.source))
     gates = [*evaluate_daily_incremental(
