@@ -360,6 +360,7 @@ class IndustryContractTest(unittest.TestCase):
             write_gzip_rows(root / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
             write_gzip_rows(root / "exchange-delistings.json.gz", [row.canonical() for row in delistings])
             with (
+                patch("scripts.market_data.industry_runner.TiDBConfig.from_env", return_value=MagicMock()),
                 patch("scripts.market_data.industry_runner.connect", return_value=connection),
                 patch("scripts.market_data.industry_runner.ensure_industry_schema"),
                 patch("scripts.market_data.industry_runner.completed_symbols", return_value=set()),
