@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -38,6 +39,7 @@ from scripts.market_data.industry_runner import (
 )
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.cninfo_industry_source import (
+    CninfoIndustrySource,
     assignments_from_cninfo_changes,
     normalize_cninfo_catalog,
     normalize_cninfo_changes,
@@ -412,6 +414,51 @@ class IndustryContractTest(unittest.TestCase):
 
 
 class IndustrySourceNormalizationTest(unittest.TestCase):
+    def test_cninfo_raw_empty_records_become_empty_history_without_hiding_schema_errors(self) -> None:
+        class Response:
+            def __init__(self, records):
+                self.records = records
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"records": self.records}
+
+        class Requests:
+            def __init__(self, records):
+                self.records = records
+
+            def get(self, *_args, **_kwargs):
+                return Response(self.records)
+
+            def post(self, *_args, **_kwargs):
+                return Response(self.records)
+
+        def source_for(records):
+            requests = Requests(records)
+
+            def loader(_symbol, _start, _end):
+                frame = pd.DataFrame(requests.post().json()["records"])
+                frame["变更日期"] = pd.to_datetime(frame["变更日期"], errors="coerce").dt.date
+                return frame
+
+            source = CninfoIndustrySource(
+                catalog_loader=lambda: pd.DataFrame(), changes_loader=loader,
+            )
+            source._uses_default_changes = True
+            source._akshare_module = SimpleNamespace(requests=requests)
+            return source
+
+        self.assertEqual(
+            source_for([]).fetch_changes("000046", date(1990, 1, 1), OBSERVED_ON),
+            (),
+        )
+        with self.assertRaisesRegex(RuntimeError, "CNINFO request failed"):
+            source_for([{"unexpected": "schema"}]).fetch_changes(
+                "000046", date(1990, 1, 1), OBSERVED_ON,
+            )
+
     def test_sws_frame_requires_exact_scope_and_preserves_dates(self) -> None:
         frame = pd.DataFrame([
             {"股票代码": "000001", "计入日期": "2014-02-21 00:00:00", "行业代码": "480101", "更新日期": "2024-09-27 09:08:00"},

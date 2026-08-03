@@ -163,6 +163,7 @@ class CninfoIndustrySource:
     def _call(self, loader: Callable[..., pd.DataFrame], *args: str, bounded: bool) -> pd.DataFrame:
         last_error: Exception | None = None
         for attempt in range(1, self.attempts + 1):
+            empty_records_response = False
             try:
                 if not bounded or self._akshare_module is None:
                     return loader(*args)
@@ -171,15 +172,27 @@ class CninfoIndustrySource:
                 original_post = requests_module.post
 
                 def bounded_get(*request_args, **request_kwargs):
+                    nonlocal empty_records_response
                     request_kwargs.setdefault("timeout", self.timeout_seconds)
                     response = original_get(*request_args, **request_kwargs)
                     response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = None
+                    empty_records_response = isinstance(payload, dict) and payload.get("records") == []
                     return response
 
                 def bounded_post(*request_args, **request_kwargs):
+                    nonlocal empty_records_response
                     request_kwargs.setdefault("timeout", self.timeout_seconds)
                     response = original_post(*request_args, **request_kwargs)
                     response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = None
+                    empty_records_response = isinstance(payload, dict) and payload.get("records") == []
                     return response
 
                 requests_module.get = bounded_get
@@ -190,6 +203,8 @@ class CninfoIndustrySource:
                     requests_module.get = original_get
                     requests_module.post = original_post
             except Exception as error:
+                if empty_records_response:
+                    return pd.DataFrame()
                 last_error = error
                 if attempt < self.attempts:
                     time.sleep(min(2 ** (attempt - 1), 2))
