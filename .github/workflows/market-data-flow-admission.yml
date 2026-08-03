@@ -27,6 +27,8 @@ on:
       - scripts/market_data/flow_runner.py
       - scripts/market_data/tidb_flow_store.py
       - scripts/test_market_data_verified_flow.py
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
