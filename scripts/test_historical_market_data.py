@@ -442,6 +442,36 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(bars[0].amount_cny, Decimal("3558300.00"))
         self.assertEqual(bars[0].turnover_percent, Decimal("1.250000"))
 
+        star_row = [
+            "2026-07-27", "33.58", "34.02", "34.60", "33.18", "5913104.00",
+            {}, "2.04", "201185.97", "0.00", "0.00",
+        ]
+        with patch.object(TencentHistorySource, "_rows", return_value=[star_row]):
+            star_bars = source.fetch_raw("688037", date(2026, 7, 27), date(2026, 7, 27))
+        self.assertEqual(star_bars[0].volume_shares, 5_913_104)
+        self.assertEqual(star_bars[0].amount_cny, Decimal("2011859700.00"))
+
+    def test_tencent_hfq_continuity_requires_exact_consistent_pair(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        previous = date(2026, 7, 24)
+        target = date(2026, 7, 27)
+        raw = [
+            ["2026-07-24", "38.00", "38.18", "38.50", "37.80", "1"],
+            ["2026-07-27", "39.00", "39.41", "39.80", "38.80", "1"],
+        ]
+        hfq = [
+            ["2026-07-24", "39.80", "39.99", "40.32", "39.59", "1"],
+            ["2026-07-27", "40.80", "41.22", "41.63", "40.59", "1"],
+        ]
+        with patch.object(source, "_rows", side_effect=[raw, hfq]):
+            result = source.verify_no_adjustment_continuity("689009", previous, target)
+        self.assertEqual(result, "tencent_hfq_no_adjustment_continuity")
+
+        changed_hfq = [hfq[0], ["2026-07-27", "44.80", "45.22", "45.63", "44.59", "1"]]
+        with patch.object(source, "_rows", side_effect=[raw, changed_hfq]):
+            with self.assertRaisesRegex(RuntimeError, "HFQ factor changed"):
+                source.verify_no_adjustment_continuity("689009", previous, target)
+
     def test_primary_history_run_does_not_require_baostock_history_login(self) -> None:
         calendar = TradingCalendar.build(
             "akshare_calendar", date(2026, 7, 20), date(2026, 7, 22),

@@ -27,6 +27,24 @@ def _valid_positive_price(value: Decimal | None) -> bool:
     return isinstance(value, Decimal) and value.is_finite() and value > 0
 
 
+def cross_source_consistency_errors(primary: DailyBar, verification: DailyBar) -> tuple[str, ...]:
+    """Return exact per-symbol reasons that make a verification pair unsafe to reuse."""
+    errors: list[str] = []
+    if primary.key != verification.key:
+        errors.append("key")
+    if primary.source == verification.source:
+        errors.append("source_independence")
+    if abs(primary.close - verification.close) > _price_tolerance(primary.close):
+        errors.append("close")
+    volume_tolerance = max(100, int(verification.volume_shares * 0.001))
+    if abs(primary.volume_shares - verification.volume_shares) > volume_tolerance:
+        errors.append("volume")
+    amount_tolerance = max(Decimal("1.00"), abs(verification.amount_cny) * Decimal("0.0001"))
+    if abs(primary.amount_cny - verification.amount_cny) > amount_tolerance:
+        errors.append("amount")
+    return tuple(errors)
+
+
 def evaluate_daily_incremental(
     *,
     target_session: date,
@@ -327,19 +345,18 @@ def evaluate_daily_incremental(
     volume_mismatches = []
     amount_mismatches = []
     for symbol in sorted(verified):
+        pair_errors = cross_source_consistency_errors(primary_map[symbol], verification_map[symbol])
         first = primary_map[symbol].close
         second = verification_map[symbol].close
-        if abs(first - second) > _price_tolerance(first):
+        if "close" in pair_errors:
             close_mismatches.append(f"{symbol}:{first}:{second}")
         first_volume = primary_map[symbol].volume_shares
         second_volume = verification_map[symbol].volume_shares
-        volume_tolerance = max(100, int(second_volume * 0.001))
-        if abs(first_volume - second_volume) > volume_tolerance:
+        if "volume" in pair_errors:
             volume_mismatches.append(f"{symbol}:{first_volume}:{second_volume}")
         first_amount = primary_map[symbol].amount_cny
         second_amount = verification_map[symbol].amount_cny
-        amount_tolerance = max(Decimal("1.00"), abs(second_amount) * Decimal("0.0001"))
-        if abs(first_amount - second_amount) > amount_tolerance:
+        if "amount" in pair_errors:
             amount_mismatches.append(f"{symbol}:{first_amount}:{second_amount}")
     consistency = (len(verified) - len(close_mismatches)) * 10000 // max(1, len(verified))
     volume_consistency = (len(verified) - len(volume_mismatches)) * 10000 // max(1, len(verified))

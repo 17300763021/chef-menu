@@ -17,12 +17,13 @@ from typing import Any, Iterable, Mapping
 
 from scripts.market_data.contracts import DailyBar, parse_date
 from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
+from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v2"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v3"
 TRADEABILITY_QUANTUM = Decimal("0.01")
 
 
@@ -625,7 +626,8 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         SELECT symbol, business_date, source, exchange, open_price, high, low, close_price,
                previous_close, volume_shares, amount_cny, turnover_percent, trade_status,
                is_st, adjustment, source_schema_version, row_sha256
-        FROM m2_daily_primary_bars WHERE dataset_id=%s ORDER BY symbol, business_date
+        FROM m2_daily_primary_bars
+        WHERE dataset_id=%s ORDER BY source, symbol, business_date
     """, (dataset_id,)))
     adjusted = keep(_query_all(connection, """
         SELECT symbol, business_date, exchange, index_code, open_price, high, low, close_price,
@@ -646,7 +648,8 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         SELECT symbol, business_date, source, exchange, open_price, high, low, close_price,
                previous_close, volume_shares, amount_cny, turnover_percent, trade_status,
                is_st, adjustment, source_schema_version, row_sha256
-        FROM m2_daily_verification_bars WHERE dataset_id=%s ORDER BY symbol, business_date
+        FROM m2_daily_verification_bars
+        WHERE dataset_id=%s ORDER BY source, symbol, business_date
     """, (dataset_id,)))
     events = keep(_query_all(connection, """
         SELECT symbol, effective_date, qfq_factor, hfq_factor, source, row_sha256
@@ -865,6 +868,36 @@ def _recovered_lineage_matches(
     return len(rebuilt) == 1 and rebuilt[0].canonical() == evidence.adjusted_bars[0]
 
 
+def _daily_bar_from_canonical(row: Mapping[str, Any]) -> DailyBar:
+    return DailyBar(
+        source=str(row["source"]), symbol=str(row["symbol"]), exchange=str(row["exchange"]),
+        business_date=parse_date(row["business_date"]), open=Decimal(str(row["open"])),
+        high=Decimal(str(row["high"])), low=Decimal(str(row["low"])),
+        close=Decimal(str(row["close"])),
+        previous_close=None if row.get("previous_close") is None else Decimal(str(row["previous_close"])),
+        volume_shares=int(row["volume_shares"]), amount_cny=Decimal(str(row["amount_cny"])),
+        turnover_percent=(
+            None if row.get("turnover_percent") is None else Decimal(str(row["turnover_percent"]))
+        ),
+        trade_status=str(row["trade_status"]), is_st=row.get("is_st"),
+        adjustment=str(row.get("adjustment", "none")), schema_version=str(row["schema_version"]),
+    )
+
+
+def _recovered_verification_matches(
+    primary: list[dict[str, Any]],
+    verification: list[dict[str, Any]],
+) -> bool:
+    if not primary:
+        return not verification
+    if len(primary) != 1 or len(verification) != 1:
+        return False
+    return not cross_source_consistency_errors(
+        _daily_bar_from_canonical(primary[0]),
+        _daily_bar_from_canonical(verification[0]),
+    )
+
+
 def recover_compatible_daily_checkpoints(
     connection: Any,
     *,
@@ -939,6 +972,8 @@ def recover_compatible_daily_checkpoints(
             if bool(primary) != bool(adjusted):
                 continue
             if symbol in required_verification and primary and len(verification) != 1:
+                continue
+            if symbol in required_verification and not _recovered_verification_matches(primary, verification):
                 continue
             if not primary and not (facts[0]["has_secondary_status"] and facts[0]["is_suspended"]):
                 continue

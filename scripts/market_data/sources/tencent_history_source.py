@@ -1,10 +1,12 @@
 """Tencent archive fallback for point-in-time A-share daily history.
 
-The public Tencent response includes raw OHLC, volume in lots, turnover, and
-amount in ten-thousand CNY.  AKShare's convenience frame intentionally exposes
-only the first six fields, so this adapter parses the public response directly
-to preserve units and audit provenance.  It is a bounded fallback only; it does
-not replace the admitted Eastmoney/Sina primary path.
+The public Tencent response includes raw OHLC, turnover, amount in ten-thousand
+CNY, and a market-segment-dependent volume field: ordinary A-share rows use
+lots while 688/689 STAR rows use shares.  AKShare's convenience frame
+intentionally exposes only the first six fields, so this adapter parses the
+public response directly to preserve units and audit provenance.  It is a
+bounded fallback only; it does not replace the admitted Eastmoney/Sina primary
+path.
 """
 
 from __future__ import annotations
@@ -27,6 +29,10 @@ from scripts.market_data.contracts import (
     parse_date,
 )
 from scripts.market_data.calendar_contracts import TradingCalendar
+
+
+HFQ_CONTINUITY_TOLERANCE = Decimal("0.002")
+HFQ_WITHIN_ROW_TOLERANCE = Decimal("0.003")
 
 
 class TencentIndexCalendarSource:
@@ -77,6 +83,27 @@ class TencentHistorySource:
     def _vendor_symbol(symbol: str) -> str:
         code = normalize_symbol(symbol)
         return ("sh" if exchange_for_symbol(code) == "SSE" else "sz") + code
+
+    @staticmethod
+    def _volume_multiplier(symbol: str) -> Decimal:
+        """Normalize Tencent's segment-specific volume field to shares."""
+        code = normalize_symbol(symbol)
+        return Decimal("1") if code.startswith(("688", "689")) else Decimal("100")
+
+    @staticmethod
+    def _implied_hfq_factor(raw_row: list[Any], hfq_row: list[Any], symbol: str) -> Decimal:
+        ratios: list[Decimal] = []
+        for index, field in ((1, "open"), (2, "close"), (3, "high"), (4, "low")):
+            raw_price = decimal_value(raw_row[index], f"Tencent raw {field}", PRICE_QUANTUM)
+            hfq_price = decimal_value(hfq_row[index], f"Tencent hfq {field}", PRICE_QUANTUM)
+            assert raw_price is not None and hfq_price is not None
+            if raw_price <= 0 or hfq_price <= 0:
+                raise RuntimeError(f"Tencent returned nonpositive {field} for {symbol}:{raw_row[0]}")
+            ratios.append(hfq_price / raw_price)
+        center = sum(ratios, Decimal("0")) / Decimal(len(ratios))
+        if any(abs(value - center) / center > HFQ_WITHIN_ROW_TOLERANCE for value in ratios):
+            raise RuntimeError(f"Tencent raw/HFQ ratios are internally inconsistent for {symbol}:{raw_row[0]}")
+        return center
 
     def _request_block(self, vendor_symbol: str, start: date, end: date, adjust: str) -> list[list[Any]]:
         try:
@@ -135,14 +162,15 @@ class TencentHistorySource:
 
     def fetch_raw(self, symbol: str, start: date, end: date) -> list[DailyBar]:
         code = normalize_symbol(symbol)
+        volume_multiplier = self._volume_multiplier(code)
         result: list[DailyBar] = []
         for row in self._rows(code, start, end, ""):
             if len(row) < 9:
                 raise RuntimeError(f"Tencent raw row lacks amount/turnover fields for {code}:{row[0]}")
-            volume_lots = decimal_value(row[5], "Tencent volume(lots)", Decimal("0.01"))
+            volume_vendor_units = decimal_value(row[5], "Tencent volume(vendor units)", Decimal("0.01"))
             amount_ten_thousand = decimal_value(row[8], "Tencent amount(10k CNY)", Decimal("0.0001"))
             turnover = decimal_value(row[7], "Tencent turnover(%)", TURNOVER_QUANTUM, allow_blank=True)
-            assert volume_lots is not None and amount_ten_thousand is not None
+            assert volume_vendor_units is not None and amount_ten_thousand is not None
             result.append(DailyBar(
                 source=self.name,
                 symbol=code,
@@ -153,10 +181,39 @@ class TencentHistorySource:
                 high=decimal_value(row[3], "Tencent high", PRICE_QUANTUM),  # type: ignore[arg-type]
                 low=decimal_value(row[4], "Tencent low", PRICE_QUANTUM),  # type: ignore[arg-type]
                 previous_close=None,
-                volume_shares=int_value(volume_lots * Decimal("100"), "Tencent volume(shares)"),
+                volume_shares=int_value(volume_vendor_units * volume_multiplier, "Tencent volume(shares)"),
                 amount_cny=(amount_ten_thousand * Decimal("10000")).quantize(AMOUNT_QUANTUM),
                 turnover_percent=turnover,
-                trade_status="trading" if volume_lots > 0 else "unknown_zero_volume",
+                trade_status="trading" if volume_vendor_units > 0 else "unknown_zero_volume",
                 is_st=None,
             ))
         return result
+
+    def verify_no_adjustment_continuity(
+        self,
+        symbol: str,
+        previous_session: date,
+        target_session: date,
+    ) -> str:
+        """Independently prove that Tencent's implied HFQ factor did not change.
+
+        This is intentionally a narrow fallback for a Sina raw primary when
+        Sina's factor endpoint has no rows.  It never manufactures a factor or
+        accepts a discontinuity: missing dates, inconsistent OHLC ratios, or a
+        factor change all fail closed.
+        """
+        if previous_session >= target_session:
+            raise ValueError("Tencent continuity requires an earlier predecessor session")
+        code = normalize_symbol(symbol)
+        raw = {parse_date(row[0]): row for row in self._rows(code, previous_session, target_session, "")}
+        hfq = {parse_date(row[0]): row for row in self._rows(code, previous_session, target_session, "hfq")}
+        required = {previous_session, target_session}
+        if not required <= set(raw) or not required <= set(hfq):
+            raise RuntimeError(f"Tencent raw/HFQ continuity lacks the exact session pair for {code}")
+        previous_factor = self._implied_hfq_factor(raw[previous_session], hfq[previous_session], code)
+        target_factor = self._implied_hfq_factor(raw[target_session], hfq[target_session], code)
+        if abs(previous_factor - target_factor) / previous_factor > HFQ_CONTINUITY_TOLERANCE:
+            raise RuntimeError(
+                f"Tencent HFQ factor changed for {code}: {previous_factor} -> {target_factor}"
+            )
+        return "tencent_hfq_no_adjustment_continuity"

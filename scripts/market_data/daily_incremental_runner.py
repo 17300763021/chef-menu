@@ -46,6 +46,7 @@ from scripts.market_data.sources.akshare_history_source import (
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.sources.eastmoney_market_state_source import EastmoneySuspensionSource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     TiDBConfig,
@@ -368,7 +369,19 @@ def capture_symbol(
             "akshare_sina_exact_predecessor_close",
             "tencent_exact_predecessor_close",
         }:
-            events = _target_events(primary_source, symbol, target)
+            try:
+                events = _target_events(primary_source, symbol, target)
+            except RuntimeError as factor_error:
+                if (
+                    primary_source_name != "akshare_sina"
+                    or not str(factor_error).startswith("AKShare Sina returned no ")
+                ):
+                    raise
+                continuity_source = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
+                previous_close_source = f"{previous_close_source}+{continuity_source}"
         adjusted_rows = build_daily_adjusted_bars(
             target_session=target, previous_session=plan.previous_session,
             membership=plan.membership, primary_bars=[primary], previous_states={symbol: state},

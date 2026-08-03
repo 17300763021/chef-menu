@@ -20,6 +20,7 @@ from scripts.market_data.daily_incremental_runner import (
 )
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     default_daily_dataset_id,
@@ -219,7 +220,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         }
         manifest = {
             **evidence.manifest, **values,
-            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v2",
+            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v3",
             "target_session": TARGET.isoformat(), "previous_session": PREVIOUS.isoformat(),
             "snapshot_effective_session": PREVIOUS.isoformat(), "scope_sha256": scope_hash,
             "expected_symbol_count": 1, "quality_sha256": "e" * 64,
@@ -354,6 +355,18 @@ class TiDBDailyStoreTests(unittest.TestCase):
         )
         self.assertEqual(loaded.primary_bars, [primary])
         self.assertEqual(metadata["succeeded_symbols"], ["000001"])
+        ordered_connection = FakeConnection(router_with_primary_hash(sha256(primary)))
+        load_daily_checkpoint_evidence(ordered_connection, "daily-scope")
+        market_row_queries = [
+            sql for sql, _params in ordered_connection.executed
+            if "FROM m2_daily_primary_bars" in sql
+            or "FROM m2_daily_verification_bars" in sql
+        ]
+        self.assertEqual(len(market_row_queries), 2)
+        self.assertTrue(all(
+            "ORDER BY source, symbol, business_date" in sql
+            for sql in market_row_queries
+        ))
         with self.assertRaisesRegex(RuntimeError, "primary row hash mismatch"):
             load_daily_checkpoint_evidence(
                 FakeConnection(router_with_primary_hash("0" * 64)), "daily-scope",
@@ -458,6 +471,36 @@ class TiDBDailyStoreTests(unittest.TestCase):
         self.assertEqual(rejected["recovered"], 0)
         self.assertEqual(rejected_connection.commits, 0)
 
+        bad_verification = complete_evidence()
+        bad_verification.verification_bars[0]["volume_shares"] = 1_000_000
+
+        def load_bad_verification(_connection: Any, dataset_id: str):
+            if dataset_id == "stable":
+                return empty, empty_metadata
+            if dataset_id == "bad-verification":
+                return bad_verification, metadata("akshare_eastmoney")
+            raise AssertionError(dataset_id)
+
+        rejected_verification_connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                side_effect=load_bad_verification,
+            ),
+            patch(
+                "scripts.market_data.tidb_daily_store._query_all",
+                return_value=[("bad-verification",)],
+            ),
+        ):
+            rejected_verification = recover_compatible_daily_checkpoints(
+                rejected_verification_connection, dataset_id="stable", target_session=TARGET,
+                expected_membership={"000001": "000300"},
+                verification_symbols=("000001",),
+                previous_states={"000001": previous_state()},
+            )
+        self.assertEqual(rejected_verification["recovered"], 0)
+        self.assertEqual(rejected_verification_connection.commits, 0)
+
     def test_tradeability_precision_loss_is_rejected_before_publication(self) -> None:
         evidence = complete_evidence()
         invalid_fact = {**evidence.tradeability[0], "limit_rate": "0.100001"}
@@ -542,6 +585,22 @@ class FakePrimary:
         return [] if self.event is None else [self.event]
 
 
+class FakeSinaPrimary(FakePrimary):
+    timeout_seconds = 1
+    attempts = 1
+
+    def fetch_daily_raw_with_reference(self, symbol: str, previous: date, target: date):
+        return (
+            {TARGET: raw_bar(symbol, source="akshare_sina")},
+            "akshare_sina",
+            Decimal("10"),
+            "akshare_sina_exact_predecessor_close",
+        )
+
+    def fetch_sina_adjustments(self, symbol: str, end: date):
+        raise RuntimeError(f"AKShare Sina returned no qfq-factor rows for {symbol}")
+
+
 class FakeVerification:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
@@ -617,6 +676,42 @@ class DailyCaptureTests(unittest.TestCase):
         self.assertEqual((status, error), ("succeeded", None))
         self.assertEqual(corporate.adjustments[0]["effective_date"], TARGET.isoformat())
         self.assertEqual(corporate.adjusted_bars[0]["hfq_factor"], "1.052632")
+
+    def test_sina_factor_gap_uses_independent_tencent_continuity_only(self) -> None:
+        with patch.object(
+            TencentHistorySource,
+            "verify_no_adjustment_continuity",
+            return_value="tencent_hfq_no_adjustment_continuity",
+        ):
+            evidence, reported, status, error = capture_symbol(
+                plan=plan(), symbol="000001", primary_source=FakeSinaPrimary(),
+                verification_source=FakeVerification(), secondary_source=None,
+                fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+                previous_states={"000001": previous_state()},
+                ipo_dates={"000001": date(1991, 4, 3)},
+                calendar_dates=(PREVIOUS, TARGET),
+            )
+        self.assertEqual((reported, status, error), (Decimal("10"), "succeeded", None))
+        self.assertIn(
+            "tencent_hfq_no_adjustment_continuity",
+            evidence.manifest["previous_close_source"],
+        )
+
+        class MalformedFactorPrimary(FakeSinaPrimary):
+            def fetch_sina_adjustments(self, symbol: str, end: date):
+                raise ValueError("malformed factor payload")
+
+        malformed, _reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=MalformedFactorPrimary(),
+            verification_source=FakeVerification(), secondary_source=None,
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("malformed factor payload", str(error))
+        self.assertEqual(malformed.adjusted_bars, [])
 
     def test_capture_blocks_missing_predecessor_or_verification_without_guessing(self) -> None:
         common = {
