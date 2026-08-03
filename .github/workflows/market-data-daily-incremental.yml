@@ -17,6 +17,16 @@ on:
         description: "Date the TiDB percentage was checked (YYYY-MM-DD, no older than 7 days)"
         required: true
         type: string
+      tidb_storage_percent:
+        description: "Current TiDB row-storage percentage from Usage this month"
+        required: true
+        type: string
+      max_sessions:
+        description: "Sequential missing sessions to publish atomically (1-5)"
+        required: true
+        default: "1"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
   push:
     branches: [main]
     paths:
@@ -44,6 +54,16 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  disabled-schedule-status:
+    if: github.event_name == 'schedule' && vars.M2_DAILY_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Expose disabled ingestion instead of a misleading green data run
+        run: |
+          echo "Scheduled M2 ingestion is disabled: repository variable M2_DAILY_ENABLED is not true."
+          exit 1
+
   deterministic-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -89,11 +109,14 @@ jobs:
           MANUAL_CHECKED_AT: ${{ inputs.tidb_ru_checked_at }}
           SCHEDULED_RU_PERCENT: ${{ vars.TIDB_RU_PERCENT }}
           SCHEDULED_CHECKED_AT: ${{ vars.TIDB_RU_CHECKED_AT }}
+          MANUAL_STORAGE_PERCENT: ${{ inputs.tidb_storage_percent }}
+          SCHEDULED_STORAGE_PERCENT: ${{ vars.TIDB_STORAGE_PERCENT }}
         run: >-
           python -m scripts.market_data.daily_quota_guard
           --event-name "$EVENT_NAME"
           --schedule-enabled "${SCHEDULE_ENABLED:-false}"
           --reported-percent "${MANUAL_RU_PERCENT:-$SCHEDULED_RU_PERCENT}"
+          --storage-percent "${MANUAL_STORAGE_PERCENT:-$SCHEDULED_STORAGE_PERCENT}"
           --checked-at "${MANUAL_CHECKED_AT:-$SCHEDULED_CHECKED_AT}"
 
   ingest:
@@ -110,9 +133,10 @@ jobs:
           cache-dependency-path: scripts/market_data/requirements.lock.txt
       - name: Install pinned M2 dependencies
         run: python -m pip install -r scripts/market_data/requirements.lock.txt
-      - name: Capture and atomically publish exactly one missing daily session
+      - name: Capture and atomically publish bounded sequential missing sessions
         env:
           INPUT_TARGET_SESSION: ${{ inputs.target_session }}
+          INPUT_MAX_SESSIONS: ${{ inputs.max_sessions }}
           M2_BASE_HISTORY_DATASET_ID: ${{ vars.M2_BASE_HISTORY_DATASET_ID }}
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
@@ -121,16 +145,26 @@ jobs:
           TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: |
-          args=(--init-schema --output-dir daily-market-increment --symbol-attempts 2)
           if [[ -n "$INPUT_TARGET_SESSION" ]]; then
-            args+=(--target-session "$INPUT_TARGET_SESSION")
+            if [[ "${INPUT_MAX_SESSIONS:-1}" != "1" ]]; then
+              echo "target_session cannot be combined with max_sessions > 1"
+              exit 2
+            fi
+            python -u -m scripts.market_data.daily_incremental_runner \
+              --init-schema --output-dir daily-market-increment/session-1 \
+              --symbol-attempts 2 --target-session "$INPUT_TARGET_SESSION"
+          else
+            python -u -m scripts.market_data.daily_catchup_runner \
+              --max-sessions "${INPUT_MAX_SESSIONS:-1}" \
+              --output-dir daily-market-increment --symbol-attempts 2
           fi
-          python -u -m scripts.market_data.daily_incremental_runner "${args[@]}"
       - name: Upload compact non-authoritative daily manifest
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: m2-daily-manifest-${{ github.run_id }}
-          path: daily-market-increment/manifest.json
+          path: |
+            daily-market-increment/session-*/manifest.json
+            daily-market-increment/catchup-summary.json
           if-no-files-found: ignore
           retention-days: 7

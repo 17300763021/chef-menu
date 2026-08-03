@@ -1,0 +1,44 @@
+name: M2 Data Release Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      business_date:
+        description: "Business date all required M2 components must cover"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: m2-data-release
+  cancel-in-progress: false
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - name: Bind independently accepted components into one research-only release
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: python -u -m scripts.market_data.m2_release_gate --business-date "${{ inputs.business_date }}" --output-dir m2-release
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m2-data-release-${{ github.run_id }}
+          path: m2-release/manifest.json
+          retention-days: 30
