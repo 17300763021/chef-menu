@@ -70,6 +70,23 @@ class FundamentalStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "immutable"):
             publish_symbol_checkpoint(changed, dataset_id="d", symbol="000001", status="succeeded", reports=[report], facts=[fact])
 
+    def test_confirmed_exclusion_persists_auditable_reason(self) -> None:
+        connection = Connection()
+        reason = RuntimeError(
+            "confirmed_delisted_source_empty_after_two_responses;out_date=2020-01-01"
+        )
+        publish_symbol_checkpoint(
+            connection, dataset_id="d", symbol="000046", status="excluded", error=reason,
+        )
+        checkpoint = next(
+            params for query, params in connection.queries
+            if "INSERT INTO m2_fundamental_symbol_checkpoints" in query
+        )
+        self.assertEqual(checkpoint[2], "excluded")
+        self.assertEqual(checkpoint[8], "RuntimeError")
+        self.assertIn("two_responses", checkpoint[9])
+        self.assertEqual(connection.commits, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

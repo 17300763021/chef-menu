@@ -41,6 +41,14 @@ HISTORY_START = date(2017, 1, 1)
 MODE_COUNTS = {"sample": 20, "full": 1403}
 
 
+def reusable_checkpoint(status: object, error_message: object) -> bool:
+    value = str(status)
+    return value == "succeeded" or (
+        value == "excluded"
+        and str(error_message or "").startswith("confirmed_delisted_source_empty_after_two_responses")
+    )
+
+
 def _progress(event: str, **fields: Any) -> None:
     print(json.dumps({"event": event, **fields}, ensure_ascii=False, sort_keys=True), flush=True)
 
@@ -87,8 +95,14 @@ def capture(
         symbols = [row.symbol for row in scope]
         run_id = dataset_id(base_id=base_id, mode=mode, as_of_date=as_of_date, symbols=symbols)
         with connection.cursor() as cursor:
-            cursor.execute("SELECT symbol,status FROM m2_fundamental_symbol_checkpoints WHERE dataset_id=%s", (run_id,))
-            completed = {str(symbol) for symbol, status in cursor.fetchall() if str(status) in {"succeeded", "excluded"}}
+            cursor.execute(
+                "SELECT symbol,status,error_message FROM m2_fundamental_symbol_checkpoints WHERE dataset_id=%s",
+                (run_id,),
+            )
+            completed = {
+                str(symbol) for symbol, status, error_message in cursor.fetchall()
+                if reusable_checkpoint(status, error_message)
+            }
     finally:
         connection.close()
     selected = [row for position, row in enumerate(scope) if position % shard_count == shard_index]
@@ -109,15 +123,35 @@ def capture(
             )
             if not reports or not facts:
                 if security.out_date is not None and security.out_date <= as_of_date:
+                    confirmation_source = EastmoneyFundamentalSource(attempts=attempts)
+                    reports, facts = confirmation_source.fetch(
+                        security.symbol,
+                        history_start=HISTORY_START,
+                        as_of_date=as_of_date,
+                        delisted=True,
+                    )
+                if not reports or not facts:
+                    if security.out_date is None or security.out_date > as_of_date:
+                        raise RuntimeError("no eligible financial reports or facts")
+                    exclusion = RuntimeError(
+                        "confirmed_delisted_source_empty_after_two_responses;"
+                        f"out_date={security.out_date.isoformat()}"
+                    )
                     checkpoint_connection = connect(config)
                     try:
-                        publish_symbol_checkpoint(checkpoint_connection, dataset_id=run_id, symbol=security.symbol, status="excluded")
+                        publish_symbol_checkpoint(
+                            checkpoint_connection, dataset_id=run_id, symbol=security.symbol,
+                            status="excluded", error=exclusion,
+                        )
                     finally:
                         checkpoint_connection.close()
                     excluded += 1
-                    _progress("fundamental_symbol_excluded", symbol=security.symbol, reason="delisted_source_empty")
+                    _progress(
+                        "fundamental_symbol_excluded", symbol=security.symbol,
+                        reason="confirmed_delisted_source_empty_after_two_responses",
+                        out_date=security.out_date.isoformat(),
+                    )
                     continue
-                raise RuntimeError("no eligible financial reports or facts")
             latest_notice = max(row.notice_date for row in reports)
             try:
                 verifications = verifier.fetch_near(security.symbol, latest_notice)
@@ -191,14 +225,31 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
         facts = [_fact_from_db(row) for row in fact_dicts]
         succeeded = {symbol for symbol, value in status.items() if value == "succeeded"}
         excluded = {symbol for symbol, value in status.items() if value == "excluded"}
+        allowed_excluded = {
+            row.symbol for row in scope
+            if row.out_date is not None and row.out_date <= as_of_date
+        }
         gates = evaluate_fundamentals(
             expected_symbols=symbols, reports=reports, facts=facts,
             successful_symbols=succeeded, excluded_symbols=excluded,
+            allowed_excluded_symbols=allowed_excluded,
         )
         report_rows = [row.canonical() for row in sorted(reports, key=lambda value: value.key)]
         fact_rows = [row.canonical() for row in sorted(facts, key=lambda value: value.key)]
         quality_rows = [row.canonical() for row in gates]
         verification_count = sum(int(row["verification_count"]) for row in checkpoints)
+        scope_by_symbol = {row.symbol: row for row in scope}
+        exclusion_evidence = [
+            {
+                "symbol": str(row["symbol"]),
+                "out_date": (
+                    None if scope_by_symbol[str(row["symbol"])].out_date is None
+                    else scope_by_symbol[str(row["symbol"])].out_date.isoformat()
+                ),
+                "reason": str(row["error_message"]),
+            }
+            for row in checkpoints if str(row["status"]) == "excluded"
+        ]
         manifest = {
             "manifest_version": "m2-fundamental-manifest-v1",
             "schema_version": FUNDAMENTAL_SCHEMA_VERSION,
@@ -214,6 +265,7 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
             "expected_symbol_count": len(symbols),
             "successful_symbol_count": len(succeeded),
             "excluded_symbol_count": len(excluded),
+            "excluded_symbols": exclusion_evidence,
             "failed_symbol_count": len(failed),
             "failed_symbols": failed,
             "report_count": len(reports),

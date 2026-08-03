@@ -21,13 +21,22 @@ def evaluate_fundamentals(
     facts: Iterable[FundamentalFact],
     successful_symbols: set[str],
     excluded_symbols: set[str] | None = None,
+    allowed_excluded_symbols: set[str] | None = None,
 ) -> list[GateResult]:
     report_rows = list(reports)
     fact_rows = list(facts)
     expected = set(expected_symbols)
     excluded = excluded_symbols or set()
+    allowed_excluded = allowed_excluded_symbols or set()
     eligible = expected - excluded
     results: list[GateResult] = []
+
+    invalid_exclusions = sorted(excluded - allowed_excluded)
+    results.append(GateResult(
+        "fundamental_exclusion_eligibility", not invalid_exclusions, len(invalid_exclusions),
+        "= 0 excluded symbols outside the confirmed delisted scope",
+        details=tuple(invalid_exclusions[:50]),
+    ))
 
     unexpected = sorted(({row.symbol for row in report_rows} | {row.symbol for row in fact_rows}) - expected)
     results.append(GateResult(

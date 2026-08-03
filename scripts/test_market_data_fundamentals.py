@@ -8,6 +8,7 @@ import pandas as pd
 
 from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport
 from scripts.market_data.fundamental_quality_gates import evaluate_fundamentals
+from scripts.market_data.fundamental_runner import reusable_checkpoint
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.eastmoney_fundamental_source import EastmoneyFundamentalSource
 
@@ -102,6 +103,21 @@ class FundamentalTests(unittest.TestCase):
             currency="人民币", organization_type="bank", source="fixture", source_row={},
         )
         self.assertEqual(report.currency, "CNY")
+
+    def test_only_confirmed_delisted_exclusion_is_resumable(self) -> None:
+        self.assertTrue(reusable_checkpoint("succeeded", None))
+        self.assertFalse(reusable_checkpoint("excluded", None))
+        self.assertFalse(reusable_checkpoint("excluded", "delisted_source_empty"))
+        self.assertTrue(reusable_checkpoint(
+            "excluded", "confirmed_delisted_source_empty_after_two_responses;out_date=2020-01-01",
+        ))
+
+    def test_active_symbol_cannot_be_excluded_from_coverage(self) -> None:
+        gates = evaluate_fundamentals(
+            expected_symbols=["000001"], reports=[], facts=[], successful_symbols=set(),
+            excluded_symbols={"000001"}, allowed_excluded_symbols=set(),
+        )
+        self.assertFalse(next(g for g in gates if g.name == "fundamental_exclusion_eligibility").passed)
 
 
 if __name__ == "__main__":
