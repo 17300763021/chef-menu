@@ -140,7 +140,7 @@ jobs:
           path: industry-plan
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
-      - name: Freeze official sources and deterministic scope
+      - name: Freeze CNINFO taxonomy and deterministic scope
         if: inputs.resume_run_id == ''
         env:
           INPUT_OBSERVED_ON: ${{ inputs.observed_on }}
@@ -208,7 +208,7 @@ jobs:
         with:
           name: m2-industry-plan-${{ github.run_id }}
           path: industry-plan
-      - name: Capture or resume only missing CNINFO symbol verification
+      - name: Capture or resume missing CNINFO primary industry histories
         env:
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
@@ -239,7 +239,7 @@ jobs:
         with:
           name: m2-industry-plan-${{ github.run_id }}
           path: industry-plan
-      - name: Reconcile physical rows and atomically publish one accepted manifest
+      - name: Reconcile per-symbol hashes and atomically publish one accepted manifest
         env:
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}

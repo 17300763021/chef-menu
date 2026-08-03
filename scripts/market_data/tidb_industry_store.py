@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections import defaultdict
 from datetime import date, datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from scripts.market_data.industry_classification import canonical_scope
 from scripts.market_data.industry_contracts import (
@@ -20,7 +20,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-INDUSTRY_STORE_SCHEMA_VERSION = "m2-tidb-industry-checkpoint-v2"
+INDUSTRY_STORE_SCHEMA_VERSION = "m2-tidb-industry-checkpoint-v3"
 
 
 def _compact(value: Any) -> str:
@@ -76,6 +76,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       industry_code CHAR(6) NOT NULL,
       source_updated_at DATETIME(6) NULL,
       source VARCHAR(64) NOT NULL,
+      standard_name VARCHAR(255) NULL,
+      standard_code VARCHAR(32) NULL,
       source_schema_version VARCHAR(64) NOT NULL,
       row_sha256 CHAR(64) NOT NULL,
       published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -89,8 +91,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       symbol CHAR(6) NOT NULL,
       shard_index INT NOT NULL,
       status VARCHAR(32) NOT NULL,
+      source_assignment_count INT NOT NULL DEFAULT 0,
       interval_count INT NOT NULL,
       verification_count INT NOT NULL,
+      source_assignments_sha256 CHAR(64) NULL,
       intervals_sha256 CHAR(64) NULL,
       verifications_sha256 CHAR(64) NULL,
       error_class VARCHAR(128) NULL,
@@ -164,9 +168,19 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+SCHEMA_UPGRADE_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE m2_industry_source_assignments ADD COLUMN IF NOT EXISTS standard_name VARCHAR(255) NULL AFTER source",
+    "ALTER TABLE m2_industry_source_assignments ADD COLUMN IF NOT EXISTS standard_code VARCHAR(32) NULL AFTER standard_name",
+    "ALTER TABLE m2_industry_symbol_checkpoints ADD COLUMN IF NOT EXISTS source_assignment_count INT NOT NULL DEFAULT 0 AFTER status",
+    "ALTER TABLE m2_industry_symbol_checkpoints ADD COLUMN IF NOT EXISTS source_assignments_sha256 CHAR(64) NULL AFTER verification_count",
+)
+
+
 def ensure_industry_schema(connection: Any) -> None:
     with connection.cursor() as cursor:
         for statement in SCHEMA_STATEMENTS:
+            cursor.execute(statement)
+        for statement in SCHEMA_UPGRADE_STATEMENTS:
             cursor.execute(statement)
     connection.commit()
 
@@ -207,7 +221,9 @@ def completed_symbols(connection: Any, dataset_id: str) -> set[str]:
     return {
         str(row[0]) for row in _query_all(connection, """
             SELECT symbol FROM m2_industry_symbol_checkpoints
-            WHERE dataset_id=%s AND status='succeeded' ORDER BY symbol
+            WHERE dataset_id=%s AND status='succeeded'
+              AND source_assignment_count > 0 AND interval_count > 0 AND verification_count > 0
+            ORDER BY symbol
         """, (dataset_id,))
     }
 
@@ -221,12 +237,15 @@ def _accepted_manifest_hash(connection: Any, dataset_id: str) -> str | None:
 
 CHECKPOINT_UPSERT = """
 INSERT INTO m2_industry_symbol_checkpoints (
-  dataset_id, symbol, shard_index, status, interval_count, verification_count,
+  dataset_id, symbol, shard_index, status, source_assignment_count,
+  interval_count, verification_count, source_assignments_sha256,
   intervals_sha256, verifications_sha256, error_class, error_message
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
 ON DUPLICATE KEY UPDATE
   shard_index=VALUES(shard_index), status=VALUES(status),
+  source_assignment_count=VALUES(source_assignment_count),
   interval_count=VALUES(interval_count), verification_count=VALUES(verification_count),
+  source_assignments_sha256=VALUES(source_assignments_sha256),
   intervals_sha256=VALUES(intervals_sha256), verifications_sha256=VALUES(verifications_sha256),
   error_class=VALUES(error_class), error_message=VALUES(error_message)
 """
@@ -250,12 +269,21 @@ INSERT INTO m2_industry_verifications (
 """
 
 
+SOURCE_ASSIGNMENT_INSERT = """
+INSERT INTO m2_industry_source_assignments (
+  dataset_id, symbol, source_effective_from, industry_code, source_updated_at,
+  source, standard_name, standard_code, source_schema_version, row_sha256
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+"""
+
+
 def publish_symbol_checkpoint(
     connection: Any,
     *,
     dataset_id: str,
     symbol: str,
     shard_index: int,
+    source_rows: Sequence[SwsAssignmentRecord],
     intervals: Sequence[IndustryInterval],
     verifications: Sequence[IndustryVerification],
     status: str,
@@ -263,14 +291,18 @@ def publish_symbol_checkpoint(
 ) -> None:
     if status not in {"succeeded", "failed"}:
         raise ValueError("industry checkpoint status must be succeeded or failed")
+    if any(row.symbol != symbol for row in source_rows):
+        raise ValueError("industry source checkpoint contains a different symbol")
     if any(row.symbol != symbol for row in intervals):
         raise ValueError("industry interval checkpoint contains a different symbol")
     if any(row.symbol != symbol for row in verifications):
         raise ValueError("industry verification checkpoint contains a different symbol")
     if _accepted_manifest_hash(connection, dataset_id) is not None:
         raise RuntimeError("accepted industry evidence is immutable")
-    interval_rows = [row.canonical() for row in intervals]
-    verification_rows = [row.canonical() for row in verifications]
+    source_canonical = [row.canonical() for row in sorted(source_rows, key=lambda value: value.source_effective_from)]
+    interval_rows = [row.canonical() for row in sorted(intervals, key=lambda value: value.key)]
+    verification_rows = [row.canonical() for row in sorted(verifications, key=lambda value: value.key)]
+    source_hash = sha256(source_canonical) if source_canonical else None
     interval_hash = sha256(interval_rows) if interval_rows else None
     verification_hash = sha256(verification_rows) if verification_rows else None
     error_class = None
@@ -281,9 +313,19 @@ def publish_symbol_checkpoint(
     try:
         with connection.cursor() as cursor:
             cursor.execute(
+                "DELETE FROM m2_industry_source_assignments WHERE dataset_id=%s AND symbol=%s",
+                (dataset_id, symbol),
+            )
+            cursor.execute(
                 "DELETE FROM m2_industry_assignments WHERE dataset_id=%s AND symbol=%s",
                 (dataset_id, symbol),
             )
+            if source_rows:
+                cursor.executemany(SOURCE_ASSIGNMENT_INSERT, [(
+                    dataset_id, row.symbol, row.source_effective_from, row.industry_code,
+                    row.source_updated_at, row.source, row.standard_name, row.standard_code,
+                    INDUSTRY_SCHEMA_VERSION, sha256(row.canonical()),
+                ) for row in source_rows])
             cursor.execute(
                 "DELETE FROM m2_industry_verifications WHERE dataset_id=%s AND symbol=%s",
                 (dataset_id, symbol),
@@ -303,13 +345,27 @@ def publish_symbol_checkpoint(
                     row.standard_name, row.standard_code, row.source, sha256(row.canonical()),
                 ) for row in verifications])
             cursor.execute(CHECKPOINT_UPSERT, (
-                dataset_id, symbol, shard_index, status, len(intervals), len(verifications),
-                interval_hash, verification_hash, error_class, error_message,
+                dataset_id, symbol, shard_index, status, len(source_rows), len(intervals),
+                len(verifications), source_hash, interval_hash, verification_hash,
+                error_class, error_message,
             ))
         connection.commit()
     except Exception:
         connection.rollback()
         raise
+
+
+def load_industry_source_assignments(connection: Any, dataset_id: str) -> list[SwsAssignmentRecord]:
+    rows = _query_all(connection, """
+        SELECT symbol, source_effective_from, industry_code, source_updated_at,
+               source, standard_name, standard_code
+        FROM m2_industry_source_assignments
+        WHERE dataset_id=%s ORDER BY symbol, source_effective_from
+    """, (dataset_id,))
+    return [SwsAssignmentRecord.build(
+        symbol=row[0], source_effective_from=row[1], industry_code=row[2],
+        source_updated_at=row[3], source=str(row[4]), standard_name=row[5], standard_code=row[6],
+    ) for row in rows]
 
 
 def load_industry_intervals(connection: Any, dataset_id: str) -> list[IndustryInterval]:
@@ -352,14 +408,6 @@ INSERT INTO m2_industry_nodes (
   dataset_id, node_code, node_name, parent_code, node_level, standard_name,
   standard_code, termination_date, source, row_sha256
 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-"""
-
-
-SOURCE_ASSIGNMENT_INSERT = """
-INSERT INTO m2_industry_source_assignments (
-  dataset_id, symbol, source_effective_from, industry_code, source_updated_at,
-  source, source_schema_version, row_sha256
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
 """
 
 
@@ -445,20 +493,55 @@ def publish_industry_run(
     if other:
         raise RuntimeError("a different accepted industry observation already exists for this date")
     checkpoints = _query_all(connection, """
-        SELECT symbol, status FROM m2_industry_symbol_checkpoints
+        SELECT symbol, status, source_assignment_count, interval_count, verification_count,
+               source_assignments_sha256, intervals_sha256, verifications_sha256
+        FROM m2_industry_symbol_checkpoints
         WHERE dataset_id=%s ORDER BY symbol
     """, (dataset_id,))
     completed = {str(row[0]) for row in checkpoints if str(row[1]) == "succeeded"}
     expected_symbols = {item.symbol for item in scope}
     if completed != expected_symbols:
         raise RuntimeError("industry checkpoint inventory does not reconcile to the frozen scope")
+    sources_by_symbol: dict[str, list[SwsAssignmentRecord]] = defaultdict(list)
+    intervals_by_symbol: dict[str, list[IndustryInterval]] = defaultdict(list)
+    verifications_by_symbol: dict[str, list[IndustryVerification]] = defaultdict(list)
+    for row in source_rows:
+        sources_by_symbol[row.symbol].append(row)
+    for row in intervals:
+        intervals_by_symbol[row.symbol].append(row)
+    for row in verifications:
+        verifications_by_symbol[row.symbol].append(row)
+    checkpoint_by_symbol = {str(row[0]): row for row in checkpoints}
+    mismatched_checkpoints: list[str] = []
+    for symbol in sorted(expected_symbols):
+        row = checkpoint_by_symbol[symbol]
+        source_payload = [
+            item.canonical() for item in sorted(
+                sources_by_symbol[symbol], key=lambda value: value.source_effective_from
+            )
+        ]
+        interval_payload = [
+            item.canonical() for item in sorted(intervals_by_symbol[symbol], key=lambda value: value.key)
+        ]
+        verification_payload = [
+            item.canonical() for item in sorted(verifications_by_symbol[symbol], key=lambda value: value.key)
+        ]
+        expected_checkpoint = (
+            len(source_payload), len(interval_payload), len(verification_payload),
+            sha256(source_payload), sha256(interval_payload), sha256(verification_payload),
+        )
+        physical_checkpoint = (
+            int(row[2]), int(row[3]), int(row[4]), str(row[5]), str(row[6]), str(row[7]),
+        )
+        if physical_checkpoint != expected_checkpoint:
+            mismatched_checkpoints.append(symbol)
+    if mismatched_checkpoints:
+        raise RuntimeError(
+            "industry checkpoint hashes do not reconcile to physical rows: "
+            + ",".join(mismatched_checkpoints[:50])
+        )
     try:
         with connection.cursor() as cursor:
-            cursor.executemany(SOURCE_ASSIGNMENT_INSERT, [(
-                dataset_id, row.symbol, row.source_effective_from, row.industry_code,
-                row.source_updated_at, "sws_official", INDUSTRY_SCHEMA_VERSION,
-                sha256(row.canonical()),
-            ) for row in source_rows])
             cursor.executemany(NODE_INSERT, [(
                 dataset_id, row.node_code, row.node_name, row.parent_code, row.level,
                 row.standard_name, row.standard_code, row.termination_date, row.source,
@@ -485,6 +568,7 @@ def publish_industry_run(
 __all__ = [
     "INDUSTRY_STORE_SCHEMA_VERSION", "TiDBConfig", "completed_symbols", "connect",
     "ensure_industry_schema", "load_base_scope", "load_industry_intervals",
+    "load_industry_source_assignments",
     "load_industry_verifications", "publish_industry_run", "publish_symbol_checkpoint",
     "validate_publication",
 ]

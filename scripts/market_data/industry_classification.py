@@ -24,7 +24,7 @@ from scripts.market_data.quality_gates import GateResult, accepted
 
 
 HISTORY_START = date(2018, 1, 1)
-MANIFEST_VERSION = "m2-industry-pit-manifest-v1"
+MANIFEST_VERSION = "m2-industry-pit-manifest-v2"
 
 
 def canonical_scope(scope: Iterable[IndustryScopeSecurity]) -> list[dict[str, Any]]:
@@ -68,6 +68,7 @@ def build_intervals(
                 industry_code=row.industry_code,
                 observed_on=observed_on,
                 source_updated_at=row.source_updated_at,
+                primary_source=row.source,
             ))
     return sorted(intervals, key=lambda value: (value.symbol, value.valid_from))
 
@@ -267,21 +268,29 @@ def evaluate_industry(
         details=tuple(placeholder_rows[:50]),
     ))
 
-    verification_codes: dict[str, set[str]] = defaultdict(set)
-    for row in verifications:
-        if row.change_date <= as_of_date:
-            verification_codes[row.symbol].add(row.industry_code)
-    verified = {
-        symbol for symbol, interval in latest_interval.items()
-        if interval.industry_code in verification_codes.get(symbol, set())
+    active_node_codes = {
+        row.node_code.removeprefix("S") for row in nodes if row.termination_date is None
     }
-    verification_bps = len(verified) * 10000 // max(1, len(scope_symbols))
+    catalog_matched = {
+        symbol for symbol, interval in latest_interval.items()
+        if interval.level1_code in active_node_codes
+        and interval.level2_code in active_node_codes
+        and interval.level3_code in active_node_codes
+    }
+    catalog_coverage_bps = len(catalog_matched) * 10000 // max(1, len(scope_symbols))
     results.append(GateResult(
-        "cross_source_latest_code_coverage",
-        verification_bps >= 9500,
-        f"{verification_bps / 100:.2f}%",
-        ">= 95.00%",
-        details=tuple(sorted(scope_symbols - verified)[:50]),
+        "cninfo_latest_code_catalog_coverage",
+        catalog_coverage_bps >= 9800,
+        f"{catalog_coverage_bps / 100:.2f}%",
+        ">= 98.00%",
+        details=tuple(sorted(scope_symbols - catalog_matched)[:50]),
+    ))
+    results.append(GateResult(
+        "independent_secondary_source_disclosure",
+        False,
+        "not captured",
+        "diagnostic only; SWS workbook unavailable with verified TLS",
+        critical=False,
     ))
 
     node_keys = [row.node_code for row in nodes]
@@ -356,6 +365,11 @@ def build_manifest(
         "nodes_sha256": sha256(node_rows),
         "quality_sha256": sha256(gate_rows),
         "source_metadata": dict(sorted(source_metadata.items())),
+        "independent_secondary_source": {
+            "status": "unavailable",
+            "required_for_research_acceptance": False,
+            "simulation_use_requires_separate_authorization": True,
+        },
         "accepted": accepted(gates),
         "gates": gate_rows,
     }

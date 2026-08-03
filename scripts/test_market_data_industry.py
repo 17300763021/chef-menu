@@ -28,6 +28,7 @@ from scripts.market_data.quality_gates import accepted
 from scripts.market_data.industry_runner import _dataset_id, _plan_seed, load_plan
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.cninfo_industry_source import (
+    assignments_from_cninfo_changes,
     normalize_cninfo_catalog,
     normalize_cninfo_changes,
 )
@@ -45,7 +46,7 @@ def scope_fixture() -> list[IndustryScopeSecurity]:
 
 
 def source_fixture() -> list[SwsAssignmentRecord]:
-    return [
+    rows = [
         SwsAssignmentRecord.build(
             symbol="000001", source_effective_from="2014-02-21", industry_code="480101",
             source_updated_at="2024-09-27 09:08:00",
@@ -63,6 +64,7 @@ def source_fixture() -> list[SwsAssignmentRecord]:
             source_updated_at="2021-07-31 08:00:00",
         ),
     ]
+    return [replace(row, source="cninfo_official_api") for row in rows]
 
 
 def verification_fixture() -> list[IndustryVerification]:
@@ -81,7 +83,16 @@ def node_fixture() -> list[IndustryNode]:
         IndustryNode(f"S{code}", f"行业{code}", "S", 1, "申银万国行业分类标准", "008003", None)
         for code in codes
     )
-    return rows
+    rows.extend([
+        IndustryNode("S43", "房地产", "S", 1, "申银万国行业分类标准", "008003", None),
+        IndustryNode("S4302", "房地产开发Ⅱ", "S43", 2, "申银万国行业分类标准", "008003", None),
+        IndustryNode("S430201", "住宅开发Ⅲ", "S4302", 3, "申银万国行业分类标准", "008003", None),
+        IndustryNode("S48", "银行", "S", 1, "申银万国行业分类标准", "008003", None),
+        IndustryNode("S4803", "股份制银行Ⅱ", "S48", 2, "申银万国行业分类标准", "008003", None),
+        IndustryNode("S480301", "股份制银行Ⅲ", "S4803", 3, "申银万国行业分类标准", "008003", None),
+    ])
+    unique = {row.node_code: row for row in rows}
+    return list(unique.values())
 
 
 class IndustryContractTest(unittest.TestCase):
@@ -92,16 +103,13 @@ class IndustryContractTest(unittest.TestCase):
         seed = _plan_seed(
             base_history_dataset_id="m2-base", mode="sample", observed_on=OBSERVED_ON,
             scope_sha256=sha256(canonical_scope(scope)),
-            sws_raw_sha256="a" * 64,
-            source_assignments_sha256=sha256([row.canonical() for row in source]),
             nodes_sha256=sha256([row.canonical() for row in nodes]),
         )
         plan = {
-            "plan_version": "m2-industry-plan-v1",
+            "plan_version": "m2-industry-plan-v2",
             "dataset_id": _dataset_id(seed),
             "expected_scope_count": len(scope),
             "scope_sha256": seed["scope_sha256"],
-            "source_assignments_sha256": seed["source_assignments_sha256"],
             "nodes_sha256": seed["nodes_sha256"],
             "seed": seed,
         }
@@ -109,10 +117,9 @@ class IndustryContractTest(unittest.TestCase):
             root = Path(directory)
             (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
             write_gzip_rows(root / "scope.json.gz", canonical_scope(scope))
-            write_gzip_rows(root / "sws-assignments.json.gz", [row.canonical() for row in source])
             write_gzip_rows(root / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
 
-            loaded, loaded_scope, _loaded_source, _loaded_nodes = load_plan(root)
+            loaded, loaded_scope, _loaded_nodes = load_plan(root)
             self.assertEqual(loaded["dataset_id"], plan["dataset_id"])
             self.assertEqual(len(loaded_scope), 2)
 
@@ -176,7 +183,7 @@ class IndustryContractTest(unittest.TestCase):
         )
 
         self.assertIsNone(first_pre_2021.level1_name)
-        self.assertEqual(first_2021.level1_name, "行业48")
+        self.assertEqual(first_2021.level1_name, "银行")
 
     def test_out_of_scope_evidence_fails_closed(self) -> None:
         scope = scope_fixture()
@@ -292,6 +299,11 @@ class IndustrySourceNormalizationTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].industry_code, "480301")
         self.assertEqual(rows[0].level1_name, "银行")
+
+        assignments = assignments_from_cninfo_changes(list(rows))
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].source, "cninfo_official_api")
+        self.assertEqual(assignments[0].standard_code, "008003")
 
     def test_cninfo_conflicting_duplicate_rows_fail_closed(self) -> None:
         columns = (

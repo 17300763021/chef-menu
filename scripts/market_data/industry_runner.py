@@ -30,8 +30,10 @@ from scripts.market_data.industry_contracts import (
     SwsAssignmentRecord,
 )
 from scripts.market_data.manifest import sha256
-from scripts.market_data.sources.cninfo_industry_source import CninfoIndustrySource
-from scripts.market_data.sources.sws_industry_source import SwsIndustrySource
+from scripts.market_data.sources.cninfo_industry_source import (
+    CninfoIndustrySource,
+    assignments_from_cninfo_changes,
+)
 from scripts.market_data.tidb_industry_store import (
     TiDBConfig,
     completed_symbols,
@@ -39,6 +41,7 @@ from scripts.market_data.tidb_industry_store import (
     ensure_industry_schema,
     load_base_scope,
     load_industry_intervals,
+    load_industry_source_assignments,
     load_industry_verifications,
     publish_industry_run,
     publish_symbol_checkpoint,
@@ -53,6 +56,7 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
 MODE_COUNTS = {"sample": 20, "full": 1403}
 MODE_SHARDS = {"sample": 2, "full": 4}
 SYMBOL_DEADLINE_SECONDS = 90
+PLAN_VERSION = "m2-industry-plan-v2"
 
 
 class IndustrySymbolTimeout(BaseException):
@@ -86,15 +90,6 @@ def _scope_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[IndustryScopeSec
     return [IndustryScopeSecurity.build(row["symbol"], row["ipo_date"], row.get("out_date")) for row in rows]
 
 
-def _source_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[SwsAssignmentRecord]:
-    return [SwsAssignmentRecord.build(
-        symbol=row["symbol"],
-        source_effective_from=row["source_effective_from"],
-        industry_code=row["industry_code"],
-        source_updated_at=row.get("source_updated_at"),
-    ) for row in rows]
-
-
 def _nodes_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[IndustryNode]:
     return [IndustryNode(
         node_code=str(row["node_code"]), node_name=str(row["node_name"]),
@@ -116,18 +111,17 @@ def _plan_seed(
     mode: str,
     observed_on: date,
     scope_sha256: str,
-    sws_raw_sha256: str,
-    source_assignments_sha256: str,
     nodes_sha256: str,
 ) -> dict[str, Any]:
     return {
+        "plan_version": PLAN_VERSION,
+        "schema_version": "m2-industry-pit-v2",
         "base_history_dataset_id": base_history_dataset_id,
         "mode": mode,
         "observed_on": observed_on.isoformat(),
         "scope_sha256": scope_sha256,
-        "sws_raw_sha256": sws_raw_sha256,
-        "source_assignments_sha256": source_assignments_sha256,
         "nodes_sha256": nodes_sha256,
+        "primary_source": "cninfo_official_api",
     }
 
 
@@ -149,26 +143,20 @@ def build_plan(
     if len(full_scope) != MODE_COUNTS["full"]:
         raise RuntimeError(f"accepted M2.3 base scope changed: expected 1403, got {len(full_scope)}")
     scope = full_scope if mode == "full" else full_scope[:MODE_COUNTS[mode]]
-    scope_symbols = [item.symbol for item in scope]
-    sws = SwsIndustrySource().fetch(scope_symbols)
-    source_rows = [row for row in sws.rows if row.source_effective_from <= observed_on]
-    nodes = list(CninfoIndustrySource().fetch_catalog())
+    nodes = list(CninfoIndustrySource(attempts=3).fetch_catalog())
     scope_hash = sha256(canonical_scope(scope))
-    source_hash = sha256([row.canonical() for row in source_rows])
     nodes_hash = sha256([row.canonical() for row in nodes])
     seed = _plan_seed(
         base_history_dataset_id=base_history_dataset_id,
         mode=mode,
         observed_on=observed_on,
         scope_sha256=scope_hash,
-        sws_raw_sha256=sws.raw_sha256,
-        source_assignments_sha256=source_hash,
         nodes_sha256=nodes_hash,
     )
     dataset_id = _dataset_id(seed)
     shard_count = MODE_SHARDS[mode]
     plan = {
-        "plan_version": "m2-industry-plan-v1",
+        "plan_version": PLAN_VERSION,
         "dataset_id": dataset_id,
         "base_history_dataset_id": base_history_dataset_id,
         "mode": mode,
@@ -177,14 +165,12 @@ def build_plan(
         "history_start": HISTORY_START.isoformat(),
         "expected_scope_count": MODE_COUNTS[mode],
         "scope_sha256": scope_hash,
-        "source_assignments_sha256": source_hash,
         "nodes_sha256": nodes_hash,
         "source_metadata": {
-            "sws_assignment_url": sws.source_url,
-            "sws_assignment_raw_sha256": sws.raw_sha256,
-            "sws_assignment_raw_bytes": sws.raw_bytes,
-            "cninfo_catalog_source": "stock_industry_category_cninfo:申银万国行业分类标准",
-            "cninfo_change_source": "stock_industry_change_cninfo",
+            "primary_assignment_source": "CNINFO p_stock2110 via stock_industry_change_cninfo",
+            "classification_catalog_source": "CNINFO p_public0002 via stock_industry_category_cninfo",
+            "primary_transport": "verified HTTPS",
+            "sws_workbook_role": "optional independent diagnostic; unavailable with verified TLS",
         },
         "shard_count": shard_count,
         "matrix": {"include": [{"shard_index": index} for index in range(shard_count)]},
@@ -195,23 +181,22 @@ def build_plan(
         json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
     write_gzip_rows(output_dir / "scope.json.gz", canonical_scope(scope))
-    write_gzip_rows(output_dir / "sws-assignments.json.gz", [row.canonical() for row in source_rows])
     write_gzip_rows(output_dir / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
     _progress(
         "industry_plan_ready", dataset_id=dataset_id, mode=mode, scope_count=len(scope),
-        source_assignment_count=len(source_rows), node_count=len(nodes), shard_count=shard_count,
+        node_count=len(nodes), shard_count=shard_count,
     )
     return plan
 
 
-def load_plan(input_dir: Path) -> tuple[dict[str, Any], list[IndustryScopeSecurity], list[SwsAssignmentRecord], list[IndustryNode]]:
+def load_plan(input_dir: Path) -> tuple[dict[str, Any], list[IndustryScopeSecurity], list[IndustryNode]]:
     plan = json.loads((input_dir / "plan.json").read_text(encoding="utf-8"))
+    if plan.get("plan_version") != PLAN_VERSION:
+        raise RuntimeError(f"unsupported industry plan version: {plan.get('plan_version')!r}")
     scope = _scope_from_rows(read_gzip_rows(input_dir / "scope.json.gz"))
-    source_rows = _source_from_rows(read_gzip_rows(input_dir / "sws-assignments.json.gz"))
     nodes = _nodes_from_rows(read_gzip_rows(input_dir / "cninfo-nodes.json.gz"))
     actual = {
         "scope_sha256": sha256(canonical_scope(scope)),
-        "source_assignments_sha256": sha256([row.canonical() for row in source_rows]),
         "nodes_sha256": sha256([row.canonical() for row in nodes]),
     }
     mismatches = {key: {"plan": plan.get(key), "artifact": value} for key, value in actual.items() if plan.get(key) != value}
@@ -221,7 +206,7 @@ def load_plan(input_dir: Path) -> tuple[dict[str, Any], list[IndustryScopeSecuri
         raise RuntimeError("industry plan dataset id does not match its deterministic seed")
     if len(scope) != int(plan["expected_scope_count"]):
         raise RuntimeError("industry plan scope count does not reconcile")
-    return plan, scope, source_rows, nodes
+    return plan, scope, nodes
 
 
 def _shard_scope(scope: Sequence[IndustryScopeSecurity], shard_index: int, shard_count: int) -> list[IndustryScopeSecurity]:
@@ -233,7 +218,7 @@ def _shard_scope(scope: Sequence[IndustryScopeSecurity], shard_index: int, shard
 def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[str, Any]:
     if attempts < 1 or attempts > 3:
         raise ValueError("industry symbol attempts must be between 1 and 3")
-    plan, scope, source_rows, nodes = load_plan(input_dir)
+    plan, scope, nodes = load_plan(input_dir)
     shard_count = int(plan["shard_count"])
     shard_scope = _shard_scope(scope, shard_index, shard_count)
     dataset_id = str(plan["dataset_id"])
@@ -253,27 +238,31 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
     source = CninfoIndustrySource()
     failed = 0
     as_of = date.fromisoformat(plan["as_of_date"])
-    observed_on = date.fromisoformat(plan["observed_on"])
-    source_by_symbol: dict[str, list[SwsAssignmentRecord]] = {}
-    for security in shard_scope:
-        source_by_symbol[security.symbol] = [row for row in source_rows if row.symbol == security.symbol]
+    captured_on = datetime.now(SHANGHAI).date()
     for position, security in enumerate(pending, start=1):
         final_error: Exception | str | None = None
         verification_rows: Sequence[IndustryVerification] = ()
-        intervals = build_intervals(
-            [security], source_by_symbol.get(security.symbol, []), observed_on=observed_on,
-            as_of_date=as_of, history_start=date.fromisoformat(plan["history_start"]),
-        )
+        symbol_source_rows: Sequence[SwsAssignmentRecord] = ()
+        intervals = []
         for attempt in range(1, attempts + 1):
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
                     verification_rows = source.fetch_changes(security.symbol, date(1990, 1, 1), as_of)
+                if not verification_rows:
+                    raise RuntimeError(f"CNINFO returned no Shenwan industry history for {security.symbol}")
+                symbol_source_rows = assignments_from_cninfo_changes(list(verification_rows))
+                intervals = build_intervals(
+                    [security], symbol_source_rows, observed_on=captured_on,
+                    as_of_date=as_of, history_start=date.fromisoformat(plan["history_start"]),
+                )
+                if not intervals:
+                    raise RuntimeError(f"CNINFO industry history produced no valid interval for {security.symbol}")
                 enriched = enrich_interval_names(intervals, verification_rows, nodes)
                 connection = connect(config)
                 try:
                     publish_symbol_checkpoint(
                         connection, dataset_id=dataset_id, symbol=security.symbol,
-                        shard_index=shard_index, intervals=enriched,
+                        shard_index=shard_index, source_rows=symbol_source_rows, intervals=enriched,
                         verifications=verification_rows, status="succeeded",
                     )
                 finally:
@@ -295,7 +284,7 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
             try:
                 publish_symbol_checkpoint(
                     connection, dataset_id=dataset_id, symbol=security.symbol,
-                    shard_index=shard_index, intervals=[], verifications=[], status="failed",
+                    shard_index=shard_index, source_rows=[], intervals=[], verifications=[], status="failed",
                     error=final_error or "unknown CNINFO verification failure",
                 )
             finally:
@@ -314,10 +303,11 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
 
 
 def finalize(*, input_dir: Path, output_dir: Path) -> dict[str, Any]:
-    plan, scope, source_rows, nodes = load_plan(input_dir)
+    plan, scope, nodes = load_plan(input_dir)
     config = TiDBConfig.from_env()
     connection = connect(config)
     try:
+        source_rows = load_industry_source_assignments(connection, plan["dataset_id"])
         intervals = load_industry_intervals(connection, plan["dataset_id"])
         verifications = load_industry_verifications(connection, plan["dataset_id"])
     finally:
@@ -329,9 +319,13 @@ def finalize(*, input_dir: Path, output_dir: Path) -> dict[str, Any]:
         as_of_date=date.fromisoformat(plan["as_of_date"]),
         expected_scope_count=int(plan["expected_scope_count"]),
     )
+    knowledge_observed_on = max(
+        (row.known_from for row in intervals),
+        default=date.fromisoformat(plan["observed_on"]),
+    )
     manifest = build_manifest(
         dataset_id=plan["dataset_id"], base_history_dataset_id=plan["base_history_dataset_id"],
-        mode=plan["mode"], observed_on=date.fromisoformat(plan["observed_on"]),
+        mode=plan["mode"], observed_on=knowledge_observed_on,
         as_of_date=date.fromisoformat(plan["as_of_date"]),
         history_start=date.fromisoformat(plan["history_start"]), scope=scope,
         source_rows=source_rows, intervals=intervals, verifications=verifications,

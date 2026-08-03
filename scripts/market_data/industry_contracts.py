@@ -9,7 +9,7 @@ from typing import Any
 from scripts.market_data.contracts import normalize_symbol, parse_date
 
 
-INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v1"
+INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v2"
 SW_2021_EFFECTIVE_DATE = date(2021, 7, 30)
 
 
@@ -76,6 +76,9 @@ class SwsAssignmentRecord:
     source_effective_from: date
     industry_code: str
     source_updated_at: datetime | None
+    source: str = "sws_official_workbook"
+    standard_name: str | None = None
+    standard_code: str | None = None
 
     @classmethod
     def build(
@@ -85,6 +88,9 @@ class SwsAssignmentRecord:
         source_effective_from: Any,
         industry_code: Any,
         source_updated_at: Any,
+        source: str = "sws_official_workbook",
+        standard_name: Any = None,
+        standard_code: Any = None,
     ) -> "SwsAssignmentRecord":
         updated = None
         if source_updated_at not in (None, "", "NaT", "nan"):
@@ -97,6 +103,9 @@ class SwsAssignmentRecord:
             source_effective_from=parse_industry_date(source_effective_from),
             industry_code=normalize_assignment_industry_code(industry_code),
             source_updated_at=updated,
+            source=str(source).strip(),
+            standard_name=None if standard_name in (None, "", "nan") else str(standard_name).strip(),
+            standard_code=None if standard_code in (None, "", "nan") else str(standard_code).strip(),
         )
 
     def canonical(self) -> dict[str, Any]:
@@ -105,6 +114,9 @@ class SwsAssignmentRecord:
             "source_effective_from": self.source_effective_from.isoformat(),
             "industry_code": self.industry_code,
             "source_updated_at": None if self.source_updated_at is None else self.source_updated_at.isoformat(),
+            "source": self.source,
+            "standard_name": self.standard_name,
+            "standard_code": self.standard_code,
         }
 
 
@@ -125,7 +137,7 @@ class IndustryInterval:
     knowledge_status: str
     known_from: date
     source_updated_at: datetime | None
-    primary_source: str = "sws_official"
+    primary_source: str = "sws_official_workbook"
     schema_version: str = INDUSTRY_SCHEMA_VERSION
 
     @classmethod
@@ -139,6 +151,7 @@ class IndustryInterval:
         industry_code: str,
         observed_on: date,
         source_updated_at: datetime | None,
+        primary_source: str = "sws_official_workbook",
     ) -> "IndustryInterval":
         code = normalize_assignment_industry_code(industry_code)
         if valid_to <= valid_from:
@@ -161,6 +174,7 @@ class IndustryInterval:
             ),
             known_from=observed_on,
             source_updated_at=source_updated_at,
+            primary_source=primary_source,
         )
 
     def with_names(self, level1: str | None, level2: str | None, level3: str | None) -> "IndustryInterval":
@@ -217,7 +231,7 @@ class IndustryVerification:
     level3_name: str | None
     standard_name: str
     standard_code: str
-    source: str = "cninfo_industry_change"
+    source: str = "cninfo_official_api"
 
     @property
     def key(self) -> tuple[str, date, str, str]:

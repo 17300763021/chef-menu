@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import time
 from typing import Callable
 
 import pandas as pd
@@ -11,9 +12,33 @@ from scripts.market_data.contracts import normalize_symbol
 from scripts.market_data.industry_contracts import (
     IndustryNode,
     IndustryVerification,
+    SwsAssignmentRecord,
     normalize_assignment_industry_code,
     parse_industry_date,
 )
+
+
+def assignments_from_cninfo_changes(
+    rows: tuple[IndustryVerification, ...] | list[IndustryVerification],
+) -> tuple[SwsAssignmentRecord, ...]:
+    """Convert first-party CNINFO Shenwan change events into primary assignments."""
+    assignments: dict[tuple[str, date], SwsAssignmentRecord] = {}
+    for row in rows:
+        assignment = SwsAssignmentRecord.build(
+            symbol=row.symbol,
+            source_effective_from=row.change_date,
+            industry_code=row.industry_code,
+            source_updated_at=None,
+            source="cninfo_official_api",
+            standard_name=row.standard_name,
+            standard_code=row.standard_code,
+        )
+        key = (assignment.symbol, assignment.source_effective_from)
+        existing = assignments.get(key)
+        if existing is not None and existing.canonical() != assignment.canonical():
+            raise RuntimeError(f"CNINFO returned conflicting primary assignments for {key}")
+        assignments[key] = assignment
+    return tuple(sorted(assignments.values(), key=lambda value: (value.symbol, value.source_effective_from)))
 
 
 def _text(value: object) -> str | None:
@@ -91,9 +116,20 @@ class CninfoIndustrySource:
         *,
         catalog_loader: Callable[[], pd.DataFrame] | None = None,
         changes_loader: Callable[[str, str, str], pd.DataFrame] | None = None,
+        timeout_seconds: int = 30,
+        attempts: int = 1,
     ) -> None:
+        if timeout_seconds < 1 or attempts < 1 or attempts > 3:
+            raise ValueError("CNINFO timeout must be positive and attempts must be between 1 and 3")
+        self.timeout_seconds = timeout_seconds
+        self.attempts = attempts
+        self._uses_default_catalog = catalog_loader is None
+        self._uses_default_changes = changes_loader is None
+        self._akshare_module = None
         if catalog_loader is None or changes_loader is None:
             import akshare as ak
+            import akshare.stock.stock_industry_cninfo as akshare_module
+            self._akshare_module = akshare_module
             catalog_loader = catalog_loader or (
                 lambda: ak.stock_industry_category_cninfo(symbol="申银万国行业分类标准")
             )
@@ -105,11 +141,50 @@ class CninfoIndustrySource:
         self.catalog_loader = catalog_loader
         self.changes_loader = changes_loader
 
+    def _call(self, loader: Callable[..., pd.DataFrame], *args: str, bounded: bool) -> pd.DataFrame:
+        last_error: Exception | None = None
+        for attempt in range(1, self.attempts + 1):
+            try:
+                if not bounded or self._akshare_module is None:
+                    return loader(*args)
+                requests_module = self._akshare_module.requests
+                original_get = requests_module.get
+                original_post = requests_module.post
+
+                def bounded_get(*request_args, **request_kwargs):
+                    request_kwargs.setdefault("timeout", self.timeout_seconds)
+                    response = original_get(*request_args, **request_kwargs)
+                    response.raise_for_status()
+                    return response
+
+                def bounded_post(*request_args, **request_kwargs):
+                    request_kwargs.setdefault("timeout", self.timeout_seconds)
+                    response = original_post(*request_args, **request_kwargs)
+                    response.raise_for_status()
+                    return response
+
+                requests_module.get = bounded_get
+                requests_module.post = bounded_post
+                try:
+                    return loader(*args)
+                finally:
+                    requests_module.get = original_get
+                    requests_module.post = original_post
+            except Exception as error:
+                last_error = error
+                if attempt < self.attempts:
+                    time.sleep(min(2 ** (attempt - 1), 2))
+        raise RuntimeError(f"CNINFO request failed after {self.attempts} attempt(s): {last_error}")
+
     def fetch_catalog(self) -> tuple[IndustryNode, ...]:
         assert self.catalog_loader is not None
-        return normalize_cninfo_catalog(self.catalog_loader())
+        frame = self._call(self.catalog_loader, bounded=self._uses_default_catalog)
+        return normalize_cninfo_catalog(frame)
 
     def fetch_changes(self, symbol: str, start: date, end: date) -> tuple[IndustryVerification, ...]:
         assert self.changes_loader is not None
-        frame = self.changes_loader(symbol, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+        frame = self._call(
+            self.changes_loader, symbol, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"),
+            bounded=self._uses_default_changes,
+        )
         return normalize_cninfo_changes(frame, symbol)
