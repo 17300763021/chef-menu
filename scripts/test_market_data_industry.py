@@ -46,6 +46,7 @@ from scripts.market_data.sources.cninfo_industry_source import (
 )
 from scripts.market_data.sources.sws_industry_source import normalize_sws_frame
 from scripts.market_data.sources.exchange_delisting_source import normalize_delisting_frame
+from scripts.market_data.sources.csi_index_source import load_identifier_continuities
 
 
 OBSERVED_ON = date(2026, 7, 28)
@@ -383,6 +384,68 @@ class IndustryContractTest(unittest.TestCase):
         self.assertEqual(kwargs["exclusion"].confirmed_empty_responses, 2)
         self.assertEqual(kwargs["exclusion"].delisting_source, "szse_official_delisting")
 
+    def test_shard_uses_only_frozen_identifier_continuity_for_empty_predecessor(self) -> None:
+        scope = [IndustryScopeSecurity.build("300114", "2023-12-11")]
+        nodes = node_fixture()
+        scope_hash = sha256(canonical_scope(scope))
+        nodes_hash = sha256([row.canonical() for row in nodes])
+        delistings_hash = sha256([])
+        seed = _plan_seed(
+            base_history_dataset_id="m2-base", mode="full", observed_on=OBSERVED_ON,
+            scope_sha256=scope_hash, nodes_sha256=nodes_hash,
+            delisting_inventory_sha256=delistings_hash, catalog_evidence_dataset_id="accepted-sample",
+        )
+        plan = {
+            "plan_version": "m2-industry-plan-v3", "dataset_id": _dataset_id(seed),
+            "base_history_dataset_id": "m2-base", "mode": "full",
+            "observed_on": OBSERVED_ON.isoformat(), "as_of_date": OBSERVED_ON.isoformat(),
+            "history_start": HISTORY_START.isoformat(), "expected_scope_count": 1,
+            "scope_sha256": scope_hash, "nodes_sha256": nodes_hash,
+            "delisting_inventory_count": 0, "delisting_inventory_sha256": delistings_hash,
+            "source_metadata": {}, "shard_count": 1, "seed": seed,
+        }
+        successor_rows = tuple(
+            replace(row, symbol="302132") for row in verification_fixture() if row.symbol == "000001"
+        )
+        source = MagicMock()
+        source.fetch_changes.side_effect = [(), successor_rows]
+        checkpoint = MagicMock()
+        connection = MagicMock()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            write_gzip_rows(root / "scope.json.gz", canonical_scope(scope))
+            write_gzip_rows(root / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
+            write_gzip_rows(root / "exchange-delistings.json.gz", [])
+            with (
+                patch("scripts.market_data.industry_runner.TiDBConfig.from_env", return_value=MagicMock()),
+                patch("scripts.market_data.industry_runner.connect", return_value=connection),
+                patch("scripts.market_data.industry_runner.ensure_industry_schema"),
+                patch("scripts.market_data.industry_runner.completed_symbols", return_value=set()),
+                patch("scripts.market_data.industry_runner.CninfoIndustrySource", return_value=source),
+                patch("scripts.market_data.industry_runner.publish_symbol_checkpoint", checkpoint),
+                patch("scripts.market_data.industry_runner.time.sleep"),
+            ):
+                result = run_shard(input_dir=root, shard_index=0, attempts=1)
+
+        self.assertEqual(result["failed_symbols"], 0)
+        self.assertEqual(source.fetch_changes.call_args_list[0].args[0], "300114")
+        self.assertEqual(source.fetch_changes.call_args_list[1].args[0], "302132")
+        kwargs = checkpoint.call_args.kwargs
+        self.assertEqual(kwargs["status"], "succeeded")
+        self.assertTrue(all(row.symbol == "300114" for row in kwargs["verifications"]))
+        self.assertTrue(all(row.source == "cninfo_id_alias:1222544408:302132" for row in kwargs["verifications"]))
+        self.assertTrue(all(row.source.startswith("cninfo_id_alias:1222544408:302132") for row in kwargs["source_rows"]))
+
+    def test_frozen_identifier_continuity_is_hash_verified_and_one_to_one(self) -> None:
+        continuity = load_identifier_continuities()["300114"]
+        self.assertEqual(continuity.successor_symbol, "302132")
+        self.assertEqual(continuity.notice_id, 1222544408)
+        self.assertEqual(
+            continuity.attachment_sha256,
+            "dd68049c48df826848f361fd9e7b23dd20b6805144a2e5bc36e54db638611488",
+        )
+
     def test_manifest_is_deterministic_and_discloses_reconstruction(self) -> None:
         scope = scope_fixture()
         source = source_fixture()
@@ -414,6 +477,21 @@ class IndustryContractTest(unittest.TestCase):
 
 
 class IndustrySourceNormalizationTest(unittest.TestCase):
+    def test_cninfo_ancestor_code_is_preserved_as_evidence_but_not_promoted(self) -> None:
+        ancestor = IndustryVerification(
+            symbol="601138", change_date=date(2018, 5, 14), industry_code="2705",
+            level1_name="电子", level2_name="电子制造", level3_name="电子制造",
+            standard_name="申银万国行业分类标准(旧)", standard_code="008018",
+        )
+        leaf = replace(ancestor, change_date=date(2018, 5, 28), industry_code="270501")
+
+        assignments = assignments_from_cninfo_changes([ancestor, leaf])
+
+        self.assertEqual(ancestor.industry_code, "2705")
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].industry_code, "270501")
+        self.assertEqual(assignments[0].source_effective_from, date(2018, 5, 28))
+
     def test_cninfo_raw_empty_records_become_empty_history_without_hiding_schema_errors(self) -> None:
         class Response:
             def __init__(self, records):

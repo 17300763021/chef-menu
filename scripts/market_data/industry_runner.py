@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
@@ -40,6 +41,7 @@ from scripts.market_data.sources.cninfo_industry_source import (
     assignments_from_cninfo_changes,
 )
 from scripts.market_data.sources.exchange_delisting_source import ExchangeDelistingSource
+from scripts.market_data.sources.csi_index_source import load_identifier_continuities
 from scripts.market_data.tidb_industry_store import (
     TiDBConfig,
     completed_symbols,
@@ -329,6 +331,7 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
     as_of = date.fromisoformat(plan["as_of_date"])
     captured_on = datetime.now(SHANGHAI).date()
     delisting_by_symbol = {row.symbol: row for row in delistings}
+    identifier_continuities = load_identifier_continuities()
     for position, security in enumerate(pending, start=1):
         final_error: Exception | str | None = None
         verification_rows: Sequence[IndustryVerification] = ()
@@ -339,6 +342,30 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
             try:
                 with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
                     verification_rows = source.fetch_changes(security.symbol, date(1990, 1, 1), as_of)
+                continuity = identifier_continuities.get(security.symbol)
+                if not verification_rows and continuity is not None and continuity.effective_session <= as_of:
+                    with symbol_deadline(SYMBOL_DEADLINE_SECONDS):
+                        successor_rows = source.fetch_changes(
+                            continuity.successor_symbol, date(1990, 1, 1), as_of,
+                        )
+                    verification_rows = tuple(
+                        replace(
+                            row,
+                            symbol=security.symbol,
+                            source=continuity.industry_source,
+                        )
+                        for row in successor_rows
+                    )
+                    if verification_rows:
+                        _progress(
+                            "industry_identifier_continuity_applied",
+                            symbol=security.symbol,
+                            source_symbol=continuity.successor_symbol,
+                            effective_session=continuity.effective_session.isoformat(),
+                            notice_id=continuity.notice_id,
+                            evidence_sha256=continuity.attachment_sha256,
+                            shard_index=shard_index,
+                        )
                 if not verification_rows:
                     confirmed_empty_responses += 1
                     exclusion = _delisted_no_history_exclusion(

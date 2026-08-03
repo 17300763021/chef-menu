@@ -39,6 +39,21 @@ class NoticeSpec:
     basis: str
 
 
+@dataclass(frozen=True, slots=True)
+class IdentifierContinuity:
+    """A one-to-one security-code change backed by frozen official evidence."""
+
+    predecessor_symbol: str
+    successor_symbol: str
+    effective_session: date
+    notice_id: int
+    attachment_sha256: str
+
+    @property
+    def industry_source(self) -> str:
+        return f"cninfo_id_alias:{self.notice_id}:{self.successor_symbol}"
+
+
 NOTICE_SPECS = (
     NoticeSpec(11518, date(2018, 5, 28), "regular", date(2018, 6, 11), False, "CSI notice: effective on stated date"),
     NoticeSpec(11859, date(2018, 12, 3), "regular", date(2018, 12, 17), False, "CSI notice: effective on stated date"),
@@ -183,6 +198,35 @@ def load_event_index(path: Path = EVENT_INDEX_PATH) -> tuple[list[UniverseEvent]
     if missing:
         raise ValueError(f"CSI event index missing notices: {missing}")
     return sorted(events, key=lambda value: (value.effective_session, value.notice_id)), source
+
+
+def load_identifier_continuities(
+    path: Path = EVENT_INDEX_PATH,
+) -> dict[str, IdentifierContinuity]:
+    """Return only unambiguous one-to-one identifier changes from hashed evidence."""
+    events, _ = load_event_index(path)
+    continuities: dict[str, IdentifierContinuity] = {}
+    for event in events:
+        if event.event_type != "identifier_change":
+            continue
+        if len(event.changes) != 1:
+            raise ValueError(f"identifier event {event.notice_id} must contain exactly one index change")
+        change = event.changes[0]
+        if len(change.removed) != 1 or len(change.added) != 1:
+            raise ValueError(f"identifier event {event.notice_id} must be one-to-one")
+        predecessor = normalize_symbol(change.removed[0])
+        continuity = IdentifierContinuity(
+            predecessor_symbol=predecessor,
+            successor_symbol=normalize_symbol(change.added[0]),
+            effective_session=event.effective_session,
+            notice_id=event.notice_id,
+            attachment_sha256=event.attachment_sha256,
+        )
+        existing = continuities.get(predecessor)
+        if existing is not None and existing != continuity:
+            raise ValueError(f"conflicting identifier continuity for {predecessor}")
+        continuities[predecessor] = continuity
+    return dict(sorted(continuities.items()))
 
 
 class CsiIndexSource:

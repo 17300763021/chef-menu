@@ -15,6 +15,7 @@ from scripts.market_data.industry_contracts import (
     IndustryVerification,
     SwsAssignmentRecord,
     normalize_assignment_industry_code,
+    normalize_industry_code,
     parse_industry_date,
 )
 
@@ -26,6 +27,10 @@ def assignments_from_cninfo_changes(
     grouped: dict[tuple[str, date], list[IndustryVerification]] = {}
     current_before_cutover: dict[str, list[IndustryVerification]] = {}
     for row in rows:
+        if len(row.industry_code) != 6:
+            # CNINFO can publish a temporary level-1/2 node before its leaf assignment.
+            # Preserve it as verification evidence but never invent a 6-digit assignment.
+            continue
         if row.standard_code == "008003" and row.change_date <= SW_2021_EFFECTIVE_DATE:
             current_before_cutover.setdefault(row.symbol, []).append(row)
             continue
@@ -43,16 +48,27 @@ def assignments_from_cninfo_changes(
             raise RuntimeError(f"CNINFO returned conflicting primary assignment codes for {key}: {sorted(codes)}")
         standard_names = {row.standard_name for row in candidates if row.standard_name}
         standard_codes = {row.standard_code for row in candidates if row.standard_code}
+        evidence_sources = {row.source for row in candidates}
+        if len(evidence_sources) != 1:
+            raise RuntimeError(f"CNINFO returned conflicting evidence sources for {key}: {sorted(evidence_sources)}")
+        evidence_source = next(iter(evidence_sources))
+        if evidence_source.startswith("cninfo_id_alias:"):
+            assignment_source = (
+                f"{evidence_source}:sw2021" if key[1] == SW_2021_EFFECTIVE_DATE
+                and standard_codes == {"008003"} else evidence_source
+            )
+        else:
+            assignment_source = (
+                "cninfo_official_api:sw2021_cutover_normalized"
+                if key[1] == SW_2021_EFFECTIVE_DATE and standard_codes == {"008003"}
+                else "cninfo_official_api"
+            )
         assignment = SwsAssignmentRecord.build(
             symbol=key[0],
             source_effective_from=key[1],
             industry_code=next(iter(codes)),
             source_updated_at=None,
-            source=(
-                "cninfo_official_api:sw2021_cutover_normalized"
-                if key[1] == SW_2021_EFFECTIVE_DATE and standard_codes == {"008003"}
-                else "cninfo_official_api"
-            ),
+            source=assignment_source,
             standard_name=next(iter(standard_names)) if len(standard_names) == 1 else None,
             standard_code=next(iter(standard_codes)) if len(standard_codes) == 1 else None,
         )
@@ -109,7 +125,7 @@ def normalize_cninfo_changes(frame: pd.DataFrame, requested_symbol: str) -> tupl
         symbol = normalize_symbol(str(item["证券代码"] or requested))
         if symbol != requested:
             raise RuntimeError(f"CNINFO returned {symbol} while {requested} was requested")
-        code = normalize_assignment_industry_code(item["行业编码"])
+        code = normalize_industry_code(item["行业编码"])
         rows.append(IndustryVerification(
             symbol=symbol,
             change_date=parse_industry_date(item["变更日期"]),
