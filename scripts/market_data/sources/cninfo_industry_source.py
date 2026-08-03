@@ -10,6 +10,7 @@ import pandas as pd
 
 from scripts.market_data.contracts import normalize_symbol
 from scripts.market_data.industry_contracts import (
+    SW_2021_EFFECTIVE_DATE,
     IndustryNode,
     IndustryVerification,
     SwsAssignmentRecord,
@@ -23,8 +24,18 @@ def assignments_from_cninfo_changes(
 ) -> tuple[SwsAssignmentRecord, ...]:
     """Convert first-party CNINFO Shenwan change events into primary assignments."""
     grouped: dict[tuple[str, date], list[IndustryVerification]] = {}
+    current_before_cutover: dict[str, list[IndustryVerification]] = {}
     for row in rows:
+        if row.standard_code == "008003" and row.change_date <= SW_2021_EFFECTIVE_DATE:
+            current_before_cutover.setdefault(row.symbol, []).append(row)
+            continue
+        if row.standard_code != "008003" and row.change_date >= SW_2021_EFFECTIVE_DATE:
+            continue
         grouped.setdefault((row.symbol, row.change_date), []).append(row)
+    for symbol, candidates in current_before_cutover.items():
+        latest_date = max(row.change_date for row in candidates)
+        latest = [row for row in candidates if row.change_date == latest_date]
+        grouped.setdefault((symbol, SW_2021_EFFECTIVE_DATE), []).extend(latest)
     assignments: list[SwsAssignmentRecord] = []
     for key, candidates in sorted(grouped.items()):
         codes = {row.industry_code for row in candidates}
@@ -37,7 +48,11 @@ def assignments_from_cninfo_changes(
             source_effective_from=key[1],
             industry_code=next(iter(codes)),
             source_updated_at=None,
-            source="cninfo_official_api",
+            source=(
+                "cninfo_official_api:sw2021_cutover_normalized"
+                if key[1] == SW_2021_EFFECTIVE_DATE and standard_codes == {"008003"}
+                else "cninfo_official_api"
+            ),
             standard_name=next(iter(standard_names)) if len(standard_names) == 1 else None,
             standard_code=next(iter(standard_codes)) if len(standard_codes) == 1 else None,
         )

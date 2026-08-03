@@ -9,7 +9,7 @@ from typing import Any
 from scripts.market_data.contracts import normalize_symbol, parse_date
 
 
-INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v2"
+INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v3"
 SW_2021_EFFECTIVE_DATE = date(2021, 7, 30)
 
 

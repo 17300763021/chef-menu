@@ -24,6 +24,7 @@ from scripts.market_data.industry_classification import (
     write_gzip_rows,
 )
 from scripts.market_data.industry_contracts import (
+    INDUSTRY_SCHEMA_VERSION,
     IndustryNode,
     IndustryScopeSecurity,
     IndustryVerification,
@@ -116,7 +117,7 @@ def _plan_seed(
 ) -> dict[str, Any]:
     return {
         "plan_version": PLAN_VERSION,
-        "schema_version": "m2-industry-pit-v2",
+        "schema_version": INDUSTRY_SCHEMA_VERSION,
         "base_history_dataset_id": base_history_dataset_id,
         "mode": mode,
         "observed_on": observed_on.isoformat(),

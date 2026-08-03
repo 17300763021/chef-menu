@@ -302,7 +302,7 @@ class IndustrySourceNormalizationTest(unittest.TestCase):
 
         assignments = assignments_from_cninfo_changes(list(rows))
         self.assertEqual(len(assignments), 1)
-        self.assertEqual(assignments[0].source, "cninfo_official_api")
+        self.assertTrue(assignments[0].source.startswith("cninfo_official_api"))
         self.assertEqual(assignments[0].standard_code, "008003")
 
     def test_cninfo_conflicting_duplicate_rows_fail_closed(self) -> None:
@@ -319,7 +319,7 @@ class IndustrySourceNormalizationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "conflicting industry rows"):
             normalize_cninfo_changes(pd.DataFrame([first, second]), "000001")
 
-    def test_same_code_from_current_and_legacy_standards_merges_without_fabricating_standard(self) -> None:
+    def test_current_and_legacy_standards_create_a_non_leaking_2021_cutover(self) -> None:
         current = IndustryVerification(
             "000002", date(1991, 1, 29), "430101", "房地产", "房地产开发", "住宅开发",
             "申银万国行业分类标准", "008003",
@@ -331,17 +331,41 @@ class IndustrySourceNormalizationTest(unittest.TestCase):
 
         assignments = assignments_from_cninfo_changes([current, legacy])
 
-        self.assertEqual(len(assignments), 1)
-        self.assertEqual(assignments[0].industry_code, "430101")
-        self.assertIsNone(assignments[0].standard_name)
-        self.assertIsNone(assignments[0].standard_code)
+        self.assertEqual(len(assignments), 2)
+        self.assertEqual(assignments[0].source_effective_from, date(1991, 1, 29))
+        self.assertEqual(assignments[0].standard_code, "008018")
+        self.assertEqual(assignments[1].source_effective_from, date(2021, 7, 30))
+        self.assertEqual(assignments[1].industry_code, "430101")
+        self.assertEqual(assignments[1].standard_code, "008003")
+        self.assertIn("cutover_normalized", assignments[1].source)
+
+    def test_latest_current_standard_row_before_cutover_is_selected(self) -> None:
+        old_current = IndustryVerification(
+            "300059", date(2010, 3, 10), "470303", "非银金融", "多元金融", "金融信息服务",
+            "申银万国行业分类标准", "008003",
+        )
+        latest_current = replace(old_current, change_date=date(2020, 7, 23), industry_code="490101")
+        legacy = replace(
+            latest_current, change_date=date(2020, 7, 24), standard_name="申银万国行业分类标准(旧)",
+            standard_code="008018",
+        )
+
+        assignments = assignments_from_cninfo_changes([old_current, latest_current, legacy])
+
+        self.assertEqual(
+            [(row.source_effective_from, row.industry_code, row.standard_code) for row in assignments],
+            [
+                (date(2020, 7, 24), "490101", "008018"),
+                (date(2021, 7, 30), "490101", "008003"),
+            ],
+        )
 
     def test_different_codes_on_same_cninfo_date_fail_closed(self) -> None:
         first = IndustryVerification(
             "000002", date(1991, 1, 29), "430101", "房地产", "房地产开发", "住宅开发",
             "申银万国行业分类标准", "008003",
         )
-        second = replace(first, industry_code="430201", standard_code="008018")
+        second = replace(first, industry_code="430201")
 
         with self.assertRaisesRegex(RuntimeError, "conflicting primary assignment codes"):
             assignments_from_cninfo_changes([first, second])
