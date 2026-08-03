@@ -13,6 +13,39 @@ from scripts.market_data.tidb_flow_store import TiDBConfig, connect, ensure_flow
 from scripts.market_data.verified_flow import FLOW_SCHEMA_VERSION, ExactDateFlowSource
 
 
+def build_manifest(*, business_date: date, facts: list, checkpoints: list[dict]) -> dict:
+    fact_rows = [row.canonical() for row in sorted(facts, key=lambda row: row.key)]
+    coverage_bps = len(facts) * 10000 // len(SAMPLE_SYMBOLS)
+    data_available = coverage_bps >= 9800
+    facts_sha256 = sha256(fact_rows)
+    checkpoint_sha256 = sha256(checkpoints)
+    seed = {
+        "schema_version": FLOW_SCHEMA_VERSION,
+        "business_date": business_date.isoformat(),
+        "symbols": list(SAMPLE_SYMBOLS),
+        "facts_sha256": facts_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    manifest = {
+        "manifest_version": "m2-flow-boundary-manifest-v1",
+        "schema_version": FLOW_SCHEMA_VERSION,
+        "dataset_id": f"m2-flow-{business_date.isoformat()}-{sha256(seed)}",
+        "business_date": business_date.isoformat(),
+        "expected_symbol_count": len(SAMPLE_SYMBOLS),
+        "available_symbol_count": len(facts),
+        "coverage_percent": f"{coverage_bps / 100:.2f}",
+        "data_available": data_available,
+        "boundary_accepted": True,
+        "authoritative": False,
+        "simulation_orders_allowed": False,
+        "missing_value_policy": "missing remains unavailable; no zero, neutral-score, or stale-date substitution",
+        "strategy_policy": "flow factor is disabled and remaining verified weights must be renormalized when data_available=false",
+        "facts_sha256": facts_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    return manifest
+
+
 def run(*, business_date: date, output_dir: Path) -> dict:
     source = ExactDateFlowSource()
     facts = []
@@ -29,27 +62,8 @@ def run(*, business_date: date, output_dir: Path) -> dict:
                 "error_class": type(error).__name__,
                 "error_message": str(error)[:2000],
             })
-    fact_rows = [row.canonical() for row in sorted(facts, key=lambda row: row.key)]
-    coverage_bps = len(facts) * 10000 // len(SAMPLE_SYMBOLS)
-    data_available = coverage_bps >= 9800
-    seed = {"schema_version": FLOW_SCHEMA_VERSION, "business_date": business_date.isoformat(), "symbols": list(SAMPLE_SYMBOLS)}
-    manifest = {
-        "manifest_version": "m2-flow-boundary-manifest-v1",
-        "schema_version": FLOW_SCHEMA_VERSION,
-        "dataset_id": f"m2-flow-{business_date.isoformat()}-{sha256(seed)}",
-        "business_date": business_date.isoformat(),
-        "expected_symbol_count": len(SAMPLE_SYMBOLS),
-        "available_symbol_count": len(facts),
-        "coverage_percent": f"{coverage_bps / 100:.2f}",
-        "data_available": data_available,
-        "boundary_accepted": True,
-        "authoritative": False,
-        "simulation_orders_allowed": False,
-        "missing_value_policy": "missing remains unavailable; no zero, neutral-score, or stale-date substitution",
-        "strategy_policy": "flow factor is disabled and remaining verified weights must be renormalized when data_available=false",
-        "facts_sha256": sha256(fact_rows),
-        "checkpoint_sha256": sha256(checkpoints),
-    }
+    manifest = build_manifest(business_date=business_date, facts=facts, checkpoints=checkpoints)
+    data_available = bool(manifest["data_available"])
     connection = connect(TiDBConfig.from_env())
     try:
         ensure_flow_schema(connection)
