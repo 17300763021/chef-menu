@@ -27,8 +27,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v1"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v1"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v3"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v3"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
@@ -84,19 +84,21 @@ class DailyIncrementalPlan:
         return dict(self.expected_membership)
 
     def scope_canonical(self) -> dict[str, Any]:
+        """Return the stable business identity of one target-session capture.
+
+        Observation-time provenance remains in ``canonical`` and the manifest,
+        but it must not create a second checkpoint namespace when the target
+        session, predecessor, membership, and verification sample are unchanged.
+        """
         return {
             "schema_version": self.schema_version,
             "target_session": self.target_session.isoformat(),
             "previous_session": self.previous_session.isoformat(),
-            "snapshot_effective_session": self.snapshot_effective_session.isoformat(),
             "expected_membership": [
                 {"symbol": symbol, "index_code": index_code}
                 for symbol, index_code in self.expected_membership
             ],
             "verification_symbols": list(self.verification_symbols),
-            "primary_calendar_sha256": self.primary_calendar_sha256,
-            "secondary_calendar_sha256": self.secondary_calendar_sha256,
-            "universe_sha256": self.universe_sha256,
         }
 
     @property
@@ -107,6 +109,10 @@ class DailyIncrementalPlan:
         return {
             **self.scope_canonical(),
             "observed_at": self.observed_at.isoformat(),
+            "snapshot_effective_session": self.snapshot_effective_session.isoformat(),
+            "primary_calendar_sha256": self.primary_calendar_sha256,
+            "secondary_calendar_sha256": self.secondary_calendar_sha256,
+            "universe_sha256": self.universe_sha256,
             "accepted_existing_symbols": list(self.accepted_existing_symbols),
             "fetch_symbols": list(self.fetch_symbols),
             "scope_sha256": self.scope_sha256,
@@ -323,9 +329,9 @@ def build_incremental_evidence(
     list[HistoricalBar], list[AdjustmentEvent],
 ]:
     """Build deterministic non-authoritative evidence for one completed daily scope."""
-    primary_rows = sorted(primary_bars, key=lambda row: (row.symbol, row.business_date, row.source))
+    primary_rows = sorted(primary_bars, key=lambda row: (row.source, row.symbol, row.business_date))
     fact_rows = sorted(tradeability_facts, key=lambda row: (row.symbol, row.business_date))
-    verification_rows = sorted(verification_bars, key=lambda row: (row.symbol, row.business_date, row.source))
+    verification_rows = sorted(verification_bars, key=lambda row: (row.source, row.symbol, row.business_date))
     adjusted_rows = sorted(adjusted_bars, key=lambda row: (row.symbol, row.business_date))
     event_rows = sorted(adjustment_events, key=lambda row: (row.symbol, row.effective_date, row.source))
     gates = [*evaluate_daily_incremental(

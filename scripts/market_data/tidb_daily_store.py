@@ -11,16 +11,20 @@ import gzip
 import json
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from scripts.market_data.daily_adjustments import PreviousAdjustedState
+from scripts.market_data.contracts import DailyBar, parse_date
+from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
+from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
+from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v1"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v3"
+TRADEABILITY_QUANTUM = Decimal("0.01")
 
 
 def _compact(value: Any) -> str:
@@ -37,6 +41,47 @@ def _bool(value: Any) -> int | None:
 
 def _date_text(value: Any) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _tradeability_decimal(value: Any, field: str) -> str | None:
+    """Return the point-in-time price-limit contract's stable two-decimal form."""
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+        normalized = parsed.quantize(TRADEABILITY_QUANTUM)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"invalid {field}: {value!r}") from error
+    if not parsed.is_finite() or parsed != normalized:
+        raise ValueError(f"{field} exceeds the two-decimal tradeability contract: {value!r}")
+    return format(normalized, "f")
+
+
+def _canonical_tradeability_fact(row: Mapping[str, Any]) -> dict[str, Any]:
+    reasons = row["block_reasons"]
+    if not isinstance(reasons, (list, tuple)) or not all(isinstance(reason, str) for reason in reasons):
+        raise ValueError("tradeability block_reasons must be a list or tuple of strings")
+    return {
+        "symbol": str(row["symbol"]),
+        "business_date": _date_text(row["business_date"]),
+        "index_code": str(row["index_code"]),
+        "has_primary_bar": bool(row["has_primary_bar"]),
+        "has_secondary_status": bool(row["has_secondary_status"]),
+        "is_suspended": bool(row["is_suspended"]),
+        "is_st": None if row.get("is_st") is None else bool(row["is_st"]),
+        "listing_age_sessions": int(row["listing_age_sessions"]),
+        "limit_rate": _tradeability_decimal(row.get("limit_rate"), "limit_rate"),
+        "limit_up": _tradeability_decimal(row.get("limit_up"), "limit_up"),
+        "limit_down": _tradeability_decimal(row.get("limit_down"), "limit_down"),
+        "at_limit_up": bool(row["at_limit_up"]),
+        "at_limit_down": bool(row["at_limit_down"]),
+        "one_price_limit_up": bool(row["one_price_limit_up"]),
+        "one_price_limit_down": bool(row["one_price_limit_down"]),
+        "can_buy": bool(row["can_buy"]),
+        "can_sell": bool(row["can_sell"]),
+        "block_reasons": list(reasons),
+        "schema_version": str(row["schema_version"]),
+    }
 
 
 def _read_gzip_json(path: Path) -> list[dict[str, Any]]:
@@ -126,6 +171,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       verification_required TINYINT NOT NULL,
       verification_present TINYINT NOT NULL,
       reported_previous_close DECIMAL(18,4) NULL,
+      status_source VARCHAR(96) NULL,
+      reported_previous_close_source VARCHAR(96) NULL,
+      checkpoint_origin_dataset_id VARCHAR(160) NULL,
       primary_sha256 CHAR(64) NULL,
       adjusted_sha256 CHAR(64) NULL,
       tradeability_sha256 CHAR(64) NULL,
@@ -259,6 +307,19 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       PRIMARY KEY (dataset_id, symbol, effective_date)
     )
     """,
+    """
+    ALTER TABLE m2_daily_symbol_checkpoints
+      ADD COLUMN IF NOT EXISTS status_source VARCHAR(96) NULL AFTER reported_previous_close
+    """,
+    """
+    ALTER TABLE m2_daily_symbol_checkpoints
+      ADD COLUMN IF NOT EXISTS reported_previous_close_source VARCHAR(96) NULL AFTER status_source
+    """,
+    """
+    ALTER TABLE m2_daily_symbol_checkpoints
+      ADD COLUMN IF NOT EXISTS checkpoint_origin_dataset_id VARCHAR(160) NULL
+      AFTER reported_previous_close_source
+    """,
 )
 
 
@@ -351,15 +412,20 @@ CHECKPOINT_UPSERT = """
 INSERT INTO m2_daily_symbol_checkpoints (
   dataset_id, symbol, target_session, status, primary_present, adjusted_present,
   tradeability_present, verification_required, verification_present,
-  reported_previous_close, primary_sha256, adjusted_sha256, tradeability_sha256,
+  reported_previous_close, status_source, reported_previous_close_source,
+  checkpoint_origin_dataset_id,
+  primary_sha256, adjusted_sha256, tradeability_sha256,
   verification_sha256, adjustments_sha256, error_class, error_message
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON DUPLICATE KEY UPDATE
   target_session=VALUES(target_session), status=VALUES(status),
   primary_present=VALUES(primary_present), adjusted_present=VALUES(adjusted_present),
   tradeability_present=VALUES(tradeability_present),
   verification_required=VALUES(verification_required), verification_present=VALUES(verification_present),
-  reported_previous_close=VALUES(reported_previous_close), primary_sha256=VALUES(primary_sha256),
+  reported_previous_close=VALUES(reported_previous_close), status_source=VALUES(status_source),
+  reported_previous_close_source=VALUES(reported_previous_close_source),
+  checkpoint_origin_dataset_id=VALUES(checkpoint_origin_dataset_id),
+  primary_sha256=VALUES(primary_sha256),
   adjusted_sha256=VALUES(adjusted_sha256), tradeability_sha256=VALUES(tradeability_sha256),
   verification_sha256=VALUES(verification_sha256), adjustments_sha256=VALUES(adjustments_sha256),
   error_class=VALUES(error_class), error_message=VALUES(error_message)
@@ -402,6 +468,7 @@ def _adjusted_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[t
 
 
 def _fact_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    canonical_rows = [_canonical_tradeability_fact(row) for row in rows]
     return [(
         dataset_id, row["symbol"], row["business_date"], row["index_code"],
         _bool(row["has_primary_bar"]), _bool(row["has_secondary_status"]),
@@ -411,7 +478,7 @@ def _fact_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple
         _bool(row["one_price_limit_up"]), _bool(row["one_price_limit_down"]),
         _bool(row["can_buy"]), _bool(row["can_sell"]), _compact(row["block_reasons"]),
         row["schema_version"], sha256(row),
-    ) for row in rows]
+    ) for row in canonical_rows]
 
 
 def _event_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
@@ -454,7 +521,10 @@ def publish_daily_symbol_checkpoint(
         raise ValueError(f"daily symbol checkpoint contains other symbols: {sorted(observed_symbols)}")
     primary_rows = [row for row in evidence.primary_bars if row.get("symbol") == symbol]
     adjusted_rows = [row for row in evidence.adjusted_bars if row.get("symbol") == symbol]
-    fact_rows = [row for row in evidence.tradeability if row.get("symbol") == symbol]
+    fact_rows = [
+        _canonical_tradeability_fact(row)
+        for row in evidence.tradeability if row.get("symbol") == symbol
+    ]
     verification_rows = [row for row in evidence.verification_bars if row.get("symbol") == symbol]
     event_rows = [row for row in evidence.adjustments if row.get("symbol") == symbol]
     if len(primary_rows) > 1 or len(adjusted_rows) > 1 or len(fact_rows) > 1 or len(verification_rows) > 1:
@@ -491,6 +561,8 @@ def publish_daily_symbol_checkpoint(
         dataset_id, symbol, target_session.isoformat(), status, int(bool(primary_rows)),
         int(bool(adjusted_rows)), int(bool(fact_rows)), int(verification_required),
         int(bool(verification_rows)), _decimal(reported_previous_close),
+        evidence.manifest.get("status_source"), evidence.manifest.get("previous_close_source"),
+        evidence.manifest.get("checkpoint_origin_dataset_id"),
         sha256(primary_rows) if primary_rows else None,
         sha256(adjusted_rows) if adjusted_rows else None,
         sha256(fact_rows) if fact_rows else None,
@@ -511,7 +583,9 @@ def _query_all(connection: Any, sql: str, params: tuple[Any, ...]) -> list[tuple
 
 def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[DailyEvidence, dict[str, Any]]:
     checkpoints = _query_all(connection, """
-        SELECT symbol, status, verification_required, reported_previous_close, error_class, error_message,
+        SELECT symbol, status, verification_required, reported_previous_close,
+               status_source, reported_previous_close_source, error_class, error_message,
+               checkpoint_origin_dataset_id,
                primary_sha256, adjusted_sha256, tradeability_sha256,
                verification_sha256, adjustments_sha256
         FROM m2_daily_symbol_checkpoints
@@ -525,9 +599,18 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "reported_previous_closes": {
             str(row[0]): Decimal(str(row[3])) for row in checkpoints if row[3] is not None
         },
+        "status_sources": {
+            str(row[0]): str(row[4]) for row in checkpoints if row[4] is not None
+        },
+        "reported_previous_close_sources": {
+            str(row[0]): str(row[5]) for row in checkpoints if row[5] is not None
+        },
+        "checkpoint_origin_dataset_ids": {
+            str(row[0]): str(row[8]) for row in checkpoints if row[8] is not None
+        },
         "errors": {
-            str(row[0]): f"{row[4] or 'RuntimeError'}: {row[5] or 'incomplete daily evidence'}"
-            for row in checkpoints if row[4] or row[5]
+            str(row[0]): f"{row[6] or 'RuntimeError'}: {row[7] or 'incomplete daily evidence'}"
+            for row in checkpoints if row[6] or row[7]
         },
     }
     if not retained:
@@ -543,7 +626,8 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         SELECT symbol, business_date, source, exchange, open_price, high, low, close_price,
                previous_close, volume_shares, amount_cny, turnover_percent, trade_status,
                is_st, adjustment, source_schema_version, row_sha256
-        FROM m2_daily_primary_bars WHERE dataset_id=%s ORDER BY symbol, business_date
+        FROM m2_daily_primary_bars
+        WHERE dataset_id=%s ORDER BY source, symbol, business_date
     """, (dataset_id,)))
     adjusted = keep(_query_all(connection, """
         SELECT symbol, business_date, exchange, index_code, open_price, high, low, close_price,
@@ -564,7 +648,8 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         SELECT symbol, business_date, source, exchange, open_price, high, low, close_price,
                previous_close, volume_shares, amount_cny, turnover_percent, trade_status,
                is_st, adjustment, source_schema_version, row_sha256
-        FROM m2_daily_verification_bars WHERE dataset_id=%s ORDER BY symbol, business_date
+        FROM m2_daily_verification_bars
+        WHERE dataset_id=%s ORDER BY source, symbol, business_date
     """, (dataset_id,)))
     events = keep(_query_all(connection, """
         SELECT symbol, effective_date, qfq_factor, hfq_factor, source, row_sha256
@@ -596,17 +681,17 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "hfq_close": _decimal(row[21]), "primary_source": row[22],
         "factor_source": row[23], "schema_version": row[24],
     } for row in adjusted]
-    canonical_facts = [{
+    canonical_facts = [_canonical_tradeability_fact({
         "symbol": str(row[0]), "business_date": _date_text(row[1]), "index_code": row[2],
         "has_primary_bar": bool(row[3]), "has_secondary_status": bool(row[4]),
         "is_suspended": bool(row[5]), "is_st": None if row[6] is None else bool(row[6]),
-        "listing_age_sessions": int(row[7]), "limit_rate": _decimal(row[8]),
-        "limit_up": _decimal(row[9]), "limit_down": _decimal(row[10]),
+        "listing_age_sessions": int(row[7]), "limit_rate": row[8],
+        "limit_up": row[9], "limit_down": row[10],
         "at_limit_up": bool(row[11]), "at_limit_down": bool(row[12]),
         "one_price_limit_up": bool(row[13]), "one_price_limit_down": bool(row[14]),
         "can_buy": bool(row[15]), "can_sell": bool(row[16]),
         "block_reasons": json.loads(row[17]), "schema_version": row[18],
-    } for row in facts]
+    }) for row in facts]
     canonical_verification = [daily_bar(row) for row in verification]
     canonical_events = [{
         "symbol": str(row[0]), "effective_date": _date_text(row[1]),
@@ -642,8 +727,8 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "adjustments": evidence.adjustments,
     }
     checkpoint_hash_positions = {
-        "primary": 6, "adjusted": 7, "tradeability": 8,
-        "verification": 9, "adjustments": 10,
+        "primary": 9, "adjusted": 10, "tradeability": 11,
+        "verification": 12, "adjustments": 13,
     }
     for checkpoint in checkpoints:
         symbol = str(checkpoint[0])
@@ -657,6 +742,306 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
                     f"stored={stored_hash} actual={expected_hash}"
                 )
     return evidence, metadata
+
+
+def _publish_recovered_checkpoints_batch(
+    connection: Any,
+    *,
+    dataset_id: str,
+    target_session: date,
+    verification_symbols: set[str],
+    choices: Mapping[
+        str,
+        tuple[tuple[int, int, str], str, DailyEvidence, Decimal | None, str, str],
+    ],
+) -> None:
+    """Publish validated missing checkpoints in one transaction."""
+    if not choices:
+        return
+    symbols = sorted(choices)
+    placeholders = ",".join(["%s"] * len(symbols))
+    primary_rows: list[Mapping[str, Any]] = []
+    adjusted_rows: list[Mapping[str, Any]] = []
+    fact_rows: list[Mapping[str, Any]] = []
+    verification_rows: list[Mapping[str, Any]] = []
+    event_rows: list[Mapping[str, Any]] = []
+    checkpoint_rows: list[tuple[Any, ...]] = []
+    for symbol in symbols:
+        _rank, candidate_id, evidence, reported, status_source, previous_source = choices[symbol]
+        canonical_facts = [_canonical_tradeability_fact(row) for row in evidence.tradeability]
+        primary_rows.extend(evidence.primary_bars)
+        adjusted_rows.extend(evidence.adjusted_bars)
+        fact_rows.extend(canonical_facts)
+        verification_rows.extend(evidence.verification_bars)
+        event_rows.extend(evidence.adjustments)
+        checkpoint_rows.append((
+            dataset_id, symbol, target_session.isoformat(), "succeeded",
+            int(bool(evidence.primary_bars)), int(bool(evidence.adjusted_bars)),
+            int(bool(canonical_facts)), int(symbol in verification_symbols),
+            int(bool(evidence.verification_bars)), _decimal(reported),
+            status_source, previous_source, candidate_id,
+            sha256(evidence.primary_bars) if evidence.primary_bars else None,
+            sha256(evidence.adjusted_bars) if evidence.adjusted_bars else None,
+            sha256(canonical_facts) if canonical_facts else None,
+            sha256(evidence.verification_bars) if evidence.verification_bars else None,
+            sha256(evidence.adjustments) if evidence.adjustments else None,
+            None, None,
+        ))
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT accepted FROM m2_daily_runs WHERE dataset_id=%s", (dataset_id,))
+            accepted_rows = cursor.fetchall()
+            if accepted_rows and bool(accepted_rows[0][0]):
+                raise RuntimeError(f"accepted daily dataset is immutable: {dataset_id}")
+            for table in (
+                "m2_daily_primary_bars", "m2_daily_adjusted_bars",
+                "m2_daily_tradeability_facts", "m2_daily_verification_bars",
+                "m2_daily_adjustment_events",
+            ):
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE dataset_id=%s AND symbol IN ({placeholders})",
+                    (dataset_id, *symbols),
+                )
+        _upsert_many(connection, PRIMARY_UPSERT, _primary_rows(dataset_id, primary_rows))
+        _upsert_many(connection, ADJUSTED_UPSERT, _adjusted_rows(dataset_id, adjusted_rows))
+        _upsert_many(connection, TRADEABILITY_UPSERT, _fact_rows(dataset_id, fact_rows))
+        _upsert_many(connection, VERIFICATION_UPSERT, _primary_rows(dataset_id, verification_rows))
+        _upsert_many(connection, ADJUSTMENT_UPSERT, _event_rows(dataset_id, event_rows))
+        _upsert_many(connection, CHECKPOINT_UPSERT, checkpoint_rows)
+        connection.commit()
+    except BaseException:
+        if hasattr(connection, "rollback"):
+            connection.rollback()
+        raise
+
+
+def _recovered_lineage_matches(
+    *,
+    symbol: str,
+    target_session: date,
+    index_code: str,
+    evidence: DailyEvidence,
+    reported_previous_close: Decimal | None,
+    previous_states: Mapping[str, PreviousAdjustedState],
+) -> bool:
+    """Rebuild one candidate adjusted row against the active predecessor."""
+    if not evidence.primary_bars:
+        return not evidence.adjusted_bars
+    state = previous_states.get(symbol)
+    if state is None or reported_previous_close is None:
+        return False
+    row = evidence.primary_bars[0]
+    primary = DailyBar(
+        source=str(row["source"]), symbol=str(row["symbol"]), exchange=str(row["exchange"]),
+        business_date=parse_date(row["business_date"]), open=Decimal(str(row["open"])),
+        high=Decimal(str(row["high"])), low=Decimal(str(row["low"])),
+        close=Decimal(str(row["close"])),
+        previous_close=None if row.get("previous_close") is None else Decimal(str(row["previous_close"])),
+        volume_shares=int(row["volume_shares"]), amount_cny=Decimal(str(row["amount_cny"])),
+        turnover_percent=(
+            None if row.get("turnover_percent") is None
+            else Decimal(str(row["turnover_percent"]))
+        ),
+        trade_status=str(row["trade_status"]), is_st=row.get("is_st"),
+        adjustment=str(row.get("adjustment", "none")), schema_version=str(row["schema_version"]),
+    )
+    events = [
+        AdjustmentEvent(
+            symbol=str(item["symbol"]), effective_date=parse_date(item["effective_date"]),
+            qfq_factor=Decimal(str(item["qfq_factor"])),
+            hfq_factor=Decimal(str(item["hfq_factor"])), source=str(item["source"]),
+        )
+        for item in evidence.adjustments
+    ]
+    try:
+        rebuilt = build_daily_adjusted_bars(
+            target_session=target_session,
+            previous_session=state.business_date,
+            membership={symbol: index_code},
+            primary_bars=[primary],
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: reported_previous_close},
+            adjustment_events=events,
+        )
+    except (RuntimeError, ValueError):
+        return False
+    return len(rebuilt) == 1 and rebuilt[0].canonical() == evidence.adjusted_bars[0]
+
+
+def _daily_bar_from_canonical(row: Mapping[str, Any]) -> DailyBar:
+    return DailyBar(
+        source=str(row["source"]), symbol=str(row["symbol"]), exchange=str(row["exchange"]),
+        business_date=parse_date(row["business_date"]), open=Decimal(str(row["open"])),
+        high=Decimal(str(row["high"])), low=Decimal(str(row["low"])),
+        close=Decimal(str(row["close"])),
+        previous_close=None if row.get("previous_close") is None else Decimal(str(row["previous_close"])),
+        volume_shares=int(row["volume_shares"]), amount_cny=Decimal(str(row["amount_cny"])),
+        turnover_percent=(
+            None if row.get("turnover_percent") is None else Decimal(str(row["turnover_percent"]))
+        ),
+        trade_status=str(row["trade_status"]), is_st=row.get("is_st"),
+        adjustment=str(row.get("adjustment", "none")), schema_version=str(row["schema_version"]),
+    )
+
+
+def _recovered_verification_matches(
+    primary: list[dict[str, Any]],
+    verification: list[dict[str, Any]],
+) -> bool:
+    if not primary:
+        return not verification
+    if len(primary) != 1 or len(verification) != 1:
+        return False
+    return not cross_source_consistency_errors(
+        _daily_bar_from_canonical(primary[0]),
+        _daily_bar_from_canonical(verification[0]),
+    )
+
+
+def recover_compatible_daily_checkpoints(
+    connection: Any,
+    *,
+    dataset_id: str,
+    target_session: date,
+    expected_membership: Mapping[str, str],
+    verification_symbols: Iterable[str],
+    previous_states: Mapping[str, PreviousAdjustedState],
+    existing_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy only validated successful evidence into a stable daily namespace.
+
+    Earlier unaccepted retries may have used observation-dependent dataset ids.
+    Their rows remain untouched.  This function validates every source dataset
+    through normal hash readback, chooses a deterministic preferred source per
+    symbol, and republishes the selected evidence through the ordinary atomic
+    checkpoint writer.
+    """
+    expected = dict(expected_membership)
+    required_verification = set(verification_symbols)
+    if existing_metadata is None:
+        _existing, loaded_metadata = load_daily_checkpoint_evidence(connection, dataset_id)
+    else:
+        loaded_metadata = existing_metadata
+    already_present = set(loaded_metadata["succeeded_symbols"])
+    missing_symbols = sorted(set(expected) - already_present)
+    if not missing_symbols:
+        return {
+            "already_present": len(already_present),
+            "recovered": 0,
+            "candidate_datasets": 0,
+            "recovered_by_source_dataset": {},
+            "rejected_datasets": {},
+        }
+    placeholders = ",".join(["%s"] * len(missing_symbols))
+    candidate_rows = _query_all(connection, f"""
+        SELECT DISTINCT checkpoint.dataset_id
+        FROM m2_daily_symbol_checkpoints AS checkpoint
+        LEFT JOIN m2_daily_runs AS aggregate ON aggregate.dataset_id=checkpoint.dataset_id
+        WHERE checkpoint.target_session=%s AND checkpoint.dataset_id<>%s
+          AND checkpoint.status='succeeded'
+          AND checkpoint.symbol IN ({placeholders})
+          AND (aggregate.accepted IS NULL OR aggregate.accepted=0)
+        ORDER BY checkpoint.dataset_id
+    """, (target_session.isoformat(), dataset_id, *missing_symbols))
+
+    source_rank = {
+        "akshare_eastmoney": 0,
+        "akshare_sina": 1,
+        "tencent_archive": 2,
+    }
+    choices: dict[str, tuple[tuple[int, int, str], str, DailyEvidence, Decimal | None, str, str]] = {}
+    rejected_datasets: dict[str, str] = {}
+    for row in candidate_rows:
+        candidate_id = str(row[0])
+        try:
+            evidence, metadata = load_daily_checkpoint_evidence(connection, candidate_id)
+        except Exception as error:
+            rejected_datasets[candidate_id] = f"{type(error).__name__}: {error}"
+            continue
+        succeeded = set(metadata["succeeded_symbols"])
+        for symbol in sorted((succeeded & set(expected)) - already_present):
+            primary = [item for item in evidence.primary_bars if item["symbol"] == symbol]
+            adjusted = [item for item in evidence.adjusted_bars if item["symbol"] == symbol]
+            facts = [item for item in evidence.tradeability if item["symbol"] == symbol]
+            verification = [item for item in evidence.verification_bars if item["symbol"] == symbol]
+            events = [item for item in evidence.adjustments if item["symbol"] == symbol]
+            if len(facts) != 1 or facts[0]["index_code"] != expected[symbol]:
+                continue
+            if len(primary) > 1 or len(adjusted) > 1 or len(verification) > 1:
+                continue
+            if bool(primary) != bool(adjusted):
+                continue
+            if symbol in required_verification and primary and len(verification) != 1:
+                continue
+            if symbol in required_verification and not _recovered_verification_matches(primary, verification):
+                continue
+            if not primary and not (facts[0]["has_secondary_status"] and facts[0]["is_suspended"]):
+                continue
+            reported = metadata["reported_previous_closes"].get(symbol)
+            if primary and reported is None:
+                continue
+            selected_evidence = DailyEvidence(
+                manifest={"authoritative": False, "simulation_orders_allowed": False},
+                primary_bars=primary,
+                adjusted_bars=adjusted,
+                tradeability=facts,
+                verification_bars=verification,
+                adjustments=events,
+            )
+            if not _recovered_lineage_matches(
+                symbol=symbol,
+                target_session=target_session,
+                index_code=expected[symbol],
+                evidence=selected_evidence,
+                reported_previous_close=reported,
+                previous_states=previous_states,
+            ):
+                continue
+            status_source = metadata["status_sources"].get(symbol, "legacy_baostock_daily_status")
+            previous_source = metadata["reported_previous_close_sources"].get(
+                symbol,
+                "legacy_baostock_reported_preclose" if reported is not None else "unavailable",
+            )
+            selected = DailyEvidence(
+                manifest={
+                    "authoritative": False,
+                    "simulation_orders_allowed": False,
+                    "status_source": status_source,
+                    "previous_close_source": previous_source,
+                    "checkpoint_origin_dataset_id": candidate_id,
+                },
+                primary_bars=selected_evidence.primary_bars,
+                adjusted_bars=selected_evidence.adjusted_bars,
+                tradeability=selected_evidence.tradeability,
+                verification_bars=selected_evidence.verification_bars,
+                adjustments=selected_evidence.adjustments,
+            )
+            primary_name = str(primary[0]["source"]) if primary else ""
+            rank = (source_rank.get(primary_name, 99), -len(succeeded), candidate_id)
+            previous_choice = choices.get(symbol)
+            if previous_choice is None or rank < previous_choice[0]:
+                choices[symbol] = (
+                    rank, candidate_id, selected, reported, status_source, previous_source,
+                )
+
+    recovered_by_source: dict[str, int] = {}
+    for symbol in sorted(choices):
+        _rank, candidate_id, _selected, _reported, _status_source, _previous_source = choices[symbol]
+        recovered_by_source[candidate_id] = recovered_by_source.get(candidate_id, 0) + 1
+    _publish_recovered_checkpoints_batch(
+        connection,
+        dataset_id=dataset_id,
+        target_session=target_session,
+        verification_symbols=required_verification,
+        choices=choices,
+    )
+    return {
+        "already_present": len(already_present),
+        "recovered": len(choices),
+        "candidate_datasets": len(candidate_rows),
+        "recovered_by_source_dataset": dict(sorted(recovered_by_source.items())),
+        "rejected_datasets": rejected_datasets,
+    }
 
 
 def load_previous_adjusted_states(

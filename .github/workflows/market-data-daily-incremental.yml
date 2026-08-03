@@ -24,9 +24,12 @@ on:
       - scripts/market_data/daily_*.py
       - scripts/market_data/tidb_daily_store.py
       - scripts/market_data/sources/akshare_history_source.py
+      - scripts/market_data/sources/eastmoney_market_state_source.py
+      - scripts/market_data/sources/tencent_history_source.py
       - scripts/test_market_data_daily_incremental.py
       - scripts/test_market_data_daily_quota.py
       - scripts/test_tidb_daily_store.py
+      - scripts/test_eastmoney_market_state_source.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
 
@@ -65,6 +68,7 @@ jobs:
           python -m scripts.test_adjustment_engine
           python -m scripts.test_tradeability
           python -m scripts.test_baostock_calendar_source
+          python -m scripts.test_eastmoney_market_state_source
           python -m scripts.test_baostock_history_source
 
   quota-gate:

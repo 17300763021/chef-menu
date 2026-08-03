@@ -20,6 +20,7 @@ from scripts.market_data.daily_incremental import (
     write_outputs,
 )
 from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
+from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -218,6 +219,24 @@ class DailyIncrementalTests(unittest.TestCase):
         )
         self.assertEqual(friday.target_session, weekend.target_session)
         self.assertEqual(friday.scope_sha256, weekend.scope_sha256)
+
+    def test_scope_identity_ignores_provenance_but_not_membership(self) -> None:
+        baseline = small_plan()
+        changed_provenance = replace(
+            baseline,
+            observed_at=datetime(2026, 7, 29, 17, 0, tzinfo=SHANGHAI),
+            snapshot_effective_session=TARGET,
+            primary_calendar_sha256="d" * 64,
+            secondary_calendar_sha256="e" * 64,
+            universe_sha256="f" * 64,
+        )
+        self.assertEqual(baseline.scope_sha256, changed_provenance.scope_sha256)
+        self.assertNotEqual(baseline.canonical(), changed_provenance.canonical())
+        changed_membership = replace(
+            baseline,
+            expected_membership=(("000001", "000300"), ("600519", "000300")),
+        )
+        self.assertNotEqual(baseline.scope_sha256, changed_membership.scope_sha256)
 
     def test_invalid_universe_size_or_overlap_fails_closed(self) -> None:
         snapshots = self.full_snapshots()
@@ -625,6 +644,48 @@ class DailyIncrementalTests(unittest.TestCase):
                     first[5],
                 )
             self.assertFalse((Path(temporary) / "invalid").exists())
+
+    def test_returned_market_rows_use_the_manifest_hash_order(self) -> None:
+        baseline = healthy_evidence()
+        primary_source_by_symbol = {"000001": "z_primary", "600519": "a_primary"}
+        verification_source_by_symbol = {"000001": "z_verification", "600519": "a_verification"}
+        primary = [
+            replace(row, source=primary_source_by_symbol[row.symbol])
+            for row in baseline[1]
+        ]
+        verification = [
+            replace(row, source=verification_source_by_symbol[row.symbol])
+            for row in baseline[3]
+        ]
+        adjusted = [
+            replace(row, primary_source=primary_source_by_symbol[row.symbol])
+            for row in baseline[4]
+        ]
+        result = build_incremental_evidence(
+            plan=small_plan(), primary_bars=primary, tradeability_facts=baseline[2],
+            verification_bars=verification, adjusted_bars=adjusted,
+            adjustment_events=baseline[5],
+            previous_adjusted_states={
+                symbol: PreviousAdjustedState(
+                    symbol=symbol, business_date=PREVIOUS, raw_close=Decimal("10"),
+                    qfq_factor=Decimal("1"), hfq_factor=Decimal("1"),
+                    source_dataset_id="fixture-predecessor",
+                )
+                for symbol in ("000001", "600519")
+            },
+            accepted_previous_closes={"000001": Decimal("10"), "600519": Decimal("10")},
+            reported_previous_closes={"000001": Decimal("10"), "600519": Decimal("10")},
+        )
+        manifest, returned_primary, _facts, returned_verification, _adjusted, _events = result
+        self.assertEqual([row.source for row in returned_primary], ["a_primary", "z_primary"])
+        self.assertEqual(
+            manifest["primary_sha256"],
+            sha256([row.canonical() for row in returned_primary]),
+        )
+        self.assertEqual(
+            manifest["verification_sha256"],
+            sha256([row.canonical() for row in returned_verification]),
+        )
 
 
 if __name__ == "__main__":

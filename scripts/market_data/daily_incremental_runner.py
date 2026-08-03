@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -45,6 +45,8 @@ from scripts.market_data.sources.akshare_history_source import (
 )
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
+from scripts.market_data.sources.eastmoney_market_state_source import EastmoneySuspensionSource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     TiDBConfig,
@@ -57,6 +59,7 @@ from scripts.market_data.tidb_daily_store import (
     load_previous_adjusted_states,
     publish_daily_run,
     publish_daily_symbol_checkpoint,
+    recover_compatible_daily_checkpoints,
 )
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -68,9 +71,14 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
     "993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged"
 )
 SYMBOL_DEADLINE_SECONDS = 90
+CALENDAR_DEADLINE_SECONDS = 180
 
 
 class DailySymbolTimeout(BaseException):
+    pass
+
+
+class DailyPrerequisiteTimeout(BaseException):
     pass
 
 
@@ -89,6 +97,33 @@ def symbol_deadline(seconds: int):
 
     def raise_timeout(signum: int, frame: object) -> None:
         raise DailySymbolTimeout(f"daily symbol acquisition exceeded {seconds} seconds")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+@contextmanager
+def prerequisite_deadline(seconds: int):
+    """Bound cloud-only prerequisite calls that may block inside vendor sockets."""
+    try:
+        import signal
+    except ImportError:
+        yield
+        return
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(signum: int, frame: object) -> None:
+        raise DailyPrerequisiteTimeout(
+            f"daily calendar prerequisites exceeded {seconds} seconds"
+        )
 
     signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -194,9 +229,16 @@ def _checkpoint_evidence(
     verification: DailyBar | None,
     adjusted: HistoricalBar | None,
     events: Iterable[AdjustmentEvent],
+    status_source: str | None = None,
+    previous_close_source: str | None = None,
 ) -> DailyEvidence:
     return DailyEvidence(
-        manifest={"authoritative": False, "simulation_orders_allowed": False},
+        manifest={
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "status_source": status_source,
+            "previous_close_source": previous_close_source,
+        },
         primary_bars=[] if primary is None else [primary.canonical()],
         tradeability=[] if fact is None else [fact.canonical()],
         verification_bars=[] if verification is None else [verification.canonical()],
@@ -222,7 +264,9 @@ def capture_symbol(
     symbol: str,
     primary_source: AkshareEastmoneyHistorySource,
     verification_source: AkshareHistorySource,
-    secondary_source: BaostockHistorySource,
+    secondary_source: BaostockHistorySource | None,
+    fallback_suspended_symbols: frozenset[str] = frozenset(),
+    fallback_status_available: bool = True,
     previous_states: dict[str, PreviousAdjustedState],
     ipo_dates: dict[str, date],
     calendar_dates: tuple[date, ...],
@@ -230,14 +274,6 @@ def capture_symbol(
     """Capture one symbol and classify its resumable checkpoint state."""
     target = plan.target_session
     verification_required = symbol in set(plan.verification_symbols)
-    status_rows = secondary_source.fetch_status(symbol, target, target)
-    secondary = status_rows.get(target)
-    if secondary is None:
-        raise RuntimeError(f"secondary status missing for {symbol}:{target.isoformat()}")
-    reported = Decimal(str(secondary["preclose"])) if str(secondary.get("preclose", "")).strip() else None
-    trade_status = str(secondary.get("tradestatus", "")).strip()
-    if trade_status not in {"0", "1"}:
-        raise RuntimeError(f"secondary trade status is unknown for {symbol}:{target.isoformat()}")
     ipo_date = ipo_dates.get(symbol)
     if ipo_date is None:
         raise RuntimeError(f"base security reference missing for {symbol}")
@@ -248,10 +284,47 @@ def capture_symbol(
     events: list[AdjustmentEvent] = []
     recoverable_error: Exception | None = None
     primary_source_name: str | None = None
+    reported: Decimal | None = None
+    status_source: str | None = None
+    previous_close_source: str | None = None
+    secondary: dict[str, str] | None = None
+
+    if secondary_source is not None:
+        status_rows = secondary_source.fetch_status(symbol, target, target)
+        secondary = status_rows.get(target)
+        if secondary is None:
+            raise RuntimeError(f"secondary status missing for {symbol}:{target.isoformat()}")
+        trade_status = str(secondary.get("tradestatus", "")).strip()
+        if trade_status not in {"0", "1"}:
+            raise RuntimeError(f"secondary trade status is unknown for {symbol}:{target.isoformat()}")
+        reported = Decimal(str(secondary["preclose"])) if str(secondary.get("preclose", "")).strip() else None
+        status_source = "baostock_daily_status"
+        previous_close_source = "baostock_reported_preclose" if reported is not None else None
+    elif fallback_status_available:
+        trade_status = "0" if symbol in fallback_suspended_symbols else "1"
+        secondary = {"tradestatus": trade_status, "isST": "", "preclose": ""}
+        status_source = EastmoneySuspensionSource.name
+    else:
+        trade_status = "1"
+
     if trade_status == "1":
         try:
-            raw_map, primary_source_name = primary_source.fetch_raw_with_fallback(symbol, target, target)
-            primary = _one_target_row(raw_map.values(), symbol, target, "primary source")
+            if secondary_source is None:
+                raw_map, primary_source_name, reported, previous_close_source = (
+                    primary_source.fetch_daily_raw_with_reference(
+                        symbol, plan.previous_session, target,
+                    )
+                )
+                if secondary is not None:
+                    secondary["preclose"] = format(reported, "f")
+            else:
+                raw_map, primary_source_name = primary_source.fetch_raw_with_fallback(symbol, target, target)
+            primary = _one_target_row(
+                (row for row in raw_map.values() if row.business_date == target),
+                symbol,
+                target,
+                "primary source",
+            )
         except Exception as error:
             recoverable_error = error
 
@@ -264,10 +337,12 @@ def capture_symbol(
         if fact.is_suspended and fact.has_secondary_status:
             return _checkpoint_evidence(
                 primary=None, fact=fact, verification=None, adjusted=None, events=[],
+                status_source=status_source, previous_close_source=previous_close_source,
             ), reported, "succeeded", None
         error = recoverable_error or RuntimeError(f"active primary bar missing for {symbol}")
         return _checkpoint_evidence(
             primary=None, fact=fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
         ), reported, "blocked", error
 
     state = previous_states.get(symbol)
@@ -285,12 +360,28 @@ def capture_symbol(
         )
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
         ), reported, "blocked", error
     if reported is None or reported <= 0:
         raise RuntimeError(f"positive reported previous close missing for {symbol}")
     try:
-        if has_price_break(state.raw_close, reported):
-            events = _target_events(primary_source, symbol, target)
+        if has_price_break(state.raw_close, reported) or previous_close_source in {
+            "akshare_sina_exact_predecessor_close",
+            "tencent_exact_predecessor_close",
+        }:
+            try:
+                events = _target_events(primary_source, symbol, target)
+            except RuntimeError as factor_error:
+                if (
+                    primary_source_name != "akshare_sina"
+                    or not str(factor_error).startswith("AKShare Sina returned no ")
+                ):
+                    raise
+                continuity_source = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
+                previous_close_source = f"{previous_close_source}+{continuity_source}"
         adjusted_rows = build_daily_adjusted_bars(
             target_session=target, previous_session=plan.previous_session,
             membership=plan.membership, primary_bars=[primary], previous_states={symbol: state},
@@ -310,6 +401,7 @@ def capture_symbol(
         )
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
         ), reported, "blocked", error
     if verification_required:
         try:
@@ -322,6 +414,7 @@ def capture_symbol(
 
     evidence = _checkpoint_evidence(
         primary=primary, fact=fact, verification=verification, adjusted=adjusted, events=events,
+        status_source=status_source, previous_close_source=previous_close_source,
     )
     if verification_required and verification is None:
         assert recoverable_error is not None
@@ -360,7 +453,19 @@ def run(
     if symbol_attempts < 1 or symbol_attempts > 3:
         raise ValueError("symbol attempts must be between 1 and 3")
     observed = observed_at.astimezone(SHANGHAI)
-    primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_prerequisites_started",
+        phase="calendars",
+        observed_date=observed.date().isoformat(),
+        deadline_seconds=CALENDAR_DEADLINE_SECONDS,
+    )
+    with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
+        primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_calendars_loaded",
+        primary_sessions=len(primary_calendar.open_dates),
+        secondary_sessions=len(secondary_calendar.open_dates),
+    )
     if not accepted(calendar_gates):
         raise RuntimeError("daily primary and secondary calendars are not aligned")
 
@@ -385,10 +490,17 @@ def run(
         _progress(**result)
         return result
 
+    _progress("daily_prerequisites_started", phase="point_in_time_universe")
     csi = CsiIndexSource()
     current = csi.fetch_current()
     events, discovered, _event_source = csi.fetch_indexed_events(current.as_of_date)
     snapshots = reconstruct(current, events)
+    _progress(
+        "daily_universe_loaded",
+        current_as_of_date=current.as_of_date.isoformat(),
+        event_count=len(events),
+        discovered_notice_count=len(discovered),
+    )
     base_plan = build_incremental_plan(
         observed_at=observed, primary_calendar=primary_calendar,
         secondary_calendar=secondary_calendar, snapshots=snapshots, target_session=target,
@@ -400,6 +512,30 @@ def run(
         if initialize_schema:
             ensure_daily_schema(connection)
         stored, metadata = load_daily_checkpoint_evidence(connection, dataset_id)
+        previous_states = load_previous_adjusted_states(
+            connection, predecessor_dataset_id=predecessor_dataset_id,
+            previous_session=base_plan.previous_session,
+        )
+        ipo_dates = load_base_references(connection, base_history_dataset_id)
+        recovery = {
+            "already_present": len(metadata["succeeded_symbols"]),
+            "recovered": 0,
+            "candidate_datasets": 0,
+            "recovered_by_source_dataset": {},
+            "rejected_datasets": {},
+        }
+        if len(metadata["succeeded_symbols"]) < len(base_plan.expected_membership):
+            recovery = recover_compatible_daily_checkpoints(
+                connection,
+                dataset_id=dataset_id,
+                target_session=target,
+                expected_membership=base_plan.membership,
+                verification_symbols=base_plan.verification_symbols,
+                previous_states=previous_states,
+                existing_metadata=metadata,
+            )
+            if recovery["recovered"]:
+                stored, metadata = load_daily_checkpoint_evidence(connection, dataset_id)
         plan = build_incremental_plan(
             observed_at=observed, primary_calendar=primary_calendar,
             secondary_calendar=secondary_calendar, snapshots=snapshots,
@@ -408,11 +544,6 @@ def run(
             ),
             target_session=target,
         )
-        previous_states = load_previous_adjusted_states(
-            connection, predecessor_dataset_id=predecessor_dataset_id,
-            previous_session=plan.previous_session,
-        )
-        ipo_dates = load_base_references(connection, base_history_dataset_id)
     finally:
         connection.close()
 
@@ -421,17 +552,52 @@ def run(
         predecessor_dataset_id=predecessor_dataset_id,
         expected_symbols=len(plan.expected_membership), resumed_symbols=len(plan.accepted_existing_symbols),
         fetch_symbols=len(plan.fetch_symbols), verification_symbols=len(plan.verification_symbols),
+        recovered_symbols=recovery["recovered"],
+        recovery_candidate_datasets=recovery["candidate_datasets"],
+        recovery_rejected_datasets=recovery["rejected_datasets"],
     )
 
     primary_source = AkshareEastmoneyHistorySource(timeout_seconds=25, attempts=2)
     verification_source = AkshareHistorySource(timeout_seconds=25, attempts=2)
-    secondary_context = (
-        BaostockHistorySource(timeout_seconds=25, attempts=2)
-        if plan.fetch_symbols else nullcontext(None)
-    )
-    with secondary_context as secondary_source:
+    with ExitStack() as source_stack:
+        secondary_source: BaostockHistorySource | None = None
+        fallback_suspended_symbols: frozenset[str] = frozenset()
+        fallback_status_available = False
+        if plan.fetch_symbols:
+            try:
+                fallback_suspended_symbols = EastmoneySuspensionSource(
+                    attempts=3, timeout_seconds=25,
+                ).fetch(target)
+                fallback_status_available = True
+                _progress(
+                    "daily_status_source_ready",
+                    source=EastmoneySuspensionSource.name,
+                    confirmed_suspended=len(fallback_suspended_symbols),
+                    st_policy="unknown_fail_closed",
+                )
+            except Exception as error:
+                _progress(
+                    "daily_status_source_degraded",
+                    unavailable_source=EastmoneySuspensionSource.name,
+                    error=f"{type(error).__name__}: {error}",
+                    fallback_source="baostock_daily_status",
+                )
+                try:
+                    secondary_source = source_stack.enter_context(
+                        BaostockHistorySource(timeout_seconds=25, attempts=2)
+                    )
+                    _progress(
+                        "daily_status_source_ready",
+                        source="baostock_daily_status",
+                    )
+                except Exception as fallback_error:
+                    _progress(
+                        "daily_status_source_unavailable",
+                        unavailable_source="baostock_daily_status",
+                        error=f"{type(fallback_error).__name__}: {fallback_error}",
+                        trading_policy="missing_status_blocks_buy_and_sell",
+                    )
         for position, symbol in enumerate(plan.fetch_symbols, start=1):
-            assert secondary_source is not None
             final_error: Exception | str | None = None
             for attempt in range(1, symbol_attempts + 1):
                 try:
@@ -439,6 +605,8 @@ def run(
                         evidence, reported, status, error = capture_symbol(
                             plan=plan, symbol=symbol, primary_source=primary_source,
                             verification_source=verification_source, secondary_source=secondary_source,
+                            fallback_suspended_symbols=fallback_suspended_symbols,
+                            fallback_status_available=fallback_status_available,
                             previous_states=previous_states, ipo_dates=ipo_dates,
                             calendar_dates=primary_calendar.open_dates,
                         )
@@ -478,6 +646,11 @@ def run(
                         failed_connection,
                         _checkpoint_evidence(
                             primary=None, fact=None, verification=None, adjusted=None, events=[],
+                            status_source=(
+                                "baostock_daily_status" if secondary_source is not None
+                                else EastmoneySuspensionSource.name if fallback_status_available
+                                else None
+                            ),
                         ),
                         dataset_id=dataset_id, symbol=symbol, target_session=target,
                         verification_required=symbol in set(plan.verification_symbols),
@@ -523,6 +696,15 @@ def run(
         reported_previous_closes=reported_closes,
         primary_failures=primary_failures, verification_failures=verification_failures,
     )
+    status_source_counts: dict[str, int] = {}
+    for source in metadata["status_sources"].values():
+        status_source_counts[source] = status_source_counts.get(source, 0) + 1
+    previous_close_source_counts: dict[str, int] = {}
+    for source in metadata["reported_previous_close_sources"].values():
+        previous_close_source_counts[source] = previous_close_source_counts.get(source, 0) + 1
+    manifest["status_source_counts"] = dict(sorted(status_source_counts.items()))
+    manifest["reported_previous_close_source_counts"] = dict(sorted(previous_close_source_counts.items()))
+    manifest["recovered_checkpoint_count"] = len(metadata["checkpoint_origin_dataset_ids"])
     manifest.update({
         "dataset_id": dataset_id,
         "base_history_dataset_id": base_history_dataset_id,
