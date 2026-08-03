@@ -30,7 +30,9 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/market_data/requirements.lock.txt
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
-      - run: python -m scripts.test_market_data_m2_workflows
+      - run: |
+          python -m scripts.test_market_data_m2_workflows
+          python -m scripts.test_market_data_m2_release
 
   release:
     if: github.event_name == 'workflow_dispatch'
