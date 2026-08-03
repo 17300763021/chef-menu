@@ -9,8 +9,10 @@ from typing import Any
 from scripts.market_data.contracts import normalize_symbol, parse_date
 
 
-INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v3"
+INDUSTRY_SCHEMA_VERSION = "m2-industry-pit-v4"
 SW_2021_EFFECTIVE_DATE = date(2021, 7, 30)
+EXCLUDED_DELISTED_NO_HISTORY = "excluded_delisted_no_history"
+DELISTED_NO_HISTORY_REASON = "cninfo_official_industry_history_unavailable_after_delisting"
 
 
 def parse_industry_date(value: Any) -> date:
@@ -67,6 +69,106 @@ class IndustryScopeSecurity:
             "symbol": self.symbol,
             "ipo_date": self.ipo_date.isoformat(),
             "out_date": None if self.out_date is None else self.out_date.isoformat(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IndustryDelistingEvidence:
+    symbol: str
+    delisted_on: date
+    exchange: str
+    source: str
+    security_name: str | None = None
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        symbol: Any,
+        delisted_on: Any,
+        exchange: Any,
+        source: Any,
+        security_name: Any = None,
+    ) -> "IndustryDelistingEvidence":
+        normalized_exchange = str(exchange).strip().upper()
+        normalized_source = str(source).strip()
+        expected_source = {
+            "SZ": "szse_official_delisting",
+            "SH": "sse_official_delisting",
+        }.get(normalized_exchange)
+        if expected_source is None or normalized_source != expected_source:
+            raise ValueError("unsupported official exchange delisting evidence")
+        return cls(
+            symbol=normalize_symbol(str(symbol)),
+            delisted_on=parse_date(delisted_on),
+            exchange=normalized_exchange,
+            source=normalized_source,
+            security_name=None if security_name in (None, "", "nan") else str(security_name).strip(),
+        )
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "delisted_on": self.delisted_on.isoformat(),
+            "exchange": self.exchange,
+            "source": self.source,
+            "security_name": self.security_name,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IndustryExclusion:
+    symbol: str
+    out_date: date
+    confirmed_empty_responses: int
+    delisting_source: str
+    reason: str = DELISTED_NO_HISTORY_REASON
+    source: str = "cninfo_official_api"
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        symbol: Any,
+        out_date: Any,
+        confirmed_empty_responses: Any = 2,
+        delisting_source: Any = "m2_history_security_reference",
+        reason: Any = DELISTED_NO_HISTORY_REASON,
+        source: Any = "cninfo_official_api",
+    ) -> "IndustryExclusion":
+        normalized_reason = str(reason).strip()
+        normalized_source = str(source).strip()
+        if normalized_reason != DELISTED_NO_HISTORY_REASON:
+            raise ValueError("unsupported industry exclusion reason")
+        if normalized_source != "cninfo_official_api":
+            raise ValueError("unsupported industry exclusion source")
+        normalized_delisting_source = str(delisting_source).strip()
+        if normalized_delisting_source not in {
+            "m2_history_security_reference",
+            "szse_official_delisting",
+            "sse_official_delisting",
+        }:
+            raise ValueError("unsupported industry exclusion delisting source")
+        confirmed_count = int(confirmed_empty_responses)
+        if confirmed_count < 2:
+            raise ValueError("industry exclusion requires at least two confirmed empty responses")
+        return cls(
+            symbol=normalize_symbol(str(symbol)),
+            out_date=parse_date(out_date),
+            confirmed_empty_responses=confirmed_count,
+            delisting_source=normalized_delisting_source,
+            reason=normalized_reason,
+            source=normalized_source,
+        )
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "out_date": self.out_date.isoformat(),
+            "confirmed_empty_responses": self.confirmed_empty_responses,
+            "delisting_source": self.delisting_source,
+            "reason": self.reason,
+            "source": self.source,
         }
 
 

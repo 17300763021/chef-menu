@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from collections import defaultdict
 from datetime import date
@@ -12,6 +13,8 @@ from scripts.market_data.industry_classification import (
     evaluate_industry,
 )
 from scripts.market_data.industry_contracts import (
+    EXCLUDED_DELISTED_NO_HISTORY,
+    IndustryExclusion,
     IndustryNode,
     IndustryScopeSecurity,
     IndustryVerification,
@@ -19,7 +22,9 @@ from scripts.market_data.industry_contracts import (
 )
 from scripts.market_data.tidb_industry_store import (
     SCHEMA_STATEMENTS,
+    load_accepted_industry_nodes,
     load_base_scope,
+    load_industry_exclusions,
     publish_industry_run,
     publish_symbol_checkpoint,
     validate_publication,
@@ -47,6 +52,15 @@ class FakeCursor:
                 ("000001", date(2010, 1, 1), None),
                 ("000002", date(2020, 1, 1), None),
             ]
+        elif "SELECT dataset_id, node_count, nodes_sha256" in sql:
+            self.rows = list(self.connection.accepted_catalog_rows)
+        elif "FROM m2_industry_nodes" in sql:
+            self.rows = list(self.connection.catalog_node_rows)
+        elif "SELECT symbol, error_class, error_message" in sql:
+            self.rows = [
+                (row[0], row[8], row[9]) for row in self.connection.checkpoint_rows
+                if row[1] == EXCLUDED_DELISTED_NO_HISTORY
+            ]
         elif "FROM m2_industry_symbol_checkpoints" in sql:
             self.rows = list(self.connection.checkpoint_rows)
         else:
@@ -62,9 +76,11 @@ class FakeCursor:
 
 
 class FakeConnection:
-    def __init__(self, checkpoint_rows=()) -> None:
+    def __init__(self, checkpoint_rows=(), accepted_catalog_rows=(), catalog_node_rows=()) -> None:
         self.calls = []
         self.checkpoint_rows = tuple(checkpoint_rows)
+        self.accepted_catalog_rows = tuple(accepted_catalog_rows)
+        self.catalog_node_rows = tuple(catalog_node_rows)
         self.commits = 0
         self.rollbacks = 0
 
@@ -141,7 +157,7 @@ def checkpoint_fixture(source, intervals, verifications):
         verification_payload = [row.canonical() for row in sorted(verifications_by_symbol[symbol], key=lambda value: value.key)]
         result.append((
             symbol, "succeeded", len(source_payload), len(interval_payload), len(verification_payload),
-            sha256(source_payload), sha256(interval_payload), sha256(verification_payload),
+            sha256(source_payload), sha256(interval_payload), sha256(verification_payload), None, None,
         ))
     return result
 
@@ -154,6 +170,8 @@ class TiDBIndustryStoreTest(unittest.TestCase):
         self.assertIn("PRIMARY KEY (dataset_id, symbol, source_effective_from)", schema)
         self.assertIn("standard_code VARCHAR(32) NULL", schema)
         self.assertIn("row_sha256 CHAR(64) NOT NULL", schema)
+        self.assertIn("excluded_security_count INT NOT NULL DEFAULT 0", schema)
+        self.assertIn("excluded_securities_sha256 CHAR(64) NULL", schema)
 
     def test_symbol_checkpoint_rejects_cross_symbol_rows_before_database_writes(self) -> None:
         _manifest, _scope, _source, intervals, verifications, _nodes = evidence_fixture()
@@ -170,6 +188,24 @@ class TiDBIndustryStoreTest(unittest.TestCase):
     def test_base_scope_must_reconcile_to_accepted_logical_history(self) -> None:
         scope = load_base_scope(FakeConnection(), "m2-base")
         self.assertEqual([row.symbol for row in scope], ["000001", "000002"])
+
+    def test_same_date_accepted_catalog_is_physically_reconciled_before_reuse(self) -> None:
+        nodes = sorted(evidence_fixture()[-1], key=lambda row: (row.level, row.node_code))
+        node_hash = sha256([row.canonical() for row in nodes])
+        connection = FakeConnection(
+            accepted_catalog_rows=[("accepted-sample", len(nodes), node_hash)],
+            catalog_node_rows=[(
+                row.node_code, row.node_name, row.parent_code, row.level, row.standard_name,
+                row.standard_code, row.termination_date, row.source,
+            ) for row in nodes],
+        )
+
+        loaded = load_accepted_industry_nodes(connection, date(2026, 7, 28))
+
+        self.assertIsNotNone(loaded)
+        loaded_nodes, dataset_id = loaded
+        self.assertEqual(dataset_id, "accepted-sample")
+        self.assertEqual(loaded_nodes, nodes)
 
     def test_publication_hashes_reconcile(self) -> None:
         manifest, scope, source, intervals, verifications, nodes = evidence_fixture()
@@ -194,7 +230,9 @@ class TiDBIndustryStoreTest(unittest.TestCase):
     def test_final_publication_rejects_checkpoint_hash_mismatch(self) -> None:
         manifest, scope, source, intervals, verifications, nodes = evidence_fixture()
         checkpoints = checkpoint_fixture(source, intervals, verifications)
-        checkpoints[0] = (*checkpoints[0][:-1], "0" * 64)
+        corrupted = list(checkpoints[0])
+        corrupted[7] = "0" * 64
+        checkpoints[0] = tuple(corrupted)
 
         with self.assertRaisesRegex(RuntimeError, "checkpoint hashes"):
             publish_industry_run(
@@ -222,6 +260,74 @@ class TiDBIndustryStoreTest(unittest.TestCase):
         self.assertEqual(len(source_inserts[0]), 2)
         self.assertEqual(connection.commits, 1)
         self.assertEqual(connection.rollbacks, 0)
+
+    def test_delisted_exclusion_checkpoint_is_empty_canonical_and_resumable(self) -> None:
+        exclusion = IndustryExclusion.build(symbol="000046", out_date="2020-09-21")
+        connection = FakeConnection()
+
+        publish_symbol_checkpoint(
+            connection, dataset_id="m2-industry-test", symbol="000046", shard_index=0,
+            source_rows=[], intervals=[], verifications=[],
+            status=EXCLUDED_DELISTED_NO_HISTORY, exclusion=exclusion,
+        )
+        checkpoint_call = next(
+            params for sql, params in connection.calls if sql.startswith("INSERT INTO m2_industry_symbol_checkpoints")
+        )
+
+        self.assertEqual(checkpoint_call[3], EXCLUDED_DELISTED_NO_HISTORY)
+        self.assertEqual(checkpoint_call[4:10], (0, 0, 0, None, None, None))
+        self.assertEqual(checkpoint_call[10], "IndustryExclusion")
+        self.assertEqual(connection.commits, 1)
+
+    def test_exclusion_checkpoint_rejects_any_fabricated_industry_evidence(self) -> None:
+        _manifest, _scope, source, _intervals, _verifications, _nodes = evidence_fixture()
+        exclusion = IndustryExclusion.build(symbol="000001", out_date="2020-09-21")
+
+        with self.assertRaisesRegex(ValueError, "cannot contain evidence"):
+            publish_symbol_checkpoint(
+                FakeConnection(), dataset_id="m2-industry-test", symbol="000001", shard_index=0,
+                source_rows=[row for row in source if row.symbol == "000001"],
+                intervals=[], verifications=[], status=EXCLUDED_DELISTED_NO_HISTORY,
+                exclusion=exclusion,
+            )
+
+    def test_final_publication_accepts_audited_delisted_exclusion(self) -> None:
+        manifest, original_scope, source, intervals, verifications, nodes = evidence_fixture()
+        active_symbol = original_scope[0].symbol
+        scope = [
+            original_scope[0],
+            IndustryScopeSecurity.build("000046", "1994-06-30", "2020-09-21"),
+        ]
+        source = [row for row in source if row.symbol == active_symbol]
+        intervals = [row for row in intervals if row.symbol == active_symbol]
+        verifications = [row for row in verifications if row.symbol == active_symbol]
+        exclusion = IndustryExclusion.build(symbol="000046", out_date="2020-09-21")
+        gates = evaluate_industry(
+            scope=scope, source_rows=source, intervals=intervals, verifications=verifications,
+            nodes=nodes, history_start=HISTORY_START, as_of_date=date(2026, 7, 28),
+            expected_scope_count=2, exclusions=[exclusion],
+        )
+        manifest = build_manifest(
+            dataset_id=manifest["dataset_id"], base_history_dataset_id="m2-base", mode="full",
+            observed_on=date(2026, 7, 28), as_of_date=date(2026, 7, 28), history_start=HISTORY_START,
+            scope=scope, source_rows=source, intervals=intervals, verifications=verifications,
+            nodes=nodes, gates=gates, source_metadata={"source": "fixture"}, exclusions=[exclusion],
+        )
+        checkpoints = checkpoint_fixture(source, intervals, verifications)
+        checkpoints.append((
+            "000046", EXCLUDED_DELISTED_NO_HISTORY, 0, 0, 0, None, None, None,
+            "IndustryExclusion", json.dumps(exclusion.canonical(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        ))
+        connection = FakeConnection(checkpoint_rows=checkpoints)
+
+        loaded = load_industry_exclusions(connection, manifest["dataset_id"])
+        result = publish_industry_run(
+            connection, manifest, scope=scope, source_rows=source, intervals=intervals,
+            verifications=verifications, nodes=nodes, exclusions=loaded,
+        )
+
+        self.assertEqual(loaded, [exclusion])
+        self.assertTrue(result["accepted"])
 
     def test_publication_rejects_normalized_source_mismatch(self) -> None:
         manifest, scope, source, intervals, verifications, nodes = evidence_fixture()

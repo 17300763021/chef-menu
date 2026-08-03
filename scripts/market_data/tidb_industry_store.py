@@ -9,7 +9,9 @@ from typing import Any, Mapping, Sequence
 
 from scripts.market_data.industry_classification import canonical_scope
 from scripts.market_data.industry_contracts import (
+    EXCLUDED_DELISTED_NO_HISTORY,
     INDUSTRY_SCHEMA_VERSION,
+    IndustryExclusion,
     IndustryInterval,
     IndustryNode,
     IndustryScopeSecurity,
@@ -20,7 +22,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-INDUSTRY_STORE_SCHEMA_VERSION = "m2-tidb-industry-checkpoint-v3"
+INDUSTRY_STORE_SCHEMA_VERSION = "m2-tidb-industry-checkpoint-v4"
 
 
 def _compact(value: Any) -> str:
@@ -55,11 +57,13 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       interval_count INT NOT NULL,
       verification_count INT NOT NULL,
       node_count INT NOT NULL,
+      excluded_security_count INT NOT NULL DEFAULT 0,
       scope_sha256 CHAR(64) NOT NULL,
       source_assignments_sha256 CHAR(64) NOT NULL,
       intervals_sha256 CHAR(64) NOT NULL,
       verifications_sha256 CHAR(64) NOT NULL,
       nodes_sha256 CHAR(64) NOT NULL,
+      excluded_securities_sha256 CHAR(64) NULL,
       quality_sha256 CHAR(64) NOT NULL,
       manifest_sha256 CHAR(64) NOT NULL,
       manifest_json LONGTEXT NOT NULL,
@@ -173,6 +177,8 @@ SCHEMA_UPGRADE_STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE m2_industry_source_assignments ADD COLUMN IF NOT EXISTS standard_code VARCHAR(32) NULL AFTER standard_name",
     "ALTER TABLE m2_industry_symbol_checkpoints ADD COLUMN IF NOT EXISTS source_assignment_count INT NOT NULL DEFAULT 0 AFTER status",
     "ALTER TABLE m2_industry_symbol_checkpoints ADD COLUMN IF NOT EXISTS source_assignments_sha256 CHAR(64) NULL AFTER verification_count",
+    "ALTER TABLE m2_industry_runs ADD COLUMN IF NOT EXISTS excluded_security_count INT NOT NULL DEFAULT 0 AFTER node_count",
+    "ALTER TABLE m2_industry_runs ADD COLUMN IF NOT EXISTS excluded_securities_sha256 CHAR(64) NULL AFTER nodes_sha256",
 )
 
 
@@ -217,14 +223,54 @@ def load_base_scope(connection: Any, base_history_dataset_id: str) -> list[Indus
     return scope
 
 
+def load_accepted_industry_nodes(
+    connection: Any,
+    observed_on: date,
+) -> tuple[list[IndustryNode], str] | None:
+    runs = _query_all(connection, """
+        SELECT dataset_id, node_count, nodes_sha256
+        FROM m2_industry_runs
+        WHERE accepted=1 AND authoritative=0 AND simulation_orders_allowed=0
+          AND mode='sample' AND observed_on=%s AND as_of_date=%s
+        ORDER BY published_at DESC
+    """, (observed_on, observed_on))
+    if not runs:
+        return None
+    node_hashes = {str(row[2]) for row in runs}
+    if len(node_hashes) != 1:
+        raise RuntimeError("accepted same-date industry catalogs disagree")
+    dataset_id, expected_count, expected_hash = runs[0]
+    rows = _query_all(connection, """
+        SELECT node_code, node_name, parent_code, node_level, standard_name,
+               standard_code, termination_date, source
+        FROM m2_industry_nodes
+        WHERE dataset_id=%s ORDER BY node_level, node_code
+    """, (dataset_id,))
+    nodes = [IndustryNode(
+        node_code=str(row[0]), node_name=str(row[1]),
+        parent_code=None if row[2] is None else str(row[2]), level=int(row[3]),
+        standard_name=str(row[4]), standard_code=str(row[5]),
+        termination_date=None if row[6] is None else _date(row[6]), source=str(row[7]),
+    ) for row in rows]
+    physical_hash = sha256([row.canonical() for row in nodes])
+    if len(nodes) != int(expected_count) or physical_hash != str(expected_hash):
+        raise RuntimeError("accepted same-date industry catalog fails physical reconciliation")
+    return nodes, str(dataset_id)
+
+
 def completed_symbols(connection: Any, dataset_id: str) -> set[str]:
     return {
         str(row[0]) for row in _query_all(connection, """
             SELECT symbol FROM m2_industry_symbol_checkpoints
-            WHERE dataset_id=%s AND status='succeeded'
-              AND source_assignment_count > 0 AND interval_count > 0 AND verification_count > 0
+            WHERE dataset_id=%s AND (
+              (status='succeeded' AND source_assignment_count > 0 AND interval_count > 0 AND verification_count > 0)
+              OR
+              (status=%s AND source_assignment_count=0 AND interval_count=0 AND verification_count=0
+               AND source_assignments_sha256 IS NULL AND intervals_sha256 IS NULL AND verifications_sha256 IS NULL
+               AND error_class='IndustryExclusion')
+            )
             ORDER BY symbol
-        """, (dataset_id,))
+        """, (dataset_id, EXCLUDED_DELISTED_NO_HISTORY))
     }
 
 
@@ -288,15 +334,25 @@ def publish_symbol_checkpoint(
     verifications: Sequence[IndustryVerification],
     status: str,
     error: Exception | str | None = None,
+    exclusion: IndustryExclusion | None = None,
 ) -> None:
-    if status not in {"succeeded", "failed"}:
-        raise ValueError("industry checkpoint status must be succeeded or failed")
+    if status not in {"succeeded", "failed", EXCLUDED_DELISTED_NO_HISTORY}:
+        raise ValueError("unsupported industry checkpoint status")
     if any(row.symbol != symbol for row in source_rows):
         raise ValueError("industry source checkpoint contains a different symbol")
     if any(row.symbol != symbol for row in intervals):
         raise ValueError("industry interval checkpoint contains a different symbol")
     if any(row.symbol != symbol for row in verifications):
         raise ValueError("industry verification checkpoint contains a different symbol")
+    if status == "succeeded" and (not source_rows or not intervals or not verifications):
+        raise ValueError("successful industry checkpoint requires complete evidence")
+    if status == EXCLUDED_DELISTED_NO_HISTORY:
+        if exclusion is None or exclusion.symbol != symbol:
+            raise ValueError("delisted industry exclusion must match the checkpoint symbol")
+        if source_rows or intervals or verifications or error is not None:
+            raise ValueError("delisted industry exclusion cannot contain evidence or an error")
+    elif exclusion is not None:
+        raise ValueError("industry exclusion is only valid for the delisted exclusion status")
     if _accepted_manifest_hash(connection, dataset_id) is not None:
         raise RuntimeError("accepted industry evidence is immutable")
     source_canonical = [row.canonical() for row in sorted(source_rows, key=lambda value: value.source_effective_from)]
@@ -307,7 +363,10 @@ def publish_symbol_checkpoint(
     verification_hash = sha256(verification_rows) if verification_rows else None
     error_class = None
     error_message = None
-    if error is not None:
+    if exclusion is not None:
+        error_class = "IndustryExclusion"
+        error_message = _compact(exclusion.canonical())
+    elif error is not None:
         error_class = type(error).__name__ if isinstance(error, BaseException) else "RuntimeError"
         error_message = str(error)[:4000]
     try:
@@ -403,6 +462,33 @@ def load_industry_verifications(connection: Any, dataset_id: str) -> list[Indust
     ) for row in rows]
 
 
+def load_industry_exclusions(connection: Any, dataset_id: str) -> list[IndustryExclusion]:
+    rows = _query_all(connection, """
+        SELECT symbol, error_class, error_message
+        FROM m2_industry_symbol_checkpoints
+        WHERE dataset_id=%s AND status=%s
+        ORDER BY symbol
+    """, (dataset_id, EXCLUDED_DELISTED_NO_HISTORY))
+    exclusions: list[IndustryExclusion] = []
+    expected_keys = {
+        "symbol", "out_date", "confirmed_empty_responses", "delisting_source", "reason", "source",
+    }
+    for symbol, error_class, error_message in rows:
+        if str(error_class) != "IndustryExclusion":
+            raise RuntimeError(f"invalid industry exclusion class for {symbol}")
+        try:
+            payload = json.loads(str(error_message))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"invalid industry exclusion payload for {symbol}") from error
+        if not isinstance(payload, dict) or set(payload) != expected_keys or str(payload.get("symbol")) != str(symbol):
+            raise RuntimeError(f"invalid industry exclusion payload for {symbol}")
+        exclusion = IndustryExclusion.build(**payload)
+        if _compact(exclusion.canonical()) != str(error_message):
+            raise RuntimeError(f"non-canonical industry exclusion payload for {symbol}")
+        exclusions.append(exclusion)
+    return exclusions
+
+
 NODE_INSERT = """
 INSERT INTO m2_industry_nodes (
   dataset_id, node_code, node_name, parent_code, node_level, standard_name,
@@ -416,10 +502,10 @@ INSERT INTO m2_industry_runs (
   dataset_id, store_schema_version, data_schema_version, manifest_version,
   base_history_dataset_id, mode, observed_on, as_of_date, history_start,
   authoritative, simulation_orders_allowed, accepted, scope_count,
-  source_assignment_count, interval_count, verification_count, node_count,
+  source_assignment_count, interval_count, verification_count, node_count, excluded_security_count,
   scope_sha256, source_assignments_sha256, intervals_sha256, verifications_sha256,
-  nodes_sha256, quality_sha256, manifest_sha256, manifest_json
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+  nodes_sha256, excluded_securities_sha256, quality_sha256, manifest_sha256, manifest_json
+) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
 """
 
 
@@ -431,6 +517,7 @@ def validate_publication(
     intervals: Sequence[IndustryInterval],
     verifications: Sequence[IndustryVerification],
     nodes: Sequence[IndustryNode],
+    exclusions: Sequence[IndustryExclusion] = (),
 ) -> None:
     if manifest.get("accepted") is not True:
         raise RuntimeError("refusing to publish rejected industry evidence")
@@ -442,6 +529,10 @@ def validate_publication(
         "interval_count": len(intervals),
         "verification_count": len(verifications),
         "node_count": len(nodes),
+        "excluded_security_count": len(exclusions),
+        "excluded_securities": [
+            row.canonical() for row in sorted(exclusions, key=lambda value: value.symbol)
+        ],
         "scope_sha256": sha256(canonical_scope(scope)),
         "source_assignments_sha256": sha256([
             row.canonical() for row in sorted(
@@ -456,6 +547,9 @@ def validate_publication(
         ]),
         "nodes_sha256": sha256([
             row.canonical() for row in sorted(nodes, key=lambda value: (value.level, value.node_code))
+        ]),
+        "excluded_securities_sha256": sha256([
+            row.canonical() for row in sorted(exclusions, key=lambda value: value.symbol)
         ]),
     }
     mismatches = {key: {"manifest": manifest.get(key), "physical": value} for key, value in expected.items() if manifest.get(key) != value}
@@ -472,10 +566,11 @@ def publish_industry_run(
     intervals: Sequence[IndustryInterval],
     verifications: Sequence[IndustryVerification],
     nodes: Sequence[IndustryNode],
+    exclusions: Sequence[IndustryExclusion] = (),
 ) -> dict[str, Any]:
     validate_publication(
         manifest, scope=scope, source_rows=source_rows, intervals=intervals,
-        verifications=verifications, nodes=nodes,
+        verifications=verifications, nodes=nodes, exclusions=exclusions,
     )
     dataset_id = str(manifest["dataset_id"])
     manifest_hash = sha256(manifest)
@@ -494,11 +589,15 @@ def publish_industry_run(
         raise RuntimeError("a different accepted industry observation already exists for this date")
     checkpoints = _query_all(connection, """
         SELECT symbol, status, source_assignment_count, interval_count, verification_count,
-               source_assignments_sha256, intervals_sha256, verifications_sha256
+               source_assignments_sha256, intervals_sha256, verifications_sha256,
+               error_class, error_message
         FROM m2_industry_symbol_checkpoints
         WHERE dataset_id=%s ORDER BY symbol
     """, (dataset_id,))
-    completed = {str(row[0]) for row in checkpoints if str(row[1]) == "succeeded"}
+    completed = {
+        str(row[0]) for row in checkpoints
+        if str(row[1]) in {"succeeded", EXCLUDED_DELISTED_NO_HISTORY}
+    }
     expected_symbols = {item.symbol for item in scope}
     if completed != expected_symbols:
         raise RuntimeError("industry checkpoint inventory does not reconcile to the frozen scope")
@@ -512,9 +611,13 @@ def publish_industry_run(
     for row in verifications:
         verifications_by_symbol[row.symbol].append(row)
     checkpoint_by_symbol = {str(row[0]): row for row in checkpoints}
+    exclusion_by_symbol = {row.symbol: row for row in exclusions}
+    if len(exclusion_by_symbol) != len(exclusions):
+        raise RuntimeError("duplicate industry exclusions")
     mismatched_checkpoints: list[str] = []
     for symbol in sorted(expected_symbols):
         row = checkpoint_by_symbol[symbol]
+        status = str(row[1])
         source_payload = [
             item.canonical() for item in sorted(
                 sources_by_symbol[symbol], key=lambda value: value.source_effective_from
@@ -526,12 +629,26 @@ def publish_industry_run(
         verification_payload = [
             item.canonical() for item in sorted(verifications_by_symbol[symbol], key=lambda value: value.key)
         ]
-        expected_checkpoint = (
-            len(source_payload), len(interval_payload), len(verification_payload),
-            sha256(source_payload), sha256(interval_payload), sha256(verification_payload),
-        )
+        if status == EXCLUDED_DELISTED_NO_HISTORY:
+            exclusion = exclusion_by_symbol.get(symbol)
+            if exclusion is None:
+                mismatched_checkpoints.append(symbol)
+                continue
+            expected_checkpoint = (
+                0, 0, 0, None, None, None,
+                "IndustryExclusion", _compact(exclusion.canonical()),
+            )
+        else:
+            if symbol in exclusion_by_symbol:
+                mismatched_checkpoints.append(symbol)
+                continue
+            expected_checkpoint = (
+                len(source_payload), len(interval_payload), len(verification_payload),
+                sha256(source_payload), sha256(interval_payload), sha256(verification_payload),
+                None, None,
+            )
         physical_checkpoint = (
-            int(row[2]), int(row[3]), int(row[4]), str(row[5]), str(row[6]), str(row[7]),
+            int(row[2]), int(row[3]), int(row[4]), row[5], row[6], row[7], row[8], row[9],
         )
         if physical_checkpoint != expected_checkpoint:
             mismatched_checkpoints.append(symbol)
@@ -553,9 +670,11 @@ def publish_industry_run(
                 manifest["observed_on"], manifest["as_of_date"], manifest["history_start"],
                 0, 0, 1, manifest["scope_count"], manifest["source_assignment_count"],
                 manifest["interval_count"], manifest["verification_count"], manifest["node_count"],
+                manifest["excluded_security_count"],
                 manifest["scope_sha256"], manifest["source_assignments_sha256"],
                 manifest["intervals_sha256"], manifest["verifications_sha256"],
-                manifest["nodes_sha256"], manifest["quality_sha256"], manifest_hash,
+                manifest["nodes_sha256"], manifest["excluded_securities_sha256"],
+                manifest["quality_sha256"], manifest_hash,
                 _compact(manifest),
             ))
         connection.commit()
@@ -567,8 +686,8 @@ def publish_industry_run(
 
 __all__ = [
     "INDUSTRY_STORE_SCHEMA_VERSION", "TiDBConfig", "completed_symbols", "connect",
-    "ensure_industry_schema", "load_base_scope", "load_industry_intervals",
-    "load_industry_source_assignments",
+    "ensure_industry_schema", "load_accepted_industry_nodes", "load_base_scope", "load_industry_intervals",
+    "load_industry_exclusions", "load_industry_source_assignments",
     "load_industry_verifications", "publish_industry_run", "publish_symbol_checkpoint",
     "validate_publication",
 ]

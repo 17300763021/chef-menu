@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -19,13 +20,22 @@ from scripts.market_data.industry_classification import (
     write_gzip_rows,
 )
 from scripts.market_data.industry_contracts import (
+    EXCLUDED_DELISTED_NO_HISTORY,
+    IndustryDelistingEvidence,
+    IndustryExclusion,
     IndustryNode,
     IndustryScopeSecurity,
     IndustryVerification,
     SwsAssignmentRecord,
 )
 from scripts.market_data.quality_gates import accepted
-from scripts.market_data.industry_runner import _dataset_id, _plan_seed, load_plan
+from scripts.market_data.industry_runner import (
+    _dataset_id,
+    _delisted_no_history_exclusion,
+    _plan_seed,
+    load_plan,
+    run_shard,
+)
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.cninfo_industry_source import (
     assignments_from_cninfo_changes,
@@ -33,6 +43,7 @@ from scripts.market_data.sources.cninfo_industry_source import (
     normalize_cninfo_changes,
 )
 from scripts.market_data.sources.sws_industry_source import normalize_sws_frame
+from scripts.market_data.sources.exchange_delisting_source import normalize_delisting_frame
 
 
 OBSERVED_ON = date(2026, 7, 28)
@@ -95,6 +106,13 @@ def node_fixture() -> list[IndustryNode]:
     return list(unique.values())
 
 
+def delisting_fixture() -> IndustryDelistingEvidence:
+    return IndustryDelistingEvidence.build(
+        symbol="000046", delisted_on="2024-02-07", exchange="SZ",
+        source="szse_official_delisting", security_name="*ST泛海",
+    )
+
+
 class IndustryContractTest(unittest.TestCase):
     def test_frozen_plan_roundtrip_and_tamper_detection(self) -> None:
         scope = scope_fixture()
@@ -104,13 +122,17 @@ class IndustryContractTest(unittest.TestCase):
             base_history_dataset_id="m2-base", mode="sample", observed_on=OBSERVED_ON,
             scope_sha256=sha256(canonical_scope(scope)),
             nodes_sha256=sha256([row.canonical() for row in nodes]),
+            delisting_inventory_sha256=sha256([]),
+            catalog_evidence_dataset_id=None,
         )
         plan = {
-            "plan_version": "m2-industry-plan-v2",
+            "plan_version": "m2-industry-plan-v3",
             "dataset_id": _dataset_id(seed),
             "expected_scope_count": len(scope),
             "scope_sha256": seed["scope_sha256"],
             "nodes_sha256": seed["nodes_sha256"],
+            "delisting_inventory_count": 0,
+            "delisting_inventory_sha256": seed["delisting_inventory_sha256"],
             "seed": seed,
         }
         with TemporaryDirectory() as directory:
@@ -118,10 +140,12 @@ class IndustryContractTest(unittest.TestCase):
             (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
             write_gzip_rows(root / "scope.json.gz", canonical_scope(scope))
             write_gzip_rows(root / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
+            write_gzip_rows(root / "exchange-delistings.json.gz", [])
 
-            loaded, loaded_scope, _loaded_nodes = load_plan(root)
+            loaded, loaded_scope, _loaded_nodes, loaded_delistings = load_plan(root)
             self.assertEqual(loaded["dataset_id"], plan["dataset_id"])
             self.assertEqual(len(loaded_scope), 2)
+            self.assertEqual(loaded_delistings, [])
 
             write_gzip_rows(root / "scope.json.gz", canonical_scope(scope[:1]))
             with self.assertRaisesRegex(RuntimeError, "frozen-plan hash mismatch"):
@@ -239,6 +263,122 @@ class IndustryContractTest(unittest.TestCase):
 
         self.assertFalse(coverage.passed)
         self.assertFalse(accepted(gates))
+
+    def test_delisted_security_with_confirmed_empty_history_is_explicitly_excluded(self) -> None:
+        active = scope_fixture()[0]
+        delisted = IndustryScopeSecurity.build("000046", "1994-06-30")
+        delisting = delisting_fixture()
+        scope = [active, delisted]
+        source = [row for row in source_fixture() if row.symbol == active.symbol]
+        verifications = [row for row in verification_fixture() if row.symbol == active.symbol]
+        nodes = node_fixture()
+        intervals = enrich_interval_names(
+            build_intervals(scope, source, observed_on=OBSERVED_ON, as_of_date=OBSERVED_ON),
+            verifications, nodes,
+        )
+        exclusion = _delisted_no_history_exclusion(
+            delisted, as_of_date=OBSERVED_ON, delisting_evidence=delisting,
+        )
+        self.assertIsNotNone(exclusion)
+        self.assertIsNone(_delisted_no_history_exclusion(
+            delisted, as_of_date=OBSERVED_ON, confirmed_empty_responses=1,
+        ))
+        gates = evaluate_industry(
+            scope=scope, source_rows=source, intervals=intervals,
+            verifications=verifications, nodes=nodes, history_start=HISTORY_START,
+            as_of_date=OBSERVED_ON, expected_scope_count=2, exclusions=[exclusion],
+            delisting_evidence=[delisting],
+        )
+
+        self.assertTrue(accepted(gates), [gate.canonical() for gate in gates if not gate.passed])
+        manifest = build_manifest(
+            dataset_id="m2-industry-exclusion", base_history_dataset_id="m2-base", mode="full",
+            observed_on=OBSERVED_ON, as_of_date=OBSERVED_ON, history_start=HISTORY_START,
+            scope=scope, source_rows=source, intervals=intervals, verifications=verifications,
+            nodes=nodes, gates=gates, source_metadata={"source": "fixture"}, exclusions=[exclusion],
+        )
+        self.assertEqual(manifest["excluded_security_count"], 1)
+        self.assertEqual(manifest["excluded_securities"], [exclusion.canonical()])
+        self.assertEqual(manifest["excluded_securities_sha256"], sha256([exclusion.canonical()]))
+
+    def test_active_security_cannot_be_disguised_as_delisted_exclusion(self) -> None:
+        scope = scope_fixture()
+        forged = IndustryExclusion.build(symbol="000002", out_date="2020-09-21")
+        self.assertIsNone(_delisted_no_history_exclusion(scope[1], as_of_date=OBSERVED_ON))
+        gates = evaluate_industry(
+            scope=scope, source_rows=source_fixture(), intervals=enrich_interval_names(
+                build_intervals(scope, source_fixture(), observed_on=OBSERVED_ON, as_of_date=OBSERVED_ON),
+                verification_fixture(), node_fixture(),
+            ),
+            verifications=verification_fixture(), nodes=node_fixture(), history_start=HISTORY_START,
+            as_of_date=OBSERVED_ON, expected_scope_count=2, exclusions=[forged],
+        )
+        exclusion_gate = next(gate for gate in gates if gate.name == "delisted_no_history_exclusions")
+
+        self.assertFalse(exclusion_gate.passed)
+        self.assertFalse(accepted(gates))
+
+    def test_official_delisting_inventory_normalization_preserves_exchange_evidence(self) -> None:
+        frame = pd.DataFrame([{
+            "证券代码": "000046", "证券简称": "*ST泛海",
+            "上市日期": "1994-09-12", "终止上市日期": "2024-02-07",
+        }])
+
+        rows = normalize_delisting_frame(frame, exchange="SZ")
+
+        self.assertEqual(rows, (delisting_fixture(),))
+
+    def test_shard_excludes_only_after_two_confirmed_empty_official_responses(self) -> None:
+        scope = [IndustryScopeSecurity.build("000046", "1994-09-12")]
+        nodes = node_fixture()
+        delistings = [delisting_fixture()]
+        scope_hash = sha256(canonical_scope(scope))
+        nodes_hash = sha256([row.canonical() for row in nodes])
+        delistings_hash = sha256([row.canonical() for row in delistings])
+        seed = _plan_seed(
+            base_history_dataset_id="m2-base", mode="full", observed_on=OBSERVED_ON,
+            scope_sha256=scope_hash, nodes_sha256=nodes_hash,
+            delisting_inventory_sha256=delistings_hash, catalog_evidence_dataset_id="accepted-sample",
+        )
+        plan = {
+            "plan_version": "m2-industry-plan-v3", "dataset_id": _dataset_id(seed),
+            "base_history_dataset_id": "m2-base", "mode": "full",
+            "observed_on": OBSERVED_ON.isoformat(), "as_of_date": OBSERVED_ON.isoformat(),
+            "history_start": HISTORY_START.isoformat(), "expected_scope_count": 1,
+            "scope_sha256": scope_hash, "nodes_sha256": nodes_hash,
+            "delisting_inventory_count": 1, "delisting_inventory_sha256": delistings_hash,
+            "source_metadata": {}, "shard_count": 1, "seed": seed,
+        }
+        source = MagicMock()
+        source.fetch_changes.return_value = ()
+        checkpoint = MagicMock()
+        connection = MagicMock()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            write_gzip_rows(root / "scope.json.gz", canonical_scope(scope))
+            write_gzip_rows(root / "cninfo-nodes.json.gz", [row.canonical() for row in nodes])
+            write_gzip_rows(root / "exchange-delistings.json.gz", [row.canonical() for row in delistings])
+            with (
+                patch("scripts.market_data.industry_runner.connect", return_value=connection),
+                patch("scripts.market_data.industry_runner.ensure_industry_schema"),
+                patch("scripts.market_data.industry_runner.completed_symbols", return_value=set()),
+                patch("scripts.market_data.industry_runner.CninfoIndustrySource", return_value=source),
+                patch("scripts.market_data.industry_runner.publish_symbol_checkpoint", checkpoint),
+                patch("scripts.market_data.industry_runner.time.sleep"),
+            ):
+                result = run_shard(input_dir=root, shard_index=0, attempts=2)
+
+        self.assertEqual(source.fetch_changes.call_count, 2)
+        self.assertEqual(result["failed_symbols"], 0)
+        self.assertEqual(result["excluded_symbols"], 1)
+        kwargs = checkpoint.call_args.kwargs
+        self.assertEqual(kwargs["status"], EXCLUDED_DELISTED_NO_HISTORY)
+        self.assertEqual(kwargs["source_rows"], [])
+        self.assertEqual(kwargs["intervals"], [])
+        self.assertEqual(kwargs["verifications"], [])
+        self.assertEqual(kwargs["exclusion"].confirmed_empty_responses, 2)
+        self.assertEqual(kwargs["exclusion"].delisting_source, "szse_official_delisting")
 
     def test_manifest_is_deterministic_and_discloses_reconstruction(self) -> None:
         scope = scope_fixture()

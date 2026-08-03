@@ -12,6 +12,8 @@ from typing import Any, Iterable, Mapping, Sequence
 from scripts.market_data.industry_contracts import (
     INDUSTRY_SCHEMA_VERSION,
     SW_2021_EFFECTIVE_DATE,
+    IndustryDelistingEvidence,
+    IndustryExclusion,
     IndustryInterval,
     IndustryNode,
     IndustryScopeSecurity,
@@ -24,7 +26,7 @@ from scripts.market_data.quality_gates import GateResult, accepted
 
 
 HISTORY_START = date(2018, 1, 1)
-MANIFEST_VERSION = "m2-industry-pit-manifest-v2"
+MANIFEST_VERSION = "m2-industry-pit-manifest-v3"
 
 
 def canonical_scope(scope: Iterable[IndustryScopeSecurity]) -> list[dict[str, Any]]:
@@ -143,6 +145,8 @@ def evaluate_industry(
     history_start: date,
     as_of_date: date,
     expected_scope_count: int,
+    exclusions: Sequence[IndustryExclusion] = (),
+    delisting_evidence: Sequence[IndustryDelistingEvidence] = (),
 ) -> list[GateResult]:
     results: list[GateResult] = []
     scope_symbols = {item.symbol for item in scope}
@@ -167,14 +171,76 @@ def evaluate_industry(
         details=tuple(unexpected_symbols[:50]),
     ))
 
+    scope_by_symbol = {item.symbol: item for item in scope}
+    delisting_counts = Counter(row.symbol for row in delisting_evidence)
+    delisting_issues: list[str] = []
+    delisting_by_symbol: dict[str, IndustryDelistingEvidence] = {}
+    for row in sorted(delisting_evidence, key=lambda value: value.symbol):
+        if delisting_counts[row.symbol] != 1:
+            delisting_issues.append(f"{row.symbol}:duplicate_delisting_evidence")
+        elif row.symbol not in scope_by_symbol:
+            delisting_issues.append(f"{row.symbol}:delisting_evidence_outside_scope")
+        elif row.delisted_on > as_of_date:
+            delisting_issues.append(f"{row.symbol}:delisting_after_as_of_date")
+        else:
+            delisting_by_symbol[row.symbol] = row
+    results.append(GateResult(
+        "official_delisting_inventory_integrity",
+        not delisting_issues,
+        len(delisting_evidence),
+        "unique official exchange rows inside the frozen scope and known by as-of date",
+        details=tuple(delisting_issues[:50]),
+    ))
+    exclusion_counts = Counter(row.symbol for row in exclusions)
+    exclusion_issues: list[str] = []
+    valid_excluded_symbols: set[str] = set()
+    evidence_symbols = (
+        {row.symbol for row in source_rows}
+        | {row.symbol for row in intervals}
+        | {row.symbol for row in verifications}
+    )
+    for exclusion in sorted(exclusions, key=lambda value: value.symbol):
+        security = scope_by_symbol.get(exclusion.symbol)
+        if exclusion_counts[exclusion.symbol] != 1:
+            exclusion_issues.append(f"{exclusion.symbol}:duplicate_exclusion")
+        elif security is None:
+            exclusion_issues.append(f"{exclusion.symbol}:outside_scope")
+        else:
+            official = delisting_by_symbol.get(exclusion.symbol)
+            frozen_reference_matches = (
+                security.out_date is not None
+                and security.out_date <= as_of_date
+                and exclusion.out_date == security.out_date
+                and exclusion.delisting_source == "m2_history_security_reference"
+            )
+            official_evidence_matches = (
+                official is not None
+                and exclusion.out_date == official.delisted_on
+                and exclusion.delisting_source == official.source
+            )
+            if not frozen_reference_matches and not official_evidence_matches:
+                exclusion_issues.append(f"{exclusion.symbol}:delisting_evidence_mismatch")
+            elif exclusion.symbol in evidence_symbols:
+                exclusion_issues.append(f"{exclusion.symbol}:exclusion_has_industry_evidence")
+            else:
+                valid_excluded_symbols.add(exclusion.symbol)
+    results.append(GateResult(
+        "delisted_no_history_exclusions",
+        not exclusion_issues,
+        len(exclusions),
+        "only frozen-scope securities delisted by as-of date, with no industry evidence",
+        details=tuple(exclusion_issues[:50]),
+    ))
+    eligible_scope_symbols = scope_symbols - valid_excluded_symbols
+
     source_symbols = {row.symbol for row in source_rows}
-    source_coverage_bps = len(scope_symbols & source_symbols) * 10000 // max(1, len(scope_symbols))
+    source_coverage_bps = len(eligible_scope_symbols & source_symbols) * 10000 // max(1, len(eligible_scope_symbols))
     results.append(GateResult(
         "official_assignment_symbol_coverage",
         source_coverage_bps >= 9800,
         f"{source_coverage_bps / 100:.2f}%",
         ">= 98.00%",
-        details=tuple(sorted(scope_symbols - source_symbols)[:50]),
+        details=tuple(sorted(eligible_scope_symbols - source_symbols)[:50]),
     ))
 
     keys = [row.key for row in intervals]
@@ -191,6 +257,8 @@ def evaluate_industry(
     overlaps: list[str] = []
     gaps: list[str] = []
     for security in scope:
+        if security.symbol in valid_excluded_symbols:
+            continue
         bounds = _timeline_bounds(security, history_start, as_of_date)
         if bounds is None:
             continue
@@ -212,7 +280,7 @@ def evaluate_industry(
     results.append(GateResult(
         "interval_overlaps", not overlaps, len(overlaps), "= 0", details=tuple(overlaps[:50]),
     ))
-    complete_bps = len(complete) * 10000 // max(1, len(scope_symbols))
+    complete_bps = len(complete) * 10000 // max(1, len(eligible_scope_symbols))
     results.append(GateResult(
         "point_in_time_interval_coverage",
         complete_bps >= 9800,
@@ -231,7 +299,7 @@ def evaluate_industry(
         if item.ipo_date <= SW_2021_EFFECTIVE_DATE
         and (item.out_date is None or item.out_date >= SW_2021_EFFECTIVE_DATE)
         and SW_2021_EFFECTIVE_DATE <= as_of_date
-    }
+    } - valid_excluded_symbols
     cutover_rows = {
         row.symbol for row in source_rows if row.source_effective_from == SW_2021_EFFECTIVE_DATE
     }
@@ -249,13 +317,13 @@ def evaluate_industry(
         for symbol, rows in by_symbol.items() if rows
     }
     named = {symbol for symbol, row in latest_interval.items() if row.level1_name}
-    name_coverage_bps = len(named) * 10000 // max(1, len(scope_symbols))
+    name_coverage_bps = len(named & eligible_scope_symbols) * 10000 // max(1, len(eligible_scope_symbols))
     results.append(GateResult(
         "level1_name_coverage",
         name_coverage_bps >= 9800,
         f"{name_coverage_bps / 100:.2f}%",
         ">= 98.00%",
-        details=tuple(sorted(scope_symbols - named)[:50]),
+        details=tuple(sorted(eligible_scope_symbols - named)[:50]),
     ))
 
     placeholder_rows = [
@@ -277,13 +345,13 @@ def evaluate_industry(
         and interval.level2_code in active_node_codes
         and interval.level3_code in active_node_codes
     }
-    catalog_coverage_bps = len(catalog_matched) * 10000 // max(1, len(scope_symbols))
+    catalog_coverage_bps = len(catalog_matched & eligible_scope_symbols) * 10000 // max(1, len(eligible_scope_symbols))
     results.append(GateResult(
         "cninfo_latest_code_catalog_coverage",
         catalog_coverage_bps >= 9800,
         f"{catalog_coverage_bps / 100:.2f}%",
         ">= 98.00%",
-        details=tuple(sorted(scope_symbols - catalog_matched)[:50]),
+        details=tuple(sorted(eligible_scope_symbols - catalog_matched)[:50]),
     ))
     results.append(GateResult(
         "independent_secondary_source_disclosure",
@@ -332,11 +400,13 @@ def build_manifest(
     nodes: Sequence[IndustryNode],
     gates: Sequence[GateResult],
     source_metadata: Mapping[str, Any],
+    exclusions: Sequence[IndustryExclusion] = (),
 ) -> dict[str, Any]:
     interval_rows = [row.canonical() for row in sorted(intervals, key=lambda value: value.key)]
     verification_rows = [row.canonical() for row in sorted(verifications, key=lambda value: value.key)]
     node_rows = [row.canonical() for row in sorted(nodes, key=lambda value: (value.level, value.node_code))]
     source_assignment_rows = [row.canonical() for row in sorted(source_rows, key=lambda value: (value.symbol, value.source_effective_from))]
+    exclusion_rows = [row.canonical() for row in sorted(exclusions, key=lambda value: value.symbol)]
     gate_rows = [gate.canonical() for gate in gates]
     return {
         "manifest_version": MANIFEST_VERSION,
@@ -358,13 +428,16 @@ def build_manifest(
         "interval_count": len(interval_rows),
         "verification_count": len(verification_rows),
         "node_count": len(node_rows),
+        "excluded_security_count": len(exclusion_rows),
         "scope_sha256": sha256(canonical_scope(scope)),
         "source_assignments_sha256": sha256(source_assignment_rows),
         "intervals_sha256": sha256(interval_rows),
         "verifications_sha256": sha256(verification_rows),
         "nodes_sha256": sha256(node_rows),
+        "excluded_securities_sha256": sha256(exclusion_rows),
         "quality_sha256": sha256(gate_rows),
         "source_metadata": dict(sorted(source_metadata.items())),
+        "excluded_securities": exclusion_rows,
         "independent_secondary_source": {
             "status": "unavailable",
             "required_for_research_acceptance": False,
