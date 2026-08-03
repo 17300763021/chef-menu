@@ -13,6 +13,15 @@ from scripts.market_data.manifest import sha256
 
 FUNDAMENTAL_SCHEMA_VERSION = "m2-fundamental-pit-v1"
 STATEMENT_TYPES = ("balance", "income", "cashflow")
+SUPPORTED_REPORTING_CURRENCIES = frozenset({"CNY", "USD", "HKD", "EUR"})
+_CURRENCY_ALIASES = {
+    "人民币": "CNY",
+    "RMB": "CNY",
+    "美元": "USD",
+    "港元": "HKD",
+    "港币": "HKD",
+    "欧元": "EUR",
+}
 
 METRIC_COLUMNS: dict[str, tuple[str, ...]] = {
     "balance": (
@@ -111,7 +120,10 @@ class FundamentalReport:
             update_date=update_day,
             effective_on=effective,
             report_type=str(report_type or "").strip(),
-            currency=str(currency or "CNY").strip().upper(),
+            currency=_CURRENCY_ALIASES.get(
+                str(currency or "CNY").strip().upper(),
+                str(currency or "CNY").strip().upper(),
+            ),
             organization_type=str(organization_type or "").strip(),
             source=str(source).strip(),
             source_row_sha256=sha256(dict(sorted((str(k), None if v is None else str(v)) for k, v in source_row.items()))),

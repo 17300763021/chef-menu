@@ -210,6 +210,7 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
             "authoritative": False,
             "simulation_orders_allowed": False,
             "knowledge_boundary": "facts are usable no earlier than max(NOTICE_DATE, UPDATE_DATE); initial capture cannot reconstruct superseded pre-revision values",
+            "currency_policy": "facts retain the source report currency; absolute values in different currencies cannot be compared or combined without separately accepted point-in-time FX conversion",
             "expected_symbol_count": len(symbols),
             "successful_symbol_count": len(succeeded),
             "excluded_symbol_count": len(excluded),

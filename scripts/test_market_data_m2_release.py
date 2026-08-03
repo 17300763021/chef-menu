@@ -20,7 +20,7 @@ class _Cursor:
         return False
 
     def execute(self, query, _params=()):
-        if query.startswith("CREATE TABLE"):
+        if query.lstrip().startswith("CREATE TABLE"):
             self.current = []
             return
         for marker, row in self.rows.items():

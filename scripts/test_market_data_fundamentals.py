@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from decimal import Decimal
 
 import pandas as pd
 
@@ -71,6 +72,36 @@ class FundamentalTests(unittest.TestCase):
                  for metric, value in (("TOTAL_ASSETS", 1000), ("TOTAL_LIABILITIES", 700), ("TOTAL_EQUITY", 100))]
         gates = evaluate_fundamentals(expected_symbols=["000001"], reports=[report], facts=facts, successful_symbols={"000001"})
         self.assertFalse(next(g for g in gates if g.name == "balance_sheet_accounting_equation").passed)
+
+    def test_declared_usd_is_preserved_but_fact_unit_must_match(self) -> None:
+        report = FundamentalReport.build(
+            symbol="688981", statement_type="balance", report_date="2019-06-30",
+            notice_date="2019-08-30", update_date="2019-08-30", report_type="中报",
+            currency="USD", organization_type="通用", source="fixture", source_row={"currency": "USD"},
+        )
+        facts = [
+            FundamentalFact(report.version_id, report.symbol, report.statement_type, report.report_date,
+                            report.effective_on, "TOTAL_ASSETS", Decimal("100"), "USD"),
+            FundamentalFact(report.version_id, report.symbol, report.statement_type, report.report_date,
+                            report.effective_on, "TOTAL_LIABILITIES", Decimal("70"), "USD"),
+            FundamentalFact(report.version_id, report.symbol, report.statement_type, report.report_date,
+                            report.effective_on, "TOTAL_EQUITY", Decimal("30"), "CNY"),
+        ]
+        gates = evaluate_fundamentals(
+            expected_symbols=[report.symbol], reports=[report], facts=facts,
+            successful_symbols={report.symbol},
+        )
+        by_name = {gate.name: gate for gate in gates}
+        self.assertTrue(by_name["fundamental_currency_contract"].passed)
+        self.assertFalse(by_name["fundamental_fact_currency_lineage"].passed)
+
+    def test_currency_aliases_are_normalized_without_converting_values(self) -> None:
+        report = FundamentalReport.build(
+            symbol="000001", statement_type="balance", report_date="2025-12-31",
+            notice_date="2026-03-21", update_date="2026-03-21", report_type="annual",
+            currency="人民币", organization_type="bank", source="fixture", source_row={},
+        )
+        self.assertEqual(report.currency, "CNY")
 
 
 if __name__ == "__main__":

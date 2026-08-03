@@ -6,7 +6,11 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 from typing import Iterable, Sequence
 
-from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport
+from scripts.market_data.fundamental_contracts import (
+    SUPPORTED_REPORTING_CURRENCIES,
+    FundamentalFact,
+    FundamentalReport,
+)
 from scripts.market_data.quality_gates import GateResult
 
 
@@ -69,10 +73,20 @@ def evaluate_fundamentals(
         "fundamental_fact_report_lineage", not orphan_facts, len(orphan_facts), "= 0", details=tuple(orphan_facts[:20]),
     ))
 
-    currencies = sorted({row.currency for row in report_rows if row.currency not in {"CNY", "RMB"}})
+    currencies = sorted({row.currency for row in report_rows if row.currency not in SUPPORTED_REPORTING_CURRENCIES})
     results.append(GateResult(
-        "fundamental_currency_contract", not currencies, len(currencies), "= 0 non-CNY currencies",
+        "fundamental_currency_contract", not currencies, len(currencies), "= 0 unsupported or undeclared currencies",
         details=tuple(currencies),
+    ))
+    report_currency = {row.version_id: row.currency for row in report_rows}
+    unit_mismatches = sorted(
+        f"{row.symbol}:{row.report_version_id}:{row.unit}:{report_currency.get(row.report_version_id)}"
+        for row in fact_rows
+        if report_currency.get(row.report_version_id) is not None and row.unit != report_currency[row.report_version_id]
+    )
+    results.append(GateResult(
+        "fundamental_fact_currency_lineage", not unit_mismatches, len(unit_mismatches),
+        "= 0 facts whose unit differs from the source report currency", details=tuple(unit_mismatches[:50]),
     ))
 
     by_report: dict[tuple[str, object, object], dict[str, Decimal]] = defaultdict(dict)
