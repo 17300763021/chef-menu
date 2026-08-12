@@ -23,6 +23,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
+    canonical_lineage_evidence,
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
@@ -31,6 +32,7 @@ from scripts.market_data.tidb_daily_store import (
     publish_daily_run,
     publish_daily_symbol_checkpoint,
     recover_compatible_daily_checkpoints,
+    recovered_previous_states_from_lineage,
 )
 from scripts.market_data.tradeability import derive_tradeability
 
@@ -172,6 +174,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "m2_daily_runs", "m2_daily_symbol_checkpoints", "m2_daily_primary_bars",
             "m2_daily_adjusted_bars", "m2_daily_tradeability_facts",
             "m2_daily_verification_bars", "m2_daily_adjustment_events",
+            "m2_daily_lineage_evidence",
         ):
             self.assertIn(table, sql)
         self.assertEqual(connection.commits, 1)
@@ -186,10 +189,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         )
         self.assertEqual(counts, {
             "primary_bars": 1, "adjusted_bars": 1, "tradeability": 1,
-            "verification_bars": 1, "adjustments": 0, "symbol_checkpoints": 1,
+            "verification_bars": 1, "adjustments": 0, "lineage_evidence": 0,
+            "symbol_checkpoints": 1,
         })
         deletes = [sql for sql, _params in connection.executed if sql.strip().startswith("DELETE")]
-        self.assertEqual(len(deletes), 5)
+        self.assertEqual(len(deletes), 6)
         self.assertEqual(connection.commits, 1)
 
         immutable = FakeConnection(
@@ -202,6 +206,40 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 reported_previous_close=Decimal("10"), status="succeeded",
             )
 
+    def test_lineage_evidence_is_canonical_persisted_and_rehydrates_predecessor(self) -> None:
+        evidence = complete_evidence()
+        lineage = canonical_lineage_evidence({
+            "symbol": "000001",
+            "target_session": TARGET.isoformat(),
+            "kind": "gap_no_adjustment_recovery",
+            "source": "tencent_raw_hfq_continuity",
+            "details": {
+                "prior_session": "2026-07-23",
+                "recovered_session": PREVIOUS.isoformat(),
+                "prior_source_dataset_id": "base-history",
+                "accepted_prior_close": "9.8000",
+                "recovered_raw_close": "10.0000",
+                "observed_sessions": ["2026-07-23", PREVIOUS.isoformat()],
+                "maximum_implied_hfq_change_rate": "0.001",
+                "qfq_factor": "1.000000",
+                "hfq_factor": "2.000000",
+                "raw_rows_sha256": "b" * 64,
+                "hfq_rows_sha256": "c" * 64,
+            },
+        })
+        evidence.lineage_evidence.append(lineage)
+        counts = publish_daily_symbol_checkpoint(
+            FakeConnection(), evidence, dataset_id="daily-scope", symbol="000001",
+            target_session=TARGET, verification_required=True,
+            reported_previous_close=Decimal("10"), status="succeeded",
+        )
+        self.assertEqual(counts["lineage_evidence"], 1)
+        states = recovered_previous_states_from_lineage(
+            [lineage], previous_session=PREVIOUS,
+        )
+        self.assertEqual(states["000001"].raw_close, Decimal("10.0000"))
+        self.assertEqual(states["000001"].hfq_factor, Decimal("2.000000"))
+
     def test_accepted_aggregate_is_one_time_and_idempotent(self) -> None:
         evidence = complete_evidence()
         scope_hash = "d" * 64
@@ -212,15 +250,17 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "tradeability_row_count": len(evidence.tradeability),
             "verification_row_count": len(evidence.verification_bars),
             "adjustment_event_count": len(evidence.adjustments),
+            "lineage_evidence_count": len(evidence.lineage_evidence),
             "primary_sha256": sha256(evidence.primary_bars),
             "adjusted_sha256": sha256(evidence.adjusted_bars),
             "tradeability_sha256": sha256(evidence.tradeability),
             "verification_sha256": sha256(evidence.verification_bars),
             "adjustments_sha256": sha256(evidence.adjustments),
+            "lineage_evidence_sha256": sha256(evidence.lineage_evidence),
         }
         manifest = {
             **evidence.manifest, **values,
-            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v3",
+            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v4",
             "target_session": TARGET.isoformat(), "previous_session": PREVIOUS.isoformat(),
             "snapshot_effective_session": PREVIOUS.isoformat(), "scope_sha256": scope_hash,
             "expected_symbol_count": 1, "quality_sha256": "e" * 64,
@@ -302,7 +342,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
                         "000001", "succeeded", 1, Decimal("10"), None, None,
                         None, None, None,
                         sha256([primary]), sha256([adjusted]), sha256([fact]),
-                        sha256([verification]), None,
+                        sha256([verification]), None, None,
                     )]
                 if "FROM m2_daily_primary_bars" in sql:
                     return [(
@@ -601,6 +641,14 @@ class FakeSinaPrimary(FakePrimary):
         raise RuntimeError(f"AKShare Sina returned no qfq-factor rows for {symbol}")
 
 
+class FakeDividendSinaPrimary(FakeSinaPrimary):
+    def fetch_sina_adjustments(self, symbol: str, end: date):
+        return [AdjustmentEvent(
+            symbol, TARGET, Decimal("1"), Decimal("1.052632"),
+            source="akshare_sina_factor_multiplicative",
+        )]
+
+
 class FakeVerification:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
@@ -712,6 +760,81 @@ class DailyCaptureTests(unittest.TestCase):
         self.assertEqual(status, "blocked")
         self.assertIn("malformed factor payload", str(error))
         self.assertEqual(malformed.adjusted_bars, [])
+
+    def test_sina_ex_date_uses_tencent_cash_evidence_and_recomputes_limits(self) -> None:
+        action_details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "10",
+            "cash_per_ten_shares": "5.000000",
+            "derived_previous_close": "9.5000",
+            "action_content": "10派5元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        with patch.object(
+            TencentHistorySource,
+            "fetch_cash_dividend_reference",
+            return_value=(Decimal("9.5000"), action_details),
+        ):
+            evidence, reported, status, error = capture_symbol(
+                plan=plan(), symbol="000001", primary_source=FakeDividendSinaPrimary(),
+                verification_source=FakeVerification(), secondary_source=None,
+                fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+                previous_states={"000001": previous_state()},
+                ipo_dates={"000001": date(1991, 4, 3)},
+                calendar_dates=(PREVIOUS, TARGET),
+            )
+        self.assertEqual((reported, status, error), (Decimal("9.5000"), "succeeded", None))
+        self.assertEqual(evidence.manifest["previous_close_source"], "tencent_structured_cash_dividend")
+        self.assertEqual(evidence.adjusted_bars[0]["previous_close"], "9.5000")
+        self.assertEqual(evidence.lineage_evidence[0]["kind"], "cash_dividend_reference")
+        self.assertIsNone(evidence.tradeability[0]["limit_up"])
+        self.assertIn("unknown_st_status", evidence.tradeability[0]["block_reasons"])
+
+    def test_missing_exact_predecessor_is_recovered_only_with_gap_evidence(self) -> None:
+        prior = date(2026, 7, 23)
+        fallback_state = PreviousAdjustedState(
+            symbol="000001", business_date=prior, raw_close=Decimal("9.8"),
+            qfq_factor=Decimal("1"), hfq_factor=Decimal("2"),
+            source_dataset_id="base-history",
+        )
+        recovery_details = {
+            "prior_session": prior.isoformat(),
+            "recovered_session": PREVIOUS.isoformat(),
+            "accepted_prior_close": "9.8",
+            "recovered_raw_close": "10.0000",
+            "observed_sessions": [prior.isoformat(), PREVIOUS.isoformat()],
+            "maximum_implied_hfq_change_rate": "0.001",
+            "raw_rows_sha256": "b" * 64,
+            "hfq_rows_sha256": "c" * 64,
+        }
+        with (
+            patch.object(
+                TencentHistorySource,
+                "recover_no_adjustment_predecessor",
+                return_value=(Decimal("10.0000"), recovery_details),
+            ),
+            patch.object(
+                TencentHistorySource,
+                "verify_no_adjustment_continuity",
+                return_value="tencent_hfq_no_adjustment_continuity",
+            ),
+        ):
+            exact_states: dict[str, PreviousAdjustedState] = {}
+            evidence, reported, status, error = capture_symbol(
+                plan=plan(), symbol="000001", primary_source=FakeSinaPrimary(),
+                verification_source=FakeVerification(), secondary_source=None,
+                fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+                previous_states=exact_states,
+                fallback_previous_states={"000001": fallback_state},
+                ipo_dates={"000001": date(1991, 4, 3)},
+                calendar_dates=(prior, PREVIOUS, TARGET),
+            )
+        self.assertEqual((reported, status, error), (Decimal("10"), "succeeded", None))
+        self.assertEqual(exact_states["000001"].business_date, PREVIOUS)
+        self.assertEqual(evidence.lineage_evidence[0]["kind"], "gap_no_adjustment_recovery")
+        self.assertEqual(evidence.adjusted_bars[0]["hfq_factor"], "2")
 
     def test_capture_blocks_missing_predecessor_or_verification_without_guessing(self) -> None:
         common = {

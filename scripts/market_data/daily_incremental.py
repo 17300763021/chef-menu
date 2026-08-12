@@ -27,8 +27,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v3"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v3"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v4"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v4"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
@@ -387,6 +387,7 @@ def build_incremental_evidence(
         "verification_row_count": len(verification_rows),
         "adjusted_row_count": len(adjusted_rows),
         "adjustment_event_count": len(event_rows),
+        "lineage_evidence_count": 0,
         "primary_failures": dict(sorted((primary_failures or {}).items())),
         "verification_failures": dict(sorted((verification_failures or {}).items())),
         "primary_sha256": sha256(canonical_primary),
@@ -394,6 +395,7 @@ def build_incremental_evidence(
         "verification_sha256": sha256(canonical_verification),
         "adjusted_sha256": sha256(canonical_adjusted),
         "adjustments_sha256": sha256(canonical_events),
+        "lineage_evidence_sha256": sha256([]),
         "quality_sha256": sha256([gate.canonical() for gate in gates]),
         "accepted": accepted(gates),
         "gates": [gate.canonical() for gate in gates],
@@ -416,6 +418,7 @@ def write_outputs(
     verification_bars: Iterable[DailyBar],
     adjusted_bars: Iterable[HistoricalBar],
     adjustment_events: Iterable[AdjustmentEvent],
+    lineage_evidence: Iterable[Mapping[str, Any]] = (),
 ) -> None:
     canonical_primary = canonical_rows(primary_bars)
     canonical_facts = [
@@ -431,17 +434,23 @@ def write_outputs(
         row.canonical()
         for row in sorted(adjustment_events, key=lambda value: (value.symbol, value.effective_date, value.source))
     ]
+    canonical_lineage = sorted(
+        (dict(row) for row in lineage_evidence),
+        key=lambda row: (str(row.get("symbol", "")), str(row.get("kind", ""))),
+    )
     expected_evidence = {
         "primary_row_count": len(canonical_primary),
         "tradeability_row_count": len(canonical_facts),
         "verification_row_count": len(canonical_verification),
         "adjusted_row_count": len(canonical_adjusted),
         "adjustment_event_count": len(canonical_events),
+        "lineage_evidence_count": len(canonical_lineage),
         "primary_sha256": sha256(canonical_primary),
         "tradeability_sha256": sha256(canonical_facts),
         "verification_sha256": sha256(canonical_verification),
         "adjusted_sha256": sha256(canonical_adjusted),
         "adjustments_sha256": sha256(canonical_events),
+        "lineage_evidence_sha256": sha256(canonical_lineage),
     }
     mismatches = {
         key: {"manifest": manifest.get(key), "actual": value}
@@ -457,6 +466,7 @@ def write_outputs(
     _write_gzip(output_dir / "daily-verification-bars.json.gz", canonical_verification)
     _write_gzip(output_dir / "daily-adjusted-bars.json.gz", canonical_adjusted)
     _write_gzip(output_dir / "daily-adjustment-events.json.gz", canonical_events)
+    _write_gzip(output_dir / "daily-lineage-evidence.json.gz", canonical_lineage)
     (output_dir / "manifest.json").write_text(
         json.dumps(dict(manifest), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

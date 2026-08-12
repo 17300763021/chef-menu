@@ -38,6 +38,7 @@ on:
       - scripts/market_data/sources/tencent_history_source.py
       - scripts/test_market_data_daily_incremental.py
       - scripts/test_market_data_daily_quota.py
+      - scripts/test_historical_market_data.py
       - scripts/test_tidb_daily_store.py
       - scripts/test_eastmoney_market_state_source.py
       - scripts/market_data/requirements.lock.txt
@@ -80,6 +81,7 @@ jobs:
         run: |
           python -m scripts.test_market_data_daily_incremental
           python -m scripts.test_market_data_daily_quota
+          python -m scripts.test_historical_market_data
           python -m scripts.test_tidb_daily_store
           python -m scripts.test_market_data_contracts
           python -m scripts.test_market_data_quality

@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import gzip
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from scripts.market_data.contracts import DailyBar, parse_date
+from scripts.market_data.contracts import DailyBar, normalize_symbol, parse_date
 from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
 from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_contracts import AdjustmentEvent
@@ -23,7 +23,8 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v3"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v4"
+DAILY_LINEAGE_SCHEMA_VERSION = "m2-daily-lineage-evidence-v1"
 TRADEABILITY_QUANTUM = Decimal("0.01")
 
 
@@ -92,6 +93,82 @@ def _read_gzip_json(path: Path) -> list[dict[str, Any]]:
     return value
 
 
+def canonical_lineage_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the small immutable evidence envelope used by V4 recovery paths."""
+    symbol = str(row.get("symbol", ""))
+    if normalize_symbol(symbol) != symbol:
+        raise ValueError("daily lineage evidence requires a normalized symbol")
+    target_session = _date_text(row.get("target_session"))
+    parse_date(target_session)
+    kind = str(row.get("kind", "")).strip()
+    if kind not in {"cash_dividend_reference", "gap_no_adjustment_recovery"}:
+        raise ValueError(f"unsupported daily lineage evidence kind: {kind}")
+    source = str(row.get("source", "")).strip()
+    if not source:
+        raise ValueError("daily lineage evidence requires an attributed source")
+    details = row.get("details")
+    if not isinstance(details, Mapping) or not details:
+        raise ValueError("daily lineage evidence requires nonempty structured details")
+    canonical_details = json.loads(_compact(dict(details)))
+    target = parse_date(target_session)
+    if kind == "cash_dividend_reference":
+        if source != "tencent_archive":
+            raise ValueError("cash-dividend lineage evidence requires Tencent attribution")
+        previous = parse_date(canonical_details.get("previous_session"))
+        registration = parse_date(canonical_details.get("registration_date"))
+        ex_rights = parse_date(canonical_details.get("ex_rights_date"))
+        accepted_close = Decimal(str(canonical_details.get("accepted_previous_close")))
+        cash_per_ten = Decimal(str(canonical_details.get("cash_per_ten_shares")))
+        derived_close = Decimal(str(canonical_details.get("derived_previous_close")))
+        if previous != registration or ex_rights != target or not previous < target:
+            raise ValueError("cash-dividend lineage dates do not match the daily transition")
+        expected_close = (accepted_close - cash_per_ten / Decimal("10")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if min(accepted_close, cash_per_ten, derived_close) <= 0 or derived_close != expected_close:
+            raise ValueError("cash-dividend lineage arithmetic does not reconcile")
+        if not str(canonical_details.get("action_content", "")).strip():
+            raise ValueError("cash-dividend lineage requires the vendor action content")
+        vendor_hash = str(canonical_details.get("vendor_action_sha256", ""))
+        if len(vendor_hash) != 64 or any(character not in "0123456789abcdef" for character in vendor_hash):
+            raise ValueError("cash-dividend lineage requires a valid vendor action hash")
+    else:
+        if source != "tencent_raw_hfq_continuity":
+            raise ValueError("gap recovery lineage evidence requires Tencent continuity attribution")
+        prior = parse_date(canonical_details.get("prior_session"))
+        recovered = parse_date(canonical_details.get("recovered_session"))
+        observed_sessions = [parse_date(value) for value in canonical_details.get("observed_sessions", [])]
+        maximum_change = Decimal(str(canonical_details.get("maximum_implied_hfq_change_rate")))
+        numeric_values = [
+            Decimal(str(canonical_details.get(key)))
+            for key in (
+                "accepted_prior_close", "recovered_raw_close", "qfq_factor", "hfq_factor",
+            )
+        ]
+        if not prior < recovered < target:
+            raise ValueError("gap recovery lineage dates do not precede the target session")
+        if observed_sessions != sorted(set(observed_sessions)) or not observed_sessions:
+            raise ValueError("gap recovery lineage sessions must be unique and sorted")
+        if observed_sessions[0] != prior or observed_sessions[-1] != recovered:
+            raise ValueError("gap recovery lineage sessions do not cover both boundaries")
+        if any(value <= 0 for value in numeric_values) or not Decimal("0") <= maximum_change <= Decimal("0.002"):
+            raise ValueError("gap recovery lineage values violate continuity boundaries")
+        if not str(canonical_details.get("prior_source_dataset_id", "")).strip():
+            raise ValueError("gap recovery lineage requires the immutable prior dataset")
+        for key in ("raw_rows_sha256", "hfq_rows_sha256"):
+            value = str(canonical_details.get(key, ""))
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"gap recovery lineage requires a valid {key}")
+    return {
+        "schema_version": DAILY_LINEAGE_SCHEMA_VERSION,
+        "symbol": symbol,
+        "target_session": target_session,
+        "kind": kind,
+        "source": source,
+        "details": canonical_details,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class DailyEvidence:
     manifest: dict[str, Any]
@@ -100,6 +177,7 @@ class DailyEvidence:
     verification_bars: list[dict[str, Any]]
     adjusted_bars: list[dict[str, Any]]
     adjustments: list[dict[str, Any]]
+    lineage_evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_daily_evidence(input_dir: Path) -> DailyEvidence:
@@ -114,6 +192,11 @@ def load_daily_evidence(input_dir: Path) -> DailyEvidence:
         verification_bars=_read_gzip_json(input_dir / "daily-verification-bars.json.gz"),
         adjusted_bars=_read_gzip_json(input_dir / "daily-adjusted-bars.json.gz"),
         adjustments=_read_gzip_json(input_dir / "daily-adjustment-events.json.gz"),
+        lineage_evidence=(
+            _read_gzip_json(input_dir / "daily-lineage-evidence.json.gz")
+            if (input_dir / "daily-lineage-evidence.json.gz").exists()
+            else []
+        ),
     )
 
 
@@ -145,11 +228,13 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       tradeability_row_count INT NOT NULL,
       verification_row_count INT NOT NULL,
       adjustment_event_count INT NOT NULL,
+      lineage_evidence_count INT NOT NULL,
       primary_sha256 CHAR(64) NOT NULL,
       adjusted_sha256 CHAR(64) NOT NULL,
       tradeability_sha256 CHAR(64) NOT NULL,
       verification_sha256 CHAR(64) NOT NULL,
       adjustments_sha256 CHAR(64) NOT NULL,
+      lineage_evidence_sha256 CHAR(64) NOT NULL,
       quality_sha256 CHAR(64) NOT NULL,
       manifest_sha256 CHAR(64) NOT NULL,
       manifest_json LONGTEXT NOT NULL,
@@ -179,6 +264,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       tradeability_sha256 CHAR(64) NULL,
       verification_sha256 CHAR(64) NULL,
       adjustments_sha256 CHAR(64) NULL,
+      lineage_evidence_sha256 CHAR(64) NULL,
       error_class VARCHAR(128) NULL,
       error_message TEXT NULL,
       published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
@@ -308,6 +394,19 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS m2_daily_lineage_evidence (
+      dataset_id VARCHAR(160) NOT NULL,
+      symbol CHAR(6) NOT NULL,
+      target_session DATE NOT NULL,
+      evidence_kind VARCHAR(64) NOT NULL,
+      source VARCHAR(96) NOT NULL,
+      evidence_json LONGTEXT NOT NULL,
+      row_sha256 CHAR(64) NOT NULL,
+      published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      PRIMARY KEY (dataset_id, symbol, evidence_kind)
+    )
+    """,
+    """
     ALTER TABLE m2_daily_symbol_checkpoints
       ADD COLUMN IF NOT EXISTS status_source VARCHAR(96) NULL AFTER reported_previous_close
     """,
@@ -319,6 +418,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ALTER TABLE m2_daily_symbol_checkpoints
       ADD COLUMN IF NOT EXISTS checkpoint_origin_dataset_id VARCHAR(160) NULL
       AFTER reported_previous_close_source
+    """,
+    """
+    ALTER TABLE m2_daily_symbol_checkpoints
+      ADD COLUMN IF NOT EXISTS lineage_evidence_sha256 CHAR(64) NULL
+      AFTER adjustments_sha256
+    """,
+    """
+    ALTER TABLE m2_daily_runs
+      ADD COLUMN IF NOT EXISTS lineage_evidence_count INT NOT NULL DEFAULT 0
+      AFTER adjustment_event_count
+    """,
+    """
+    ALTER TABLE m2_daily_runs
+      ADD COLUMN IF NOT EXISTS lineage_evidence_sha256 CHAR(64) NOT NULL
+      DEFAULT '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'
+      AFTER adjustments_sha256
     """,
 )
 
@@ -408,6 +523,16 @@ ON DUPLICATE KEY UPDATE
 """
 
 
+LINEAGE_UPSERT = """
+INSERT INTO m2_daily_lineage_evidence (
+  dataset_id, symbol, target_session, evidence_kind, source, evidence_json, row_sha256
+) VALUES (%s, %s, %s, %s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  target_session=VALUES(target_session), source=VALUES(source),
+  evidence_json=VALUES(evidence_json), row_sha256=VALUES(row_sha256)
+"""
+
+
 CHECKPOINT_UPSERT = """
 INSERT INTO m2_daily_symbol_checkpoints (
   dataset_id, symbol, target_session, status, primary_present, adjusted_present,
@@ -415,8 +540,9 @@ INSERT INTO m2_daily_symbol_checkpoints (
   reported_previous_close, status_source, reported_previous_close_source,
   checkpoint_origin_dataset_id,
   primary_sha256, adjusted_sha256, tradeability_sha256,
-  verification_sha256, adjustments_sha256, error_class, error_message
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+  verification_sha256, adjustments_sha256, lineage_evidence_sha256,
+  error_class, error_message
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON DUPLICATE KEY UPDATE
   target_session=VALUES(target_session), status=VALUES(status),
   primary_present=VALUES(primary_present), adjusted_present=VALUES(adjusted_present),
@@ -428,6 +554,7 @@ ON DUPLICATE KEY UPDATE
   primary_sha256=VALUES(primary_sha256),
   adjusted_sha256=VALUES(adjusted_sha256), tradeability_sha256=VALUES(tradeability_sha256),
   verification_sha256=VALUES(verification_sha256), adjustments_sha256=VALUES(adjustments_sha256),
+  lineage_evidence_sha256=VALUES(lineage_evidence_sha256),
   error_class=VALUES(error_class), error_message=VALUES(error_message)
 """
 
@@ -438,10 +565,10 @@ INSERT INTO m2_daily_runs (
   snapshot_effective_session, base_history_dataset_id, predecessor_dataset_id,
   scope_sha256, authoritative, simulation_orders_allowed, accepted,
   expected_symbol_count, primary_row_count, adjusted_row_count,
-  tradeability_row_count, verification_row_count, adjustment_event_count,
+  tradeability_row_count, verification_row_count, adjustment_event_count, lineage_evidence_count,
   primary_sha256, adjusted_sha256, tradeability_sha256, verification_sha256,
-  adjustments_sha256, quality_sha256, manifest_sha256, manifest_json
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+  adjustments_sha256, lineage_evidence_sha256, quality_sha256, manifest_sha256, manifest_json
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -488,12 +615,21 @@ def _event_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tupl
     ) for row in rows]
 
 
+def _lineage_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    canonical_rows = [canonical_lineage_evidence(row) for row in rows]
+    return [(
+        dataset_id, row["symbol"], row["target_session"], row["kind"], row["source"],
+        _compact(row), sha256(row),
+    ) for row in canonical_rows]
+
+
 def _symbols(evidence: DailyEvidence) -> set[str]:
     return {
         str(row["symbol"])
         for collection in (
             evidence.primary_bars, evidence.tradeability, evidence.verification_bars,
             evidence.adjusted_bars, evidence.adjustments,
+            evidence.lineage_evidence,
         )
         for row in collection
     }
@@ -527,6 +663,13 @@ def publish_daily_symbol_checkpoint(
     ]
     verification_rows = [row for row in evidence.verification_bars if row.get("symbol") == symbol]
     event_rows = [row for row in evidence.adjustments if row.get("symbol") == symbol]
+    lineage_rows = sorted(
+        (
+            canonical_lineage_evidence(row)
+            for row in evidence.lineage_evidence if row.get("symbol") == symbol
+        ),
+        key=lambda row: (row["symbol"], row["kind"]),
+    )
     if len(primary_rows) > 1 or len(adjusted_rows) > 1 or len(fact_rows) > 1 or len(verification_rows) > 1:
         raise ValueError("daily symbol checkpoint permits at most one row per evidence type")
     if status == "succeeded" and len(fact_rows) != 1:
@@ -535,6 +678,9 @@ def publish_daily_symbol_checkpoint(
         raise ValueError("a stored daily primary bar requires one adjusted bar")
     if verification_required and status == "succeeded" and primary_rows and len(verification_rows) != 1:
         raise ValueError("succeeded verification target requires an independent verification row")
+    lineage_keys = {(row["symbol"], row["kind"]) for row in lineage_rows}
+    if len(lineage_keys) != len(lineage_rows):
+        raise ValueError("daily symbol checkpoint contains duplicate lineage evidence")
 
     with connection.cursor() as cursor:
         cursor.execute("SELECT accepted FROM m2_daily_runs WHERE dataset_id=%s", (dataset_id,))
@@ -544,7 +690,7 @@ def publish_daily_symbol_checkpoint(
         for table in (
             "m2_daily_primary_bars", "m2_daily_adjusted_bars",
             "m2_daily_tradeability_facts", "m2_daily_verification_bars",
-            "m2_daily_adjustment_events",
+            "m2_daily_adjustment_events", "m2_daily_lineage_evidence",
         ):
             cursor.execute(f"DELETE FROM {table} WHERE dataset_id=%s AND symbol=%s", (dataset_id, symbol))
 
@@ -556,6 +702,7 @@ def publish_daily_symbol_checkpoint(
         "tradeability": _upsert_many(connection, TRADEABILITY_UPSERT, _fact_rows(dataset_id, fact_rows)),
         "verification_bars": _upsert_many(connection, VERIFICATION_UPSERT, _primary_rows(dataset_id, verification_rows)),
         "adjustments": _upsert_many(connection, ADJUSTMENT_UPSERT, _event_rows(dataset_id, event_rows)),
+        "lineage_evidence": _upsert_many(connection, LINEAGE_UPSERT, _lineage_rows(dataset_id, lineage_rows)),
     }
     checkpoint = (
         dataset_id, symbol, target_session.isoformat(), status, int(bool(primary_rows)),
@@ -568,6 +715,7 @@ def publish_daily_symbol_checkpoint(
         sha256(fact_rows) if fact_rows else None,
         sha256(verification_rows) if verification_rows else None,
         sha256(event_rows) if event_rows else None,
+        sha256(lineage_rows) if lineage_rows else None,
         error_class, error_text,
     )
     counts["symbol_checkpoints"] = _upsert_many(connection, CHECKPOINT_UPSERT, [checkpoint])
@@ -587,7 +735,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
                status_source, reported_previous_close_source, error_class, error_message,
                checkpoint_origin_dataset_id,
                primary_sha256, adjusted_sha256, tradeability_sha256,
-               verification_sha256, adjustments_sha256
+               verification_sha256, adjustments_sha256, lineage_evidence_sha256
         FROM m2_daily_symbol_checkpoints
         WHERE dataset_id=%s AND status IN ('succeeded', 'blocked') ORDER BY symbol
     """, (dataset_id,))
@@ -617,6 +765,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         return DailyEvidence(
             manifest={"authoritative": False, "simulation_orders_allowed": False},
             primary_bars=[], tradeability=[], verification_bars=[], adjusted_bars=[], adjustments=[],
+            lineage_evidence=[],
         ), metadata
 
     def keep(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
@@ -654,6 +803,10 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
     events = keep(_query_all(connection, """
         SELECT symbol, effective_date, qfq_factor, hfq_factor, source, row_sha256
         FROM m2_daily_adjustment_events WHERE dataset_id=%s ORDER BY symbol, effective_date
+    """, (dataset_id,)))
+    lineage = keep(_query_all(connection, """
+        SELECT symbol, target_session, evidence_kind, source, evidence_json, row_sha256
+        FROM m2_daily_lineage_evidence WHERE dataset_id=%s ORDER BY symbol, evidence_kind
     """, (dataset_id,)))
 
     def daily_bar(row: tuple[Any, ...]) -> dict[str, Any]:
@@ -697,6 +850,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "symbol": str(row[0]), "effective_date": _date_text(row[1]),
         "qfq_factor": _decimal(row[2]), "hfq_factor": _decimal(row[3]), "source": row[4],
     } for row in events]
+    canonical_lineage = [canonical_lineage_evidence(json.loads(str(row[4]))) for row in lineage]
 
     for label, raw_rows, canonical_rows in (
         ("primary", primary, canonical_primary),
@@ -704,6 +858,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         ("tradeability", facts, canonical_facts),
         ("verification", verification, canonical_verification),
         ("adjustments", events, canonical_events),
+        ("lineage_evidence", lineage, canonical_lineage),
     ):
         for raw_row, canonical_row in zip(raw_rows, canonical_rows, strict=True):
             if str(raw_row[-1]) != sha256(canonical_row):
@@ -718,6 +873,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         tradeability=canonical_facts,
         verification_bars=canonical_verification,
         adjustments=canonical_events,
+        lineage_evidence=canonical_lineage,
     )
     collections = {
         "primary": evidence.primary_bars,
@@ -725,10 +881,11 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "tradeability": evidence.tradeability,
         "verification": evidence.verification_bars,
         "adjustments": evidence.adjustments,
+        "lineage_evidence": evidence.lineage_evidence,
     }
     checkpoint_hash_positions = {
         "primary": 9, "adjusted": 10, "tradeability": 11,
-        "verification": 12, "adjustments": 13,
+        "verification": 12, "adjustments": 13, "lineage_evidence": 14,
     }
     for checkpoint in checkpoints:
         symbol = str(checkpoint[0])
@@ -765,6 +922,7 @@ def _publish_recovered_checkpoints_batch(
     fact_rows: list[Mapping[str, Any]] = []
     verification_rows: list[Mapping[str, Any]] = []
     event_rows: list[Mapping[str, Any]] = []
+    lineage_rows: list[Mapping[str, Any]] = []
     checkpoint_rows: list[tuple[Any, ...]] = []
     for symbol in symbols:
         _rank, candidate_id, evidence, reported, status_source, previous_source = choices[symbol]
@@ -774,6 +932,11 @@ def _publish_recovered_checkpoints_batch(
         fact_rows.extend(canonical_facts)
         verification_rows.extend(evidence.verification_bars)
         event_rows.extend(evidence.adjustments)
+        canonical_lineage = sorted(
+            (canonical_lineage_evidence(row) for row in evidence.lineage_evidence),
+            key=lambda row: (row["symbol"], row["kind"]),
+        )
+        lineage_rows.extend(canonical_lineage)
         checkpoint_rows.append((
             dataset_id, symbol, target_session.isoformat(), "succeeded",
             int(bool(evidence.primary_bars)), int(bool(evidence.adjusted_bars)),
@@ -785,6 +948,7 @@ def _publish_recovered_checkpoints_batch(
             sha256(canonical_facts) if canonical_facts else None,
             sha256(evidence.verification_bars) if evidence.verification_bars else None,
             sha256(evidence.adjustments) if evidence.adjustments else None,
+            sha256(canonical_lineage) if canonical_lineage else None,
             None, None,
         ))
     try:
@@ -796,7 +960,7 @@ def _publish_recovered_checkpoints_batch(
             for table in (
                 "m2_daily_primary_bars", "m2_daily_adjusted_bars",
                 "m2_daily_tradeability_facts", "m2_daily_verification_bars",
-                "m2_daily_adjustment_events",
+                "m2_daily_adjustment_events", "m2_daily_lineage_evidence",
             ):
                 cursor.execute(
                     f"DELETE FROM {table} WHERE dataset_id=%s AND symbol IN ({placeholders})",
@@ -807,6 +971,7 @@ def _publish_recovered_checkpoints_batch(
         _upsert_many(connection, TRADEABILITY_UPSERT, _fact_rows(dataset_id, fact_rows))
         _upsert_many(connection, VERIFICATION_UPSERT, _primary_rows(dataset_id, verification_rows))
         _upsert_many(connection, ADJUSTMENT_UPSERT, _event_rows(dataset_id, event_rows))
+        _upsert_many(connection, LINEAGE_UPSERT, _lineage_rows(dataset_id, lineage_rows))
         _upsert_many(connection, CHECKPOINT_UPSERT, checkpoint_rows)
         connection.commit()
     except BaseException:
@@ -965,6 +1130,7 @@ def recover_compatible_daily_checkpoints(
             facts = [item for item in evidence.tradeability if item["symbol"] == symbol]
             verification = [item for item in evidence.verification_bars if item["symbol"] == symbol]
             events = [item for item in evidence.adjustments if item["symbol"] == symbol]
+            lineage = [item for item in evidence.lineage_evidence if item["symbol"] == symbol]
             if len(facts) != 1 or facts[0]["index_code"] != expected[symbol]:
                 continue
             if len(primary) > 1 or len(adjusted) > 1 or len(verification) > 1:
@@ -987,6 +1153,7 @@ def recover_compatible_daily_checkpoints(
                 tradeability=facts,
                 verification_bars=verification,
                 adjustments=events,
+                lineage_evidence=lineage,
             )
             if not _recovered_lineage_matches(
                 symbol=symbol,
@@ -1015,6 +1182,7 @@ def recover_compatible_daily_checkpoints(
                 tradeability=selected_evidence.tradeability,
                 verification_bars=selected_evidence.verification_bars,
                 adjustments=selected_evidence.adjustments,
+                lineage_evidence=selected_evidence.lineage_evidence,
             )
             primary_name = str(primary[0]["source"]) if primary else ""
             rank = (source_rank.get(primary_name, 99), -len(succeeded), candidate_id)
@@ -1099,6 +1267,87 @@ def load_previous_adjusted_states(
     return states
 
 
+def load_latest_prior_adjusted_states(
+    connection: Any,
+    *,
+    base_history_dataset_id: str,
+    previous_session: date,
+    symbols: Iterable[str],
+) -> dict[str, PreviousAdjustedState]:
+    """Load the latest immutable state before a missing exact predecessor."""
+    requested = tuple(sorted({normalize_symbol(symbol) for symbol in symbols}))
+    if not requested:
+        return {}
+    placeholders = ",".join(["%s"] * len(requested))
+    daily_rows = _query_all(connection, f"""
+        SELECT b.symbol, b.business_date, b.close_price, b.qfq_factor, b.hfq_factor,
+               b.dataset_id
+        FROM m2_daily_adjusted_bars b
+        JOIN m2_daily_runs r ON r.dataset_id=b.dataset_id
+        WHERE r.base_history_dataset_id=%s AND r.accepted=1
+          AND r.authoritative=0 AND r.simulation_orders_allowed=0
+          AND b.business_date<%s AND b.symbol IN ({placeholders})
+        ORDER BY b.symbol, b.business_date DESC
+    """, (base_history_dataset_id, previous_session.isoformat(), *requested))
+    history_rows = _query_all(connection, f"""
+        SELECT b.symbol, b.business_date, b.close_price, b.qfq_factor, b.hfq_factor,
+               %s AS source_dataset_id
+        FROM m2_history_run_shards s
+        JOIN m2_historical_bars b ON b.dataset_id=s.shard_dataset_id
+        WHERE s.merged_dataset_id=%s AND b.business_date<%s
+          AND b.symbol IN ({placeholders})
+        ORDER BY b.symbol, b.business_date DESC
+    """, (
+        base_history_dataset_id, base_history_dataset_id, previous_session.isoformat(), *requested,
+    ))
+    candidates: dict[str, PreviousAdjustedState] = {}
+    for row in [*daily_rows, *history_rows]:
+        symbol = str(row[0])
+        candidate = PreviousAdjustedState(
+            symbol=symbol,
+            business_date=date.fromisoformat(_date_text(row[1])),
+            raw_close=Decimal(str(row[2])),
+            qfq_factor=Decimal(str(row[3])),
+            hfq_factor=Decimal(str(row[4])),
+            source_dataset_id=str(row[5]),
+        )
+        existing = candidates.get(symbol)
+        if existing is None or candidate.business_date > existing.business_date:
+            candidates[symbol] = candidate
+    return candidates
+
+
+def recovered_previous_states_from_lineage(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    previous_session: date,
+) -> dict[str, PreviousAdjustedState]:
+    """Rehydrate exact predecessor states from hash-verified V4 evidence."""
+    states: dict[str, PreviousAdjustedState] = {}
+    for raw in rows:
+        row = canonical_lineage_evidence(raw)
+        if row["kind"] != "gap_no_adjustment_recovery":
+            continue
+        details = row["details"]
+        recovered_session = parse_date(details.get("recovered_session"))
+        if recovered_session != previous_session:
+            raise RuntimeError(
+                f"daily lineage recovery has the wrong predecessor session for {row['symbol']}"
+            )
+        state = PreviousAdjustedState(
+            symbol=row["symbol"],
+            business_date=recovered_session,
+            raw_close=Decimal(str(details["recovered_raw_close"])),
+            qfq_factor=Decimal(str(details["qfq_factor"])),
+            hfq_factor=Decimal(str(details["hfq_factor"])),
+            source_dataset_id=f"daily-lineage:{sha256(row)}",
+        )
+        if state.symbol in states and states[state.symbol] != state:
+            raise RuntimeError(f"conflicting daily lineage recoveries for {state.symbol}")
+        states[state.symbol] = state
+    return states
+
+
 def load_base_references(connection: Any, base_history_dataset_id: str) -> dict[str, date]:
     rows = _query_all(connection, """
         SELECT r.symbol, r.ipo_date
@@ -1156,17 +1405,23 @@ def latest_accepted_lineage(
 
 
 def _manifest_hashes(evidence: DailyEvidence) -> dict[str, Any]:
+    canonical_lineage = sorted(
+        (canonical_lineage_evidence(row) for row in evidence.lineage_evidence),
+        key=lambda row: (row["symbol"], row["kind"]),
+    )
     return {
         "primary_row_count": len(evidence.primary_bars),
         "adjusted_row_count": len(evidence.adjusted_bars),
         "tradeability_row_count": len(evidence.tradeability),
         "verification_row_count": len(evidence.verification_bars),
         "adjustment_event_count": len(evidence.adjustments),
+        "lineage_evidence_count": len(canonical_lineage),
         "primary_sha256": sha256(evidence.primary_bars),
         "adjusted_sha256": sha256(evidence.adjusted_bars),
         "tradeability_sha256": sha256(evidence.tradeability),
         "verification_sha256": sha256(evidence.verification_bars),
         "adjustments_sha256": sha256(evidence.adjustments),
+        "lineage_evidence_sha256": sha256(canonical_lineage),
     }
 
 
@@ -1222,9 +1477,11 @@ def publish_daily_run(
         base_history_dataset_id, predecessor_dataset_id, scope_hash, 0, 0, 1,
         expected_symbols, expected["primary_row_count"], expected["adjusted_row_count"],
         expected["tradeability_row_count"], expected["verification_row_count"],
-        expected["adjustment_event_count"], expected["primary_sha256"],
+        expected["adjustment_event_count"], expected["lineage_evidence_count"],
+        expected["primary_sha256"],
         expected["adjusted_sha256"], expected["tradeability_sha256"],
         expected["verification_sha256"], expected["adjustments_sha256"],
+        expected["lineage_evidence_sha256"],
         manifest["quality_sha256"], manifest_hash, _compact(manifest),
     )
     with connection.cursor() as cursor:
@@ -1237,5 +1494,6 @@ __all__ = [
     "DAILY_STORE_SCHEMA_VERSION", "DailyEvidence", "TiDBConfig", "connect",
     "default_daily_dataset_id", "ensure_daily_schema", "latest_accepted_lineage",
     "load_base_references", "load_daily_checkpoint_evidence", "load_daily_evidence",
-    "load_previous_adjusted_states", "publish_daily_run", "publish_daily_symbol_checkpoint",
+    "load_latest_prior_adjusted_states", "load_previous_adjusted_states",
+    "recovered_previous_states_from_lineage", "publish_daily_run", "publish_daily_symbol_checkpoint",
 ]

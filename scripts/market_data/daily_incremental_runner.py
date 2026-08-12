@@ -37,6 +37,7 @@ from scripts.market_data.daily_incremental import (
 )
 from scripts.market_data.historical_bars import load_calendars
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
+from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_universe import reconstruct
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.akshare_history_source import (
@@ -50,16 +51,19 @@ from scripts.market_data.sources.tencent_history_source import TencentHistorySou
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     TiDBConfig,
+    canonical_lineage_evidence,
     connect,
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
     load_base_references,
     load_daily_checkpoint_evidence,
+    load_latest_prior_adjusted_states,
     load_previous_adjusted_states,
     publish_daily_run,
     publish_daily_symbol_checkpoint,
     recover_compatible_daily_checkpoints,
+    recovered_previous_states_from_lineage,
 )
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -246,6 +250,7 @@ def _checkpoint_evidence(
     events: Iterable[AdjustmentEvent],
     status_source: str | None = None,
     previous_close_source: str | None = None,
+    lineage_evidence: Iterable[dict[str, Any]] = (),
 ) -> DailyEvidence:
     return DailyEvidence(
         manifest={
@@ -259,6 +264,10 @@ def _checkpoint_evidence(
         verification_bars=[] if verification is None else [verification.canonical()],
         adjusted_bars=[] if adjusted is None else [adjusted.canonical()],
         adjustments=[event.canonical() for event in events],
+        lineage_evidence=sorted(
+            (canonical_lineage_evidence(row) for row in lineage_evidence),
+            key=lambda row: (row["symbol"], row["kind"]),
+        ),
     )
 
 
@@ -283,6 +292,7 @@ def capture_symbol(
     fallback_suspended_symbols: frozenset[str] = frozenset(),
     fallback_status_available: bool = True,
     previous_states: dict[str, PreviousAdjustedState],
+    fallback_previous_states: dict[str, PreviousAdjustedState] | None = None,
     ipo_dates: dict[str, date],
     calendar_dates: tuple[date, ...],
 ) -> tuple[DailyEvidence, Decimal | None, str, Exception | None]:
@@ -297,6 +307,7 @@ def capture_symbol(
     adjusted: HistoricalBar | None = None
     verification: DailyBar | None = None
     events: list[AdjustmentEvent] = []
+    lineage_evidence: list[dict[str, Any]] = []
     recoverable_error: Exception | None = None
     primary_source_name: str | None = None
     reported: Decimal | None = None
@@ -362,7 +373,55 @@ def capture_symbol(
 
     state = previous_states.get(symbol)
     if state is None or state.business_date != plan.previous_session:
-        error = RuntimeError(f"exact predecessor adjusted state missing for {symbol}")
+        prior_state = (fallback_previous_states or {}).get(symbol)
+        recovery_error: Exception | None = None
+        if prior_state is not None and prior_state.business_date < plan.previous_session:
+            required_sessions = tuple(
+                session for session in calendar_dates
+                if prior_state.business_date <= session <= plan.previous_session
+            )
+            try:
+                recovered_close, recovery_details = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).recover_no_adjustment_predecessor(
+                    symbol,
+                    prior_state.business_date,
+                    plan.previous_session,
+                    prior_state.raw_close,
+                    required_sessions,
+                )
+                recovery_details.update({
+                    "prior_source_dataset_id": prior_state.source_dataset_id,
+                    "qfq_factor": format(prior_state.qfq_factor, "f"),
+                    "hfq_factor": format(prior_state.hfq_factor, "f"),
+                })
+                recovery_evidence = canonical_lineage_evidence({
+                    "symbol": symbol,
+                    "target_session": target.isoformat(),
+                    "kind": "gap_no_adjustment_recovery",
+                    "source": "tencent_raw_hfq_continuity",
+                    "details": recovery_details,
+                })
+                lineage_evidence.append(recovery_evidence)
+                state = PreviousAdjustedState(
+                    symbol=symbol,
+                    business_date=plan.previous_session,
+                    raw_close=recovered_close,
+                    qfq_factor=prior_state.qfq_factor,
+                    hfq_factor=prior_state.hfq_factor,
+                    source_dataset_id=f"daily-lineage:{sha256(recovery_evidence)}",
+                )
+                previous_states[symbol] = state
+            except Exception as error:
+                recovery_error = error
+        if state is None or state.business_date != plan.previous_session:
+            error = recovery_error or RuntimeError(f"exact predecessor adjusted state missing for {symbol}")
+        else:
+            error = None
+    else:
+        error = None
+    if error is not None:
         blocked_fact = derive_tradeability(
             symbol=symbol, business_date=target, index_code=plan.membership[symbol],
             listing_age_sessions=age, primary=None, secondary=secondary,
@@ -376,6 +435,7 @@ def capture_symbol(
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
             status_source=status_source, previous_close_source=previous_close_source,
+            lineage_evidence=lineage_evidence,
         ), reported, "blocked", error
     if reported is None or reported <= 0:
         raise RuntimeError(f"positive reported previous close missing for {symbol}")
@@ -388,7 +448,7 @@ def capture_symbol(
                 events = _target_events(primary_source, symbol, target)
             except RuntimeError as factor_error:
                 if (
-                    primary_source_name != "akshare_sina"
+                    primary_source_name not in {"akshare_sina", "tencent_archive"}
                     or not str(factor_error).startswith("AKShare Sina returned no ")
                 ):
                     raise
@@ -397,6 +457,26 @@ def capture_symbol(
                     attempts=min(primary_source.attempts, 2),
                 ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
                 previous_close_source = f"{previous_close_source}+{continuity_source}"
+            if events and previous_close_source in {
+                "akshare_sina_exact_predecessor_close",
+                "tencent_exact_predecessor_close",
+            }:
+                reported, action_details = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).fetch_cash_dividend_reference(
+                    symbol, plan.previous_session, target, state.raw_close,
+                )
+                previous_close_source = "tencent_structured_cash_dividend"
+                lineage_evidence.append(canonical_lineage_evidence({
+                    "symbol": symbol,
+                    "target_session": target.isoformat(),
+                    "kind": "cash_dividend_reference",
+                    "source": "tencent_archive",
+                    "details": action_details,
+                }))
+                if secondary is not None:
+                    secondary["preclose"] = format(reported, "f")
         adjusted_rows = build_daily_adjusted_bars(
             target_session=target, previous_session=plan.previous_session,
             membership=plan.membership, primary_bars=[primary], previous_states={symbol: state},
@@ -417,7 +497,12 @@ def capture_symbol(
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
             status_source=status_source, previous_close_source=previous_close_source,
+            lineage_evidence=lineage_evidence,
         ), reported, "blocked", error
+    fact = derive_tradeability(
+        symbol=symbol, business_date=target, index_code=plan.membership[symbol],
+        listing_age_sessions=age, primary=_tradeability_row(primary), secondary=secondary,
+    )
     if verification_required:
         try:
             values = verification_source.fetch_raw(
@@ -430,6 +515,7 @@ def capture_symbol(
     evidence = _checkpoint_evidence(
         primary=primary, fact=fact, verification=verification, adjusted=adjusted, events=events,
         status_source=status_source, previous_close_source=previous_close_source,
+        lineage_evidence=lineage_evidence,
     )
     if verification_required and verification is None:
         assert recoverable_error is not None
@@ -539,6 +625,22 @@ def run(
             connection, predecessor_dataset_id=predecessor_dataset_id,
             previous_session=base_plan.previous_session,
         )
+        recovered_states = recovered_previous_states_from_lineage(
+            stored.lineage_evidence,
+            previous_session=base_plan.previous_session,
+        )
+        for symbol, recovered_state in recovered_states.items():
+            existing_state = previous_states.get(symbol)
+            if existing_state is not None and existing_state != recovered_state:
+                raise RuntimeError(f"stored lineage conflicts with accepted predecessor for {symbol}")
+            previous_states[symbol] = recovered_state
+        missing_predecessor_symbols = set(base_plan.membership) - set(previous_states)
+        fallback_previous_states = load_latest_prior_adjusted_states(
+            connection,
+            base_history_dataset_id=base_history_dataset_id,
+            previous_session=base_plan.previous_session,
+            symbols=missing_predecessor_symbols,
+        )
         ipo_dates = load_base_references(connection, base_history_dataset_id)
         recovery = {
             "already_present": len(metadata["succeeded_symbols"]),
@@ -647,7 +749,9 @@ def run(
                             verification_source=verification_source, secondary_source=secondary_source,
                             fallback_suspended_symbols=fallback_suspended_symbols,
                             fallback_status_available=fallback_status_available,
-                            previous_states=previous_states, ipo_dates=ipo_dates,
+                            previous_states=previous_states,
+                            fallback_previous_states=fallback_previous_states,
+                            ipo_dates=ipo_dates,
                             calendar_dates=primary_calendar.open_dates,
                         )
                     final_error = error
@@ -723,6 +827,10 @@ def run(
     verification_rows = [_daily_bar_from_canonical(row) for row in stored.verification_bars]
     adjusted_rows = [_historical_bar_from_canonical(row) for row in stored.adjusted_bars]
     event_rows = [_event_from_canonical(row) for row in stored.adjustments]
+    lineage_rows = sorted(
+        (canonical_lineage_evidence(row) for row in stored.lineage_evidence),
+        key=lambda row: (row["symbol"], row["kind"]),
+    )
     reported_closes = metadata["reported_previous_closes"]
     accepted_closes = {
         symbol: state.raw_close for symbol, state in previous_states.items()
@@ -755,6 +863,8 @@ def run(
     manifest["status_source_counts"] = dict(sorted(status_source_counts.items()))
     manifest["reported_previous_close_source_counts"] = dict(sorted(previous_close_source_counts.items()))
     manifest["recovered_checkpoint_count"] = len(metadata["checkpoint_origin_dataset_ids"])
+    manifest["lineage_evidence_count"] = len(lineage_rows)
+    manifest["lineage_evidence_sha256"] = sha256(lineage_rows)
     manifest.update({
         "dataset_id": dataset_id,
         "base_history_dataset_id": base_history_dataset_id,
@@ -768,7 +878,7 @@ def run(
     })
     write_outputs(
         output_dir, manifest, primary_rows, fact_rows, verification_rows,
-        adjusted_rows, event_rows,
+        adjusted_rows, event_rows, lineage_rows,
     )
     if not manifest["accepted"]:
         failed = [gate for gate in manifest["gates"] if gate["critical"] and not gate["passed"]]
@@ -785,6 +895,7 @@ def run(
         verification_bars=[row.canonical() for row in verification_rows],
         adjusted_bars=[row.canonical() for row in adjusted_rows],
         adjustments=[row.canonical() for row in event_rows],
+        lineage_evidence=lineage_rows,
     )
     connection = connect(config)
     try:

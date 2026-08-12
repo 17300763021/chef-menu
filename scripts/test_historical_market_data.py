@@ -472,6 +472,66 @@ class HistoricalMarketDataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HFQ factor changed"):
                 source.verify_no_adjustment_continuity("689009", previous, target)
 
+    def test_tencent_cash_dividend_reference_requires_exact_structured_action(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        previous = date(2026, 7, 27)
+        target = date(2026, 7, 28)
+        row = [
+            "2026-07-28", "16.30", "16.42", "16.50", "16.20", "1",
+            {
+                "nd": "2025", "fh_sh": "3.79", "djr": "2026-07-27",
+                "cqr": "2026-07-28", "FHcontent": "10派3.79元",
+            },
+        ]
+        with patch.object(source, "_rows", return_value=[row]):
+            reference, details = source.fetch_cash_dividend_reference(
+                "600062", previous, target, Decimal("16.80"),
+            )
+        self.assertEqual(reference, Decimal("16.42"))
+        self.assertEqual(details["cash_per_ten_shares"], "3.790000")
+        self.assertEqual(details["ex_rights_date"], target.isoformat())
+
+        unsupported = copy.deepcopy(row)
+        unsupported[6]["FHcontent"] = "10送1派3.79元"
+        with patch.object(source, "_rows", return_value=[unsupported]):
+            with self.assertRaisesRegex(RuntimeError, "unsupported corporate action"):
+                source.fetch_cash_dividend_reference(
+                    "600062", previous, target, Decimal("16.80"),
+                )
+
+        inconsistent = copy.deepcopy(row)
+        inconsistent[6]["fh_sh"] = "3.78"
+        with patch.object(source, "_rows", return_value=[inconsistent]):
+            with self.assertRaisesRegex(RuntimeError, "fields disagree"):
+                source.fetch_cash_dividend_reference(
+                    "600062", previous, target, Decimal("16.80"),
+                )
+
+    def test_tencent_gap_recovery_requires_every_session_and_unchanged_factor(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        prior = date(2026, 7, 24)
+        previous = date(2026, 7, 27)
+        raw = [
+            ["2026-07-24", "38.00", "38.18", "38.50", "37.80", "1"],
+            ["2026-07-27", "39.00", "39.41", "39.80", "38.80", "1"],
+        ]
+        hfq = [
+            ["2026-07-24", "39.80", "39.99", "40.32", "39.59", "1"],
+            ["2026-07-27", "40.80", "41.22", "41.63", "40.59", "1"],
+        ]
+        with patch.object(source, "_rows", side_effect=[raw, hfq]):
+            recovered, details = source.recover_no_adjustment_predecessor(
+                "689009", prior, previous, Decimal("38.18"), (prior, previous),
+            )
+        self.assertEqual(recovered, Decimal("39.4100"))
+        self.assertEqual(details["observed_sessions"], [prior.isoformat(), previous.isoformat()])
+
+        with patch.object(source, "_rows", side_effect=[raw[1:], hfq[1:]]):
+            with self.assertRaisesRegex(RuntimeError, "every required session"):
+                source.recover_no_adjustment_predecessor(
+                    "689009", prior, previous, Decimal("38.18"), (prior, previous),
+                )
+
     def test_primary_history_run_does_not_require_baostock_history_login(self) -> None:
         calendar = TradingCalendar.build(
             "akshare_calendar", date(2026, 7, 20), date(2026, 7, 22),
