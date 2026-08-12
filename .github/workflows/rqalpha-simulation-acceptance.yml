@@ -1,0 +1,73 @@
+name: M3 RQAlpha Simulation Ledger Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Disabled M3.1 contract acceptance only; never runs a simulation account"
+        required: true
+        default: deterministic
+        type: choice
+        options: [deterministic, framework-smoke]
+  pull_request:
+    branches: [main, codex/m2-industry-pit]
+    paths:
+      - .github/workflows/rqalpha-simulation-acceptance.yml
+      - scripts/simulation/**
+      - scripts/test_v2_simulation_*.py
+      - scripts/framework-requirements.txt
+      - supabase/migrations/20260812090000_add_v2_simulation_ledger.sql
+      - .python-version
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m3-rqalpha-ledger-${{ github.event_name }}-${{ inputs.mode || 'deterministic' }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  deterministic-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - name: Verify disabled simulation contracts, reconciliation, and schema
+        run: |
+          python -m scripts.test_v2_simulation_contracts
+          python -m scripts.test_v2_simulation_reconciliation
+          python -m scripts.test_v2_simulation_schema
+          python -m scripts.test_cloud_runtime
+
+  framework-public-api-smoke:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'framework-smoke')
+    needs: deterministic-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/framework-requirements.txt
+      - name: Install pinned RQAlpha without enabling any account
+        run: python -m pip install "rqalpha==6.2.1"
+      - name: Verify pinned public API only
+        run: |
+          python - <<'PY'
+          import inspect
+          from importlib.metadata import version
+          from rqalpha import run_func
+          from rqalpha.api import order_shares
+          assert version("rqalpha") == "6.2.1"
+          assert "config" in inspect.getdoc(run_func)
+          assert list(inspect.signature(order_shares).parameters)[:2] == ["id_or_ins", "amount"]
+          print("RQAlpha 6.2.1 public API accepted; no simulation account was run")
+          PY
