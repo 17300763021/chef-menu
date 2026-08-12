@@ -23,6 +23,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
+    _canonical_adjusted_bar,
     canonical_lineage_evidence,
     default_daily_dataset_id,
     ensure_daily_schema,
@@ -206,6 +207,29 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 reported_previous_close=Decimal("10"), status="succeeded",
             )
 
+    def test_adjusted_checkpoint_hash_uses_tidb_decimal_precision(self) -> None:
+        evidence = complete_evidence()
+        evidence.adjusted_bars[0]["previous_close"] = "9.5"
+        connection = FakeConnection()
+        publish_daily_symbol_checkpoint(
+            connection, evidence, dataset_id="daily-scope", symbol="000001",
+            target_session=TARGET, verification_required=True,
+            reported_previous_close=Decimal("9.5"), status="succeeded",
+        )
+        adjusted_batch = next(
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_adjusted_bars" in sql
+        )
+        checkpoint_batch = next(
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_symbol_checkpoints" in sql
+        )
+        canonical = _canonical_adjusted_bar(evidence.adjusted_bars[0])
+        self.assertEqual(canonical["previous_close"], "9.5000")
+        self.assertEqual(adjusted_batch[0][9], "9.5000")
+        self.assertEqual(adjusted_batch[0][-1], sha256(canonical))
+        self.assertEqual(checkpoint_batch[0][14], sha256([canonical]))
+
     def test_lineage_evidence_is_canonical_persisted_and_rehydrates_predecessor(self) -> None:
         evidence = complete_evidence()
         lineage = canonical_lineage_evidence({
@@ -252,7 +276,9 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "adjustment_event_count": len(evidence.adjustments),
             "lineage_evidence_count": len(evidence.lineage_evidence),
             "primary_sha256": sha256(evidence.primary_bars),
-            "adjusted_sha256": sha256(evidence.adjusted_bars),
+            "adjusted_sha256": sha256([
+                _canonical_adjusted_bar(row) for row in evidence.adjusted_bars
+            ]),
             "tradeability_sha256": sha256(evidence.tradeability),
             "verification_sha256": sha256(evidence.verification_bars),
             "adjustments_sha256": sha256(evidence.adjustments),
@@ -260,7 +286,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         }
         manifest = {
             **evidence.manifest, **values,
-            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v4",
+            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v5",
             "target_session": TARGET.isoformat(), "previous_session": PREVIOUS.isoformat(),
             "snapshot_effective_session": PREVIOUS.isoformat(), "scope_sha256": scope_hash,
             "expected_symbol_count": 1, "quality_sha256": "e" * 64,
@@ -331,7 +357,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
     def test_checkpoint_readback_reconciles_row_and_symbol_hashes(self) -> None:
         evidence = complete_evidence()
         primary = evidence.primary_bars[0]
-        adjusted = evidence.adjusted_bars[0]
+        adjusted = _canonical_adjusted_bar(evidence.adjusted_bars[0])
         fact = evidence.tradeability[0]
         verification = evidence.verification_bars[0]
 
@@ -668,7 +694,53 @@ class FakeSecondary:
         return {TARGET: {"tradestatus": self.status, "isST": "0", "preclose": self.preclose}}
 
 
+class FakeBaoStockVerification(FakeSecondary):
+    def __init__(self, *, close: Decimal = Decimal("10.00")) -> None:
+        super().__init__()
+        self.close = close
+
+    def bars_from_status(self, symbol: str, rows):
+        bar = raw_bar(symbol, source="baostock")
+        if self.close != bar.close:
+            bar = DailyBar(
+                source=bar.source, symbol=bar.symbol, exchange=bar.exchange,
+                business_date=bar.business_date, open=self.close, high=self.close,
+                low=self.close, close=self.close, previous_close=bar.previous_close,
+                volume_shares=bar.volume_shares, amount_cny=bar.amount_cny,
+                turnover_percent=bar.turnover_percent, trade_status=bar.trade_status,
+                is_st=bar.is_st,
+            )
+        return {TARGET: bar}
+
+
 class DailyCaptureTests(unittest.TestCase):
+    def test_baostock_is_last_resort_independent_verification_only(self) -> None:
+        evidence, reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeVerification(fail=True), secondary_source=None,
+            verification_fallback_source=FakeBaoStockVerification(),
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual((reported, status, error), (Decimal("10"), "succeeded", None))
+        self.assertEqual(evidence.primary_bars[0]["source"], "akshare_eastmoney")
+        self.assertEqual(evidence.verification_bars[0]["source"], "baostock")
+
+        blocked, _reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeVerification(fail=True), secondary_source=None,
+            verification_fallback_source=FakeBaoStockVerification(close=Decimal("20.00")),
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("BaoStock verification disagrees", str(error))
+        self.assertEqual(blocked.verification_bars, [])
+
     def test_baostock_blacklist_falls_back_without_opening_tradeability(self) -> None:
         evidence, reported, status, error = capture_symbol(
             plan=plan(), symbol="000001", primary_source=FakePrimary(),

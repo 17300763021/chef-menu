@@ -35,6 +35,7 @@ from scripts.market_data.daily_incremental import (
     latest_closed_session,
     write_outputs,
 )
+from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_bars import load_calendars
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
 from scripts.market_data.manifest import sha256
@@ -289,6 +290,7 @@ def capture_symbol(
     primary_source: AkshareEastmoneyHistorySource,
     verification_source: AkshareHistorySource,
     secondary_source: BaostockHistorySource | None,
+    verification_fallback_source: BaostockHistorySource | None = None,
     fallback_suspended_symbols: frozenset[str] = frozenset(),
     fallback_status_available: bool = True,
     previous_states: dict[str, PreviousAdjustedState],
@@ -511,6 +513,30 @@ def capture_symbol(
             verification = _one_target_row(values, symbol, target, "verification source")
         except Exception as error:
             recoverable_error = error
+            if verification_fallback_source is not None and primary.source != "baostock":
+                try:
+                    fallback_status = verification_fallback_source.fetch_status(
+                        symbol, target, target,
+                    )
+                    fallback_bars = verification_fallback_source.bars_from_status(
+                        symbol, fallback_status,
+                    )
+                    verification = _one_target_row(
+                        fallback_bars.values(), symbol, target, "BaoStock verification source",
+                    )
+                    consistency_errors = cross_source_consistency_errors(primary, verification)
+                    if consistency_errors:
+                        raise RuntimeError(
+                            f"BaoStock verification disagrees for {symbol}: "
+                            f"{','.join(consistency_errors)}"
+                        )
+                    recoverable_error = None
+                except Exception as fallback_error:
+                    verification = None
+                    recoverable_error = RuntimeError(
+                        f"{error}; baostock_verification: "
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
 
     evidence = _checkpoint_evidence(
         primary=primary, fact=fact, verification=verification, adjusted=adjusted, events=events,
@@ -703,6 +729,7 @@ def run(
     verification_source = AkshareHistorySource(timeout_seconds=25, attempts=2)
     with ExitStack() as source_stack:
         secondary_source: BaostockHistorySource | None = None
+        verification_fallback_source: BaostockHistorySource | None = None
         fallback_suspended_symbols: frozenset[str] = frozenset()
         fallback_status_available = False
         if selected_fetch_symbols:
@@ -739,6 +766,28 @@ def run(
                         error=f"{type(fallback_error).__name__}: {fallback_error}",
                         trading_policy="missing_status_blocks_buy_and_sell",
                     )
+        verification_pending = bool(
+            set(selected_fetch_symbols) & set(plan.verification_symbols)
+        )
+        if verification_pending:
+            verification_fallback_source = secondary_source
+            if verification_fallback_source is None:
+                try:
+                    verification_fallback_source = source_stack.enter_context(
+                        BaostockHistorySource(timeout_seconds=25, attempts=1)
+                    )
+                    _progress(
+                        "daily_verification_fallback_ready",
+                        source="baostock_daily_bar",
+                        policy="used_only_after_non_primary_public_sources_fail",
+                    )
+                except Exception as fallback_error:
+                    _progress(
+                        "daily_verification_fallback_unavailable",
+                        unavailable_source="baostock_daily_bar",
+                        error=f"{type(fallback_error).__name__}: {fallback_error}",
+                        verification_policy="missing_verification_fails_closed",
+                    )
         for position, symbol in enumerate(selected_fetch_symbols, start=1):
             final_error: Exception | str | None = None
             for attempt in range(1, symbol_attempts + 1):
@@ -747,6 +796,7 @@ def run(
                         evidence, reported, status, error = capture_symbol(
                             plan=plan, symbol=symbol, primary_source=primary_source,
                             verification_source=verification_source, secondary_source=secondary_source,
+                            verification_fallback_source=verification_fallback_source,
                             fallback_suspended_symbols=fallback_suspended_symbols,
                             fallback_status_available=fallback_status_available,
                             previous_states=previous_states,

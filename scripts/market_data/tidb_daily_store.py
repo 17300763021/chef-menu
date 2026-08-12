@@ -23,9 +23,12 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v4"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v5"
 DAILY_LINEAGE_SCHEMA_VERSION = "m2-daily-lineage-evidence-v1"
 TRADEABILITY_QUANTUM = Decimal("0.01")
+STORAGE_PRICE_QUANTUM = Decimal("0.0001")
+STORAGE_AMOUNT_QUANTUM = Decimal("0.01")
+STORAGE_RATIO_QUANTUM = Decimal("0.000001")
 
 
 def _compact(value: Any) -> str:
@@ -56,6 +59,64 @@ def _tradeability_decimal(value: Any, field: str) -> str | None:
     if not parsed.is_finite() or parsed != normalized:
         raise ValueError(f"{field} exceeds the two-decimal tradeability contract: {value!r}")
     return format(normalized, "f")
+
+
+def _storage_decimal(
+    value: Any,
+    quantum: Decimal,
+    field: str,
+    *,
+    allow_none: bool = False,
+) -> str | None:
+    """Canonicalize a number exactly as TiDB DECIMAL stores it."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{field} cannot be null")
+    try:
+        parsed = Decimal(str(value))
+        normalized = parsed.quantize(quantum)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"invalid {field}: {value!r}") from error
+    if not parsed.is_finite() or parsed != normalized:
+        raise ValueError(f"{field} exceeds TiDB storage precision: {value!r}")
+    return format(normalized, "f")
+
+
+def _canonical_adjusted_bar(row: Mapping[str, Any]) -> dict[str, Any]:
+    price_fields = (
+        "open", "high", "low", "close", "previous_close",
+        "qfq_open", "qfq_high", "qfq_low", "qfq_close",
+        "hfq_open", "hfq_high", "hfq_low", "hfq_close",
+    )
+    canonical = {
+        "symbol": str(row["symbol"]),
+        "business_date": _date_text(row["business_date"]),
+        "exchange": str(row["exchange"]),
+        "index_code": str(row["index_code"]),
+        **{
+            field: _storage_decimal(row.get(field), STORAGE_PRICE_QUANTUM, field)
+            for field in price_fields
+        },
+        "volume_shares": int(row["volume_shares"]),
+        "amount_cny": _storage_decimal(
+            row.get("amount_cny"), STORAGE_AMOUNT_QUANTUM, "amount_cny",
+        ),
+        "turnover_percent": _storage_decimal(
+            row.get("turnover_percent"), STORAGE_RATIO_QUANTUM, "turnover_percent",
+            allow_none=True,
+        ),
+        "qfq_factor": _storage_decimal(
+            row.get("qfq_factor"), STORAGE_RATIO_QUANTUM, "qfq_factor",
+        ),
+        "hfq_factor": _storage_decimal(
+            row.get("hfq_factor"), STORAGE_RATIO_QUANTUM, "hfq_factor",
+        ),
+        "primary_source": str(row["primary_source"]),
+        "factor_source": str(row["factor_source"]),
+        "schema_version": str(row["schema_version"]),
+    }
+    return canonical
 
 
 def _canonical_tradeability_fact(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -583,6 +644,7 @@ def _primary_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tu
 
 
 def _adjusted_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
+    canonical_rows = [_canonical_adjusted_bar(row) for row in rows]
     return [(
         dataset_id, row["symbol"], row["business_date"], row["exchange"], row["index_code"],
         row["open"], row["high"], row["low"], row["close"], row["previous_close"],
@@ -591,7 +653,7 @@ def _adjusted_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[t
         row["qfq_low"], row["qfq_close"], row["hfq_open"], row["hfq_high"],
         row["hfq_low"], row["hfq_close"], row["primary_source"], row["factor_source"],
         row["schema_version"], sha256(row),
-    ) for row in rows]
+    ) for row in canonical_rows]
 
 
 def _fact_rows(dataset_id: str, rows: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
@@ -656,7 +718,10 @@ def publish_daily_symbol_checkpoint(
     if observed_symbols - {symbol}:
         raise ValueError(f"daily symbol checkpoint contains other symbols: {sorted(observed_symbols)}")
     primary_rows = [row for row in evidence.primary_bars if row.get("symbol") == symbol]
-    adjusted_rows = [row for row in evidence.adjusted_bars if row.get("symbol") == symbol]
+    adjusted_rows = [
+        _canonical_adjusted_bar(row)
+        for row in evidence.adjusted_bars if row.get("symbol") == symbol
+    ]
     fact_rows = [
         _canonical_tradeability_fact(row)
         for row in evidence.tradeability if row.get("symbol") == symbol
@@ -821,7 +886,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         }
 
     canonical_primary = [daily_bar(row) for row in primary]
-    canonical_adjusted = [{
+    canonical_adjusted = [_canonical_adjusted_bar({
         "symbol": str(row[0]), "business_date": _date_text(row[1]), "exchange": row[2],
         "index_code": row[3], "open": _decimal(row[4]), "high": _decimal(row[5]),
         "low": _decimal(row[6]), "close": _decimal(row[7]), "previous_close": _decimal(row[8]),
@@ -833,7 +898,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
         "hfq_high": _decimal(row[19]), "hfq_low": _decimal(row[20]),
         "hfq_close": _decimal(row[21]), "primary_source": row[22],
         "factor_source": row[23], "schema_version": row[24],
-    } for row in adjusted]
+    }) for row in adjusted]
     canonical_facts = [_canonical_tradeability_fact({
         "symbol": str(row[0]), "business_date": _date_text(row[1]), "index_code": row[2],
         "has_primary_bar": bool(row[3]), "has_secondary_status": bool(row[4]),
@@ -928,7 +993,8 @@ def _publish_recovered_checkpoints_batch(
         _rank, candidate_id, evidence, reported, status_source, previous_source = choices[symbol]
         canonical_facts = [_canonical_tradeability_fact(row) for row in evidence.tradeability]
         primary_rows.extend(evidence.primary_bars)
-        adjusted_rows.extend(evidence.adjusted_bars)
+        canonical_adjusted = [_canonical_adjusted_bar(row) for row in evidence.adjusted_bars]
+        adjusted_rows.extend(canonical_adjusted)
         fact_rows.extend(canonical_facts)
         verification_rows.extend(evidence.verification_bars)
         event_rows.extend(evidence.adjustments)
@@ -939,12 +1005,12 @@ def _publish_recovered_checkpoints_batch(
         lineage_rows.extend(canonical_lineage)
         checkpoint_rows.append((
             dataset_id, symbol, target_session.isoformat(), "succeeded",
-            int(bool(evidence.primary_bars)), int(bool(evidence.adjusted_bars)),
+            int(bool(evidence.primary_bars)), int(bool(canonical_adjusted)),
             int(bool(canonical_facts)), int(symbol in verification_symbols),
             int(bool(evidence.verification_bars)), _decimal(reported),
             status_source, previous_source, candidate_id,
             sha256(evidence.primary_bars) if evidence.primary_bars else None,
-            sha256(evidence.adjusted_bars) if evidence.adjusted_bars else None,
+            sha256(canonical_adjusted) if canonical_adjusted else None,
             sha256(canonical_facts) if canonical_facts else None,
             sha256(evidence.verification_bars) if evidence.verification_bars else None,
             sha256(evidence.adjustments) if evidence.adjustments else None,
@@ -1405,6 +1471,7 @@ def latest_accepted_lineage(
 
 
 def _manifest_hashes(evidence: DailyEvidence) -> dict[str, Any]:
+    canonical_adjusted = [_canonical_adjusted_bar(row) for row in evidence.adjusted_bars]
     canonical_lineage = sorted(
         (canonical_lineage_evidence(row) for row in evidence.lineage_evidence),
         key=lambda row: (row["symbol"], row["kind"]),
@@ -1417,7 +1484,7 @@ def _manifest_hashes(evidence: DailyEvidence) -> dict[str, Any]:
         "adjustment_event_count": len(evidence.adjustments),
         "lineage_evidence_count": len(canonical_lineage),
         "primary_sha256": sha256(evidence.primary_bars),
-        "adjusted_sha256": sha256(evidence.adjusted_bars),
+        "adjusted_sha256": sha256(canonical_adjusted),
         "tradeability_sha256": sha256(evidence.tradeability),
         "verification_sha256": sha256(evidence.verification_bars),
         "adjustments_sha256": sha256(evidence.adjustments),

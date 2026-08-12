@@ -247,9 +247,10 @@ class TencentHistorySource:
                 f"Tencent cash-dividend fields disagree for {code}: "
                 f"structured={cash_per_ten} content={content_cash}"
             )
-        reference = (accepted_previous_close - cash_per_ten / Decimal("10")).quantize(
+        exchange_reference = (accepted_previous_close - cash_per_ten / Decimal("10")).quantize(
             EXCHANGE_REFERENCE_QUANTUM, rounding=ROUND_HALF_UP,
         )
+        reference = exchange_reference.quantize(PRICE_QUANTUM)
         if reference <= 0:
             raise RuntimeError(f"Tencent cash dividend produced a nonpositive reference price for {code}")
         details = {
