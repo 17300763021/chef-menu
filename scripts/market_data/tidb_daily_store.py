@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -20,7 +21,7 @@ from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_d
 from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect as _connect_once
 
 
 DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v5"
@@ -29,6 +30,27 @@ TRADEABILITY_QUANTUM = Decimal("0.01")
 STORAGE_PRICE_QUANTUM = Decimal("0.0001")
 STORAGE_AMOUNT_QUANTUM = Decimal("0.01")
 STORAGE_RATIO_QUANTUM = Decimal("0.000001")
+TIDB_CONNECT_ATTEMPTS = 3
+TIDB_TRANSIENT_ERROR_CODES = frozenset({2003, 2006, 2013})
+
+
+def _is_transient_connect_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    error_code = error.args[0] if error.args else None
+    return isinstance(error_code, int) and error_code in TIDB_TRANSIENT_ERROR_CODES
+
+
+def connect(config: TiDBConfig):
+    """Open a TiDB connection with bounded retries for transient network faults."""
+    for attempt in range(1, TIDB_CONNECT_ATTEMPTS + 1):
+        try:
+            return _connect_once(config)
+        except Exception as error:
+            if not _is_transient_connect_error(error) or attempt == TIDB_CONNECT_ATTEMPTS:
+                raise
+            time.sleep(2 ** (attempt - 1))
+    raise AssertionError("unreachable TiDB connection retry state")
 
 
 def _compact(value: Any) -> str:

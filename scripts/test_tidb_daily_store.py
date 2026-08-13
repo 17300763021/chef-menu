@@ -6,7 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
-from unittest.mock import patch
+from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.market_data.contracts import DailyBar
@@ -25,6 +25,7 @@ from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     _canonical_adjusted_bar,
     canonical_lineage_evidence,
+    connect,
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
@@ -138,6 +139,44 @@ def complete_evidence() -> DailyEvidence:
 
 
 class TiDBDailyStoreTests(unittest.TestCase):
+    def test_transient_tidb_connect_error_retries_and_recovers(self) -> None:
+        connection = object()
+        with patch(
+            "scripts.market_data.tidb_daily_store._connect_once",
+            side_effect=[TimeoutError("TLS read timed out"), connection],
+        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+            self.assertIs(connect(object()), connection)
+
+        self.assertEqual(connect_once.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_transient_tidb_connect_errors_exhaust_three_bounded_attempts(self) -> None:
+        errors = [
+            ConnectionResetError("connection reset"),
+            RuntimeError(2003, "cannot connect"),
+            RuntimeError(2013, "lost connection"),
+        ]
+        with patch(
+            "scripts.market_data.tidb_daily_store._connect_once",
+            side_effect=errors,
+        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "lost connection"):
+                connect(object())
+
+        self.assertEqual(connect_once.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(1), call(2)])
+
+    def test_permanent_tidb_connect_error_fails_without_retry(self) -> None:
+        with patch(
+            "scripts.market_data.tidb_daily_store._connect_once",
+            side_effect=RuntimeError(1045, "access denied"),
+        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "access denied"):
+                connect(object())
+
+        connect_once.assert_called_once()
+        sleep.assert_not_called()
+
     def test_prerequisite_deadline_cannot_be_swallowed_by_vendor_handlers(self) -> None:
         self.assertTrue(issubclass(DailyPrerequisiteTimeout, BaseException))
         self.assertFalse(issubclass(DailyPrerequisiteTimeout, Exception))
