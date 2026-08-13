@@ -27,8 +27,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v6"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v6"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v5"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v5"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
