@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -28,6 +29,7 @@ from scripts.market_data.tidb_daily_store import (
     canonical_lineage_evidence,
     connect,
     default_daily_dataset_id,
+    daily_correction_context,
     ensure_daily_schema,
     latest_accepted_lineage,
     load_daily_checkpoint_evidence,
@@ -78,12 +80,16 @@ class FakeConnection:
         self.executed: list[tuple[str, Any]] = []
         self.executed_many: list[tuple[str, list[Any]]] = []
         self.commits = 0
+        self.rollbacks = 0
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self)
 
     def commit(self) -> None:
         self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
 
 
 def raw_bar(symbol: str = "000001", source: str = "akshare_eastmoney") -> DailyBar:
@@ -216,6 +222,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "m2_daily_adjusted_bars", "m2_daily_tradeability_facts",
             "m2_daily_verification_bars", "m2_daily_adjustment_events",
             "m2_daily_lineage_evidence",
+            "m2_daily_run_supersessions",
         ):
             self.assertIn(table, sql)
         self.assertEqual(connection.commits, 1)
@@ -326,7 +333,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         }
         manifest = {
             **evidence.manifest, **values,
-            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v5",
+            "accepted": True, "manifest_version": "m2-daily-incremental-manifest-v6",
             "target_session": TARGET.isoformat(), "previous_session": PREVIOUS.isoformat(),
             "snapshot_effective_session": PREVIOUS.isoformat(), "scope_sha256": scope_hash,
             "expected_symbol_count": 1, "quality_sha256": "e" * 64,
@@ -355,7 +362,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         def replay_router(sql: str, params: Any):
             if "SELECT symbol, status" in sql:
                 return [("000001", "succeeded")]
-            if "WHERE target_session" in sql:
+            if "run.target_session=%s" in sql:
                 return [(dataset_id, manifest_hash)]
             return []
 
@@ -364,6 +371,138 @@ class TiDBDailyStoreTests(unittest.TestCase):
             base_history_dataset_id="base", predecessor_dataset_id="base",
         )
         self.assertTrue(replay["idempotent_replay"])
+
+    def test_correction_preserves_old_run_and_registers_one_idempotent_replacement(self) -> None:
+        evidence = complete_evidence()
+        scope_hash = "9" * 64
+        dataset_id = default_daily_dataset_id(TARGET, scope_hash)
+        manifest = {
+            **evidence.manifest,
+            "accepted": True,
+            "manifest_version": "m2-daily-incremental-manifest-v6",
+            "target_session": TARGET.isoformat(),
+            "previous_session": PREVIOUS.isoformat(),
+            "snapshot_effective_session": PREVIOUS.isoformat(),
+            "scope_sha256": scope_hash,
+            "expected_symbol_count": 1,
+            "quality_sha256": "e" * 64,
+            "supersedes_dataset_id": "bad-daily-run",
+            "correction_reason": "corporate_action_inventory_false_green",
+            "primary_row_count": len(evidence.primary_bars),
+            "adjusted_row_count": len(evidence.adjusted_bars),
+            "tradeability_row_count": len(evidence.tradeability),
+            "verification_row_count": len(evidence.verification_bars),
+            "adjustment_event_count": len(evidence.adjustments),
+            "lineage_evidence_count": len(evidence.lineage_evidence),
+            "primary_sha256": sha256(evidence.primary_bars),
+            "adjusted_sha256": sha256([
+                _canonical_adjusted_bar(row) for row in evidence.adjusted_bars
+            ]),
+            "tradeability_sha256": sha256(evidence.tradeability),
+            "verification_sha256": sha256(evidence.verification_bars),
+            "adjustments_sha256": sha256(evidence.adjustments),
+            "lineage_evidence_sha256": sha256(evidence.lineage_evidence),
+        }
+        publication = DailyEvidence(
+            manifest=manifest,
+            primary_bars=evidence.primary_bars,
+            tradeability=evidence.tradeability,
+            verification_bars=evidence.verification_bars,
+            adjusted_bars=evidence.adjusted_bars,
+            adjustments=evidence.adjustments,
+        )
+
+        def router(sql: str, params: Any):
+            if "SELECT symbol, status" in sql:
+                return [("000001", "succeeded")]
+            if "run.target_session=%s" in sql:
+                return [("bad-daily-run", "old-manifest-hash")]
+            return []
+
+        connection = FakeConnection(router)
+        result = publish_daily_run(
+            connection,
+            publication,
+            dataset_id=dataset_id,
+            base_history_dataset_id="base",
+            predecessor_dataset_id="base",
+            supersedes_dataset_id="bad-daily-run",
+            correction_reason="corporate_action_inventory_false_green",
+        )
+        self.assertFalse(result["idempotent_replay"])
+        self.assertEqual(result["superseded_dataset_id"], "bad-daily-run")
+        supersession_inserts = [
+            (sql, params) for sql, params in connection.executed
+            if "INSERT INTO m2_daily_run_supersessions" in sql
+        ]
+        self.assertEqual(len(supersession_inserts), 1)
+        self.assertFalse(any("UPDATE m2_daily_runs" in sql for sql, _params in connection.executed))
+
+        manifest_hash = sha256(manifest)
+
+        def replay_router(sql: str, params: Any):
+            if "SELECT symbol, status" in sql:
+                return [("000001", "succeeded")]
+            if "JOIN m2_daily_runs AS run" in sql and "superseded_dataset_id=%s" in sql:
+                return [(dataset_id, manifest_hash)]
+            return []
+
+        replay = publish_daily_run(
+            FakeConnection(replay_router),
+            publication,
+            dataset_id=dataset_id,
+            base_history_dataset_id="base",
+            predecessor_dataset_id="base",
+            supersedes_dataset_id="bad-daily-run",
+            correction_reason="corporate_action_inventory_false_green",
+        )
+        self.assertTrue(replay["idempotent_replay"])
+
+    def test_correction_context_allows_only_active_lineage_tip(self) -> None:
+        base_session = date(2026, 7, 23)
+
+        def valid_router(sql: str, params: Any):
+            if "SELECT business_end" in sql:
+                return [(base_session, 1, 0, 0)]
+            if "SELECT run.dataset_id, run.target_session" in sql:
+                return [
+                    ("daily-previous", PREVIOUS, base_session, "base", 0, 0),
+                    ("bad-daily-run", TARGET, PREVIOUS, "daily-previous", 0, 0),
+                ]
+            if "WHERE run.dataset_id=%s" in sql:
+                return [(
+                    TARGET, PREVIOUS, "daily-previous", "base", 1, 0, 0, None,
+                )]
+            return []
+
+        self.assertEqual(
+            daily_correction_context(
+                FakeConnection(valid_router),
+                base_history_dataset_id="base",
+                superseded_dataset_id="bad-daily-run",
+                target_session=TARGET,
+            ),
+            (PREVIOUS, "daily-previous"),
+        )
+
+        def downstream_router(sql: str, params: Any):
+            if "SELECT business_end" in sql:
+                return [(base_session, 1, 0, 0)]
+            if "SELECT run.dataset_id, run.target_session" in sql:
+                return [
+                    ("daily-previous", PREVIOUS, base_session, "base", 0, 0),
+                    ("bad-daily-run", TARGET, PREVIOUS, "daily-previous", 0, 0),
+                    ("later-run", date(2026, 7, 28), TARGET, "bad-daily-run", 0, 0),
+                ]
+            return []
+
+        with self.assertRaisesRegex(RuntimeError, "lineage tip"):
+            daily_correction_context(
+                FakeConnection(downstream_router),
+                base_history_dataset_id="base",
+                superseded_dataset_id="bad-daily-run",
+                target_session=TARGET,
+            )
 
     def test_predecessor_loading_distinguishes_daily_and_history_lineage(self) -> None:
         def daily_router(sql: str, params: Any):
@@ -552,6 +691,17 @@ class TiDBDailyStoreTests(unittest.TestCase):
         self.assertEqual(primary_batches[0][0][3], "akshare_eastmoney")
         self.assertEqual(connection.commits, 1)
 
+        excluded = recover_compatible_daily_checkpoints(
+            FakeConnection(), dataset_id="stable", target_session=TARGET,
+            expected_membership={"000001": "000300"},
+            verification_symbols=("000001",),
+            previous_states={"000001": previous_state()},
+            existing_metadata=empty_metadata,
+            excluded_symbols=("000001",),
+        )
+        self.assertEqual(excluded["recovered"], 0)
+        self.assertEqual(excluded["candidate_datasets"], 0)
+
         incompatible = PreviousAdjustedState(
             symbol="000001", business_date=PREVIOUS, raw_close=Decimal("9"),
             qfq_factor=Decimal("1"), hfq_factor=Decimal("1"),
@@ -673,6 +823,9 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
 
 class FakePrimary:
+    timeout_seconds = 1
+    attempts = 1
+
     def __init__(self, *, event: AdjustmentEvent | None = None) -> None:
         self.event = event
 
@@ -754,6 +907,140 @@ class FakeBaoStockVerification(FakeSecondary):
 
 
 class DailyCaptureTests(unittest.TestCase):
+    def test_601866_false_continuity_is_overridden_by_candidate_inventory(self) -> None:
+        symbol = "601866"
+        candidate_plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS,
+            expected_membership=((symbol, "000905"),),
+            accepted_existing_symbols=(),
+            fetch_symbols=(symbol,),
+            verification_symbols=(symbol,),
+            primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64,
+            universe_sha256="c" * 64,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="d" * 64,
+            corporate_action_symbols=(symbol,),
+        )
+        primary_bar = DailyBar(
+            source="akshare_eastmoney", symbol=symbol, exchange="SSE", business_date=TARGET,
+            open=Decimal("2.46"), high=Decimal("2.47"), low=Decimal("2.43"),
+            close=Decimal("2.47"), previous_close=None, volume_shares=10000,
+            amount_cny=Decimal("24600"), turnover_percent=Decimal("0.1"),
+            trade_status="trading", is_st=None,
+        )
+        event = AdjustmentEvent(
+            symbol, TARGET, Decimal("1.000000"), Decimal("1.236110"),
+            source="akshare_sina_factor_multiplicative",
+        )
+
+        class EastmoneyPrimary(FakePrimary):
+            def fetch_daily_raw_with_reference(self, _symbol: str, previous: date, target: date):
+                return (
+                    {TARGET: primary_bar}, "akshare_eastmoney", Decimal("2.4700"),
+                    "akshare_eastmoney_change_amount",
+                )
+
+            def fetch_sina_adjustments(self, _symbol: str, end: date):
+                return [event]
+
+        class Verification(FakeVerification):
+            def fetch_raw(self, _symbol: str, start: date, end: date, *, exclude_sources=None):
+                return [replace(primary_bar, source="akshare_sina")]
+
+        details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "2.4700",
+            "cash_per_ten_shares": "0.150000",
+            "factor_reference_close": "2.455000",
+            "derived_previous_close": "2.4600",
+            "action_content": "10派0.15元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        with patch.object(
+            TencentHistorySource,
+            "fetch_cash_dividend_reference",
+            return_value=(Decimal("2.4600"), details),
+        ):
+            evidence, reported, status, error = capture_symbol(
+                plan=candidate_plan, symbol=symbol, primary_source=EastmoneyPrimary(event=event),
+                verification_source=Verification(), secondary_source=None,
+                fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+                previous_states={
+                    symbol: PreviousAdjustedState(
+                        symbol=symbol, business_date=PREVIOUS, raw_close=Decimal("2.4700"),
+                        qfq_factor=Decimal("1.000000"), hfq_factor=Decimal("1.227273"),
+                        source_dataset_id="accepted-predecessor",
+                    )
+                },
+                ipo_dates={symbol: date(2007, 12, 26)},
+                calendar_dates=(PREVIOUS, TARGET),
+            )
+        self.assertEqual((reported, status, error), (Decimal("2.4600"), "succeeded", None))
+        self.assertEqual(evidence.adjusted_bars[0]["previous_close"], "2.4600")
+        self.assertEqual(evidence.adjusted_bars[0]["hfq_factor"], "1.236110")
+        self.assertEqual(
+            evidence.lineage_evidence[0]["details"]["factor_reference_close"],
+            "2.455000",
+        )
+
+    def test_eastmoney_candidate_forces_factor_and_structured_action_checks(self) -> None:
+        candidate_plan = replace(
+            plan(),
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="f" * 64,
+            corporate_action_symbols=("000001",),
+        )
+        event = AdjustmentEvent(
+            "000001", TARGET, Decimal("1"), Decimal("1.052632"),
+            source="akshare_sina_factor_multiplicative",
+        )
+        details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "10.0000",
+            "cash_per_ten_shares": "5.000000",
+            "factor_reference_close": "9.500000",
+            "derived_previous_close": "9.5000",
+            "action_content": "10派5元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        with patch.object(
+            TencentHistorySource,
+            "fetch_cash_dividend_reference",
+            return_value=(Decimal("9.5000"), details),
+        ) as structured_action:
+            evidence, reported, status, error = capture_symbol(
+                plan=candidate_plan, symbol="000001", primary_source=FakePrimary(event=event),
+                verification_source=FakeVerification(), secondary_source=None,
+                fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+                previous_states={"000001": previous_state()},
+                ipo_dates={"000001": date(1991, 4, 3)},
+                calendar_dates=(PREVIOUS, TARGET),
+            )
+        self.assertEqual((reported, status, error), (Decimal("9.5000"), "succeeded", None))
+        structured_action.assert_called_once()
+        self.assertEqual(evidence.adjusted_bars[0]["hfq_factor"], "1.052632")
+        self.assertEqual(evidence.lineage_evidence[0]["kind"], "cash_dividend_reference")
+
+        blocked, _reported, status, error = capture_symbol(
+            plan=candidate_plan, symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeVerification(), secondary_source=None,
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)},
+            calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("no target factor event", str(error))
+        self.assertEqual(blocked.adjusted_bars, [])
+
     def test_baostock_is_last_resort_independent_verification_only(self) -> None:
         evidence, reported, status, error = capture_symbol(
             plan=plan(), symbol="000001", primary_source=FakePrimary(),

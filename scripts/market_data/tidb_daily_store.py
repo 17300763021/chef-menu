@@ -24,7 +24,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect as _connect_once
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v5"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v6"
 DAILY_LINEAGE_SCHEMA_VERSION = "m2-daily-lineage-evidence-v1"
 TRADEABILITY_QUANTUM = Decimal("0.01")
 STORAGE_PRICE_QUANTUM = Decimal("0.0001")
@@ -474,6 +474,19 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       row_sha256 CHAR(64) NOT NULL,
       published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
       PRIMARY KEY (dataset_id, symbol, effective_date)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS m2_daily_run_supersessions (
+      superseded_dataset_id VARCHAR(160) NOT NULL PRIMARY KEY,
+      replacement_dataset_id VARCHAR(160) NOT NULL,
+      target_session DATE NOT NULL,
+      reason_code VARCHAR(96) NOT NULL,
+      evidence_sha256 CHAR(64) NOT NULL,
+      evidence_json LONGTEXT NOT NULL,
+      published_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      UNIQUE KEY uq_m2_daily_replacement (replacement_dataset_id),
+      KEY idx_m2_daily_supersessions_target (target_session)
     )
     """,
     """
@@ -1160,6 +1173,7 @@ def recover_compatible_daily_checkpoints(
     verification_symbols: Iterable[str],
     previous_states: Mapping[str, PreviousAdjustedState],
     existing_metadata: Mapping[str, Any] | None = None,
+    excluded_symbols: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Copy only validated successful evidence into a stable daily namespace.
 
@@ -1176,7 +1190,10 @@ def recover_compatible_daily_checkpoints(
     else:
         loaded_metadata = existing_metadata
     already_present = set(loaded_metadata["succeeded_symbols"])
-    missing_symbols = sorted(set(expected) - already_present)
+    excluded = {normalize_symbol(symbol) for symbol in excluded_symbols}
+    if not excluded <= set(expected):
+        raise ValueError("excluded recovery symbols must be inside the expected membership")
+    missing_symbols = sorted(set(expected) - already_present - excluded)
     if not missing_symbols:
         return {
             "already_present": len(already_present),
@@ -1465,10 +1482,14 @@ def latest_accepted_lineage(
         raise RuntimeError("base history dataset is missing, unaccepted, or outside research-only boundaries")
     base_session = date.fromisoformat(_date_text(base[0][0]))
     rows = _query_all(connection, """
-        SELECT dataset_id, target_session, previous_session, predecessor_dataset_id,
-               authoritative, simulation_orders_allowed
-        FROM m2_daily_runs
-        WHERE base_history_dataset_id=%s AND accepted=1 ORDER BY target_session
+        SELECT run.dataset_id, run.target_session, run.previous_session, run.predecessor_dataset_id,
+               run.authoritative, run.simulation_orders_allowed
+        FROM m2_daily_runs AS run
+        LEFT JOIN m2_daily_run_supersessions AS supersession
+          ON supersession.superseded_dataset_id=run.dataset_id
+        WHERE run.base_history_dataset_id=%s AND run.accepted=1
+          AND supersession.superseded_dataset_id IS NULL
+        ORDER BY run.target_session
     """, (base_history_dataset_id,))
     previous_session = base_session
     predecessor_id = base_history_dataset_id
@@ -1490,6 +1511,58 @@ def latest_accepted_lineage(
         previous_session = target_session
         predecessor_id = dataset_id
     return previous_session, predecessor_id
+
+
+def daily_correction_context(
+    connection: Any,
+    *,
+    base_history_dataset_id: str,
+    superseded_dataset_id: str,
+    target_session: date,
+) -> tuple[date, str]:
+    """Validate a correction of the active lineage tip without mutating it."""
+    active_session, active_dataset_id = latest_accepted_lineage(
+        connection, base_history_dataset_id,
+    )
+    if active_session != target_session or active_dataset_id != superseded_dataset_id:
+        raise RuntimeError("daily correction is limited to the active lineage tip")
+    rows = _query_all(connection, """
+        SELECT run.target_session, run.previous_session, run.predecessor_dataset_id,
+               run.base_history_dataset_id, run.accepted, run.authoritative,
+               run.simulation_orders_allowed, supersession.superseded_dataset_id
+        FROM m2_daily_runs AS run
+        LEFT JOIN m2_daily_run_supersessions AS supersession
+          ON supersession.superseded_dataset_id=run.dataset_id
+        WHERE run.dataset_id=%s
+    """, (superseded_dataset_id,))
+    if len(rows) != 1:
+        raise RuntimeError("superseded daily dataset does not exist")
+    row = rows[0]
+    recorded_target = date.fromisoformat(_date_text(row[0]))
+    previous_session = date.fromisoformat(_date_text(row[1]))
+    predecessor_dataset_id = str(row[2])
+    if (
+        recorded_target != target_session
+        or str(row[3]) != base_history_dataset_id
+        or not bool(row[4])
+        or bool(row[5])
+        or bool(row[6])
+        or row[7] is not None
+    ):
+        raise RuntimeError("daily correction target is not the active accepted research-only result")
+    downstream = _query_all(connection, """
+        SELECT run.dataset_id
+        FROM m2_daily_runs AS run
+        LEFT JOIN m2_daily_run_supersessions AS supersession
+          ON supersession.superseded_dataset_id=run.dataset_id
+        WHERE run.base_history_dataset_id=%s AND run.accepted=1
+          AND supersession.superseded_dataset_id IS NULL
+          AND run.target_session>%s
+        LIMIT 1
+    """, (base_history_dataset_id, target_session.isoformat()))
+    if downstream:
+        raise RuntimeError("daily correction is limited to the active lineage tip")
+    return previous_session, predecessor_dataset_id
 
 
 def _manifest_hashes(evidence: DailyEvidence) -> dict[str, Any]:
@@ -1521,6 +1594,8 @@ def publish_daily_run(
     dataset_id: str,
     base_history_dataset_id: str,
     predecessor_dataset_id: str,
+    supersedes_dataset_id: str | None = None,
+    correction_reason: str | None = None,
 ) -> dict[str, Any]:
     """Atomically expose one already-checkpointed accepted daily package."""
     manifest = evidence.manifest
@@ -1552,13 +1627,46 @@ def publish_daily_run(
         raise RuntimeError("daily aggregate checkpoint inventory does not match tradeability evidence")
 
     manifest_hash = sha256(manifest)
+    if supersedes_dataset_id is not None:
+        if (
+            not correction_reason
+            or manifest.get("supersedes_dataset_id") != supersedes_dataset_id
+            or manifest.get("correction_reason") != correction_reason
+        ):
+            raise RuntimeError("daily correction metadata is missing or inconsistent")
+        replay = _query_all(connection, """
+            SELECT supersession.replacement_dataset_id, run.manifest_sha256
+            FROM m2_daily_run_supersessions AS supersession
+            JOIN m2_daily_runs AS run ON run.dataset_id=supersession.replacement_dataset_id
+            WHERE supersession.superseded_dataset_id=%s
+        """, (supersedes_dataset_id,))
+        if replay:
+            if len(replay) == 1 and str(replay[0][0]) == dataset_id and str(replay[0][1]) == manifest_hash:
+                return {
+                    "dataset_id": dataset_id,
+                    "accepted": True,
+                    "idempotent_replay": True,
+                    "superseded_dataset_id": supersedes_dataset_id,
+                }
+            raise RuntimeError("daily correction target already has a different replacement")
     existing = _query_all(connection, """
-        SELECT dataset_id, manifest_sha256 FROM m2_daily_runs WHERE target_session=%s AND accepted=1
+        SELECT run.dataset_id, run.manifest_sha256
+        FROM m2_daily_runs AS run
+        LEFT JOIN m2_daily_run_supersessions AS supersession
+          ON supersession.superseded_dataset_id=run.dataset_id
+        WHERE run.target_session=%s AND run.accepted=1
+          AND supersession.superseded_dataset_id IS NULL
     """, (target,))
     if existing:
-        if len(existing) == 1 and str(existing[0][0]) == dataset_id and str(existing[0][1]) == manifest_hash:
+        if supersedes_dataset_id is not None:
+            if len(existing) != 1 or str(existing[0][0]) != supersedes_dataset_id:
+                raise RuntimeError("daily correction does not name the active accepted result")
+        elif len(existing) == 1 and str(existing[0][0]) == dataset_id and str(existing[0][1]) == manifest_hash:
             return {"dataset_id": dataset_id, "accepted": True, "idempotent_replay": True}
-        raise RuntimeError(f"a different accepted daily result already exists for {target}")
+        else:
+            raise RuntimeError(f"a different accepted daily result already exists for {target}")
+    elif supersedes_dataset_id is not None:
+        raise RuntimeError("daily correction target is no longer active")
 
     row = (
         dataset_id, DAILY_STORE_SCHEMA_VERSION, manifest["manifest_version"], target,
@@ -1573,15 +1681,40 @@ def publish_daily_run(
         expected["lineage_evidence_sha256"],
         manifest["quality_sha256"], manifest_hash, _compact(manifest),
     )
-    with connection.cursor() as cursor:
-        cursor.execute(RUN_INSERT, row)
-    connection.commit()
-    return {"dataset_id": dataset_id, "accepted": True, "idempotent_replay": False}
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(RUN_INSERT, row)
+            if supersedes_dataset_id is not None:
+                correction = {
+                    "superseded_dataset_id": supersedes_dataset_id,
+                    "replacement_dataset_id": dataset_id,
+                    "target_session": target,
+                    "reason_code": correction_reason,
+                    "replacement_manifest_sha256": manifest_hash,
+                }
+                cursor.execute(
+                    """INSERT INTO m2_daily_run_supersessions (
+                         superseded_dataset_id, replacement_dataset_id, target_session,
+                         reason_code, evidence_sha256, evidence_json
+                       ) VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        supersedes_dataset_id, dataset_id, target, correction_reason,
+                        sha256(correction), _compact(correction),
+                    ),
+                )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    result = {"dataset_id": dataset_id, "accepted": True, "idempotent_replay": False}
+    if supersedes_dataset_id is not None:
+        result["superseded_dataset_id"] = supersedes_dataset_id
+    return result
 
 
 __all__ = [
     "DAILY_STORE_SCHEMA_VERSION", "DailyEvidence", "TiDBConfig", "connect",
-    "default_daily_dataset_id", "ensure_daily_schema", "latest_accepted_lineage",
+    "daily_correction_context", "default_daily_dataset_id", "ensure_daily_schema", "latest_accepted_lineage",
     "load_base_references", "load_daily_checkpoint_evidence", "load_daily_evidence",
     "load_latest_prior_adjusted_states", "load_previous_adjusted_states",
     "recovered_previous_states_from_lineage", "publish_daily_run", "publish_daily_symbol_checkpoint",

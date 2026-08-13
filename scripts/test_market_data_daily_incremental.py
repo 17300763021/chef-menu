@@ -242,6 +242,24 @@ class DailyIncrementalTests(unittest.TestCase):
         )
         self.assertNotEqual(baseline.scope_sha256, changed_membership.scope_sha256)
 
+    def test_corporate_action_inventory_is_scope_bound_and_in_universe_only(self) -> None:
+        baseline = small_plan()
+        record = {
+            "symbol": "000001",
+            "ex_dividend_date": TARGET.isoformat(),
+            "cash_per_ten_shares": "0.15",
+        }
+        candidate = replace(
+            baseline,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256=sha256([record]),
+            corporate_action_symbols=("000001",),
+        )
+        self.assertNotEqual(baseline.scope_sha256, candidate.scope_sha256)
+        self.assertEqual(candidate.canonical()["corporate_action_symbols"], ["000001"])
+        with self.assertRaisesRegex(ValueError, "inside the expected universe"):
+            replace(candidate, corporate_action_symbols=("601866",))
+
     def test_invalid_universe_size_or_overlap_fails_closed(self) -> None:
         snapshots = self.full_snapshots()
         snapshots[PREVIOUS]["000905"] = snapshots[PREVIOUS]["000905"][:-1]
@@ -449,6 +467,9 @@ class DailyIncrementalTests(unittest.TestCase):
             primary_calendar_sha256="a" * 64,
             secondary_calendar_sha256="b" * 64,
             universe_sha256="c" * 64,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="d" * 64,
+            corporate_action_symbols=(symbol,),
         )
         manifest = build_incremental_evidence(
             plan=evidence_plan,
@@ -461,11 +482,37 @@ class DailyIncrementalTests(unittest.TestCase):
             accepted_previous_closes={symbol: Decimal("2.4700")},
             reported_previous_closes={symbol: Decimal("2.4600")},
             factor_reference_closes={symbol: Decimal("2.455000")},
+            lineage_evidence=[{
+                "symbol": symbol,
+                "target_session": TARGET.isoformat(),
+                "kind": "cash_dividend_reference",
+                "source": "tencent_archive",
+                "details": {"factor_reference_close": "2.455000"},
+            }],
         )[0]
         manifest_lineage = next(
             gate for gate in manifest["gates"] if gate["name"] == "daily_adjustment_lineage"
         )
         self.assertTrue(manifest_lineage["passed"], manifest_lineage["details"])
+        candidate_gate = next(
+            gate for gate in manifest["gates"]
+            if gate["name"] == "daily_corporate_action_candidate_evidence"
+        )
+        self.assertTrue(candidate_gate["passed"], candidate_gate["details"])
+
+        missing_lineage = build_incremental_evidence(
+            plan=evidence_plan,
+            primary_bars=primary,
+            tradeability_facts=[fact(symbol, "000905")],
+            verification_bars=[bar("baostock", symbol, "2.50")],
+            adjusted_bars=adjusted,
+            adjustment_events=[event],
+            previous_adjusted_states={symbol: state},
+            accepted_previous_closes={symbol: Decimal("2.4700")},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )[0]
+        self.assertFalse(missing_lineage["accepted"])
 
         with self.assertRaisesRegex(ValueError, "does not round to reported previous close"):
             build_daily_adjusted_bars(

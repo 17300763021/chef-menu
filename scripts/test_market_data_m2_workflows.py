@@ -32,7 +32,10 @@ class M2WorkflowTests(unittest.TestCase):
     def test_daily_cloud_catchup_is_bounded_sharded_and_quota_gated(self) -> None:
         text = (ROOT / ".github" / "workflows" / "market-data-daily-incremental.yml").read_text(encoding="utf-8")
         yaml.safe_load(text)
-        self.assertIn("--parallel-shards 4", text)
+        self.assertIn("parallel_shards=4", text)
+        self.assertIn("parallel_shards=1", text)
+        self.assertIn("--parallel-shards \"$parallel_shards\"", text)
+        self.assertIn("supersedes_dataset_id", text)
         self.assertIn("timeout-minutes: 300", text)
         self.assertIn("--storage-percent", text)
         self.assertIn("max_sessions", text)

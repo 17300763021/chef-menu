@@ -47,6 +47,7 @@ from scripts.market_data.sources.akshare_history_source import (
 )
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
+from scripts.market_data.sources.eastmoney_corporate_action_source import EastmoneyCorporateActionSource
 from scripts.market_data.sources.eastmoney_market_state_source import EastmoneySuspensionSource
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
@@ -54,6 +55,7 @@ from scripts.market_data.tidb_daily_store import (
     TiDBConfig,
     canonical_lineage_evidence,
     connect,
+    daily_correction_context,
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
@@ -467,7 +469,8 @@ def capture_symbol(
     if reported is None or reported <= 0:
         raise RuntimeError(f"positive reported previous close missing for {symbol}")
     try:
-        if has_price_break(state.raw_close, reported) or previous_close_source in {
+        corporate_action_candidate = symbol in set(plan.corporate_action_symbols)
+        if corporate_action_candidate or has_price_break(state.raw_close, reported) or previous_close_source in {
             "akshare_sina_exact_predecessor_close",
             "tencent_exact_predecessor_close",
         }:
@@ -475,7 +478,8 @@ def capture_symbol(
                 events = _target_events(primary_source, symbol, target)
             except RuntimeError as factor_error:
                 if (
-                    primary_source_name not in {"akshare_sina", "tencent_archive"}
+                    corporate_action_candidate
+                    or primary_source_name not in {"akshare_sina", "tencent_archive"}
                     or not str(factor_error).startswith("AKShare Sina returned no ")
                 ):
                     raise
@@ -484,10 +488,15 @@ def capture_symbol(
                     attempts=min(primary_source.attempts, 2),
                 ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
                 previous_close_source = f"{previous_close_source}+{continuity_source}"
-            if events and previous_close_source in {
-                "akshare_sina_exact_predecessor_close",
-                "tencent_exact_predecessor_close",
-            }:
+            if corporate_action_candidate and not events:
+                raise RuntimeError(f"corporate-action candidate has no target factor event for {symbol}")
+            if events and (
+                corporate_action_candidate
+                or previous_close_source in {
+                    "akshare_sina_exact_predecessor_close",
+                    "tencent_exact_predecessor_close",
+                }
+            ):
                 reported, action_details = TencentHistorySource(
                     timeout_seconds=primary_source.timeout_seconds,
                     attempts=min(primary_source.attempts, 2),
@@ -605,6 +614,7 @@ def run(
     shard_count: int = 1,
     defer_finalize: bool = False,
     finalize_only: bool = False,
+    supersedes_dataset_id: str | None = None,
 ) -> dict[str, Any]:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
@@ -614,6 +624,8 @@ def run(
         raise ValueError("daily shard coordinates must use between 1 and 4 stable shards")
     if defer_finalize and finalize_only:
         raise ValueError("daily capture cannot defer and finalize in the same invocation")
+    if supersedes_dataset_id is not None and requested_target is None:
+        raise ValueError("daily correction requires an explicit target session")
     observed = observed_at.astimezone(SHANGHAI)
     _progress(
         "daily_prerequisites_started",
@@ -636,9 +648,17 @@ def run(
     try:
         if initialize_schema:
             ensure_daily_schema(connection)
-        latest_accepted, predecessor_dataset_id = latest_accepted_lineage(
-            connection, base_history_dataset_id,
-        )
+        if supersedes_dataset_id is None:
+            latest_accepted, predecessor_dataset_id = latest_accepted_lineage(
+                connection, base_history_dataset_id,
+            )
+        else:
+            latest_accepted, predecessor_dataset_id = daily_correction_context(
+                connection,
+                base_history_dataset_id=base_history_dataset_id,
+                superseded_dataset_id=supersedes_dataset_id,
+                target_session=requested_target,
+            )
         latest_ready = latest_closed_session(primary_calendar, observed)
     finally:
         connection.close()
@@ -651,6 +671,20 @@ def run(
         }
         _progress(**result)
         return result
+
+    _progress("daily_prerequisites_started", phase="corporate_action_inventory")
+    with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
+        corporate_action_inventory = EastmoneyCorporateActionSource(
+            attempts=3, timeout_seconds=25,
+        ).fetch(target)
+    corporate_action_rows = list(corporate_action_inventory.records)
+    _progress(
+        "daily_corporate_action_inventory_loaded",
+        source=corporate_action_inventory.source,
+        target_session=target.isoformat(),
+        record_count=len(corporate_action_rows),
+        records_sha256=corporate_action_inventory.evidence_sha256,
+    )
 
     _progress("daily_prerequisites_started", phase="point_in_time_universe")
     csi = CsiIndexSource()
@@ -666,6 +700,8 @@ def run(
     base_plan = build_incremental_plan(
         observed_at=observed, primary_calendar=primary_calendar,
         secondary_calendar=secondary_calendar, snapshots=snapshots, target_session=target,
+        corporate_action_inventory=corporate_action_rows,
+        corporate_action_inventory_source=corporate_action_inventory.source,
     )
     dataset_id = default_daily_dataset_id(target, base_plan.scope_sha256)
 
@@ -711,6 +747,7 @@ def run(
                 verification_symbols=base_plan.verification_symbols,
                 previous_states=previous_states,
                 existing_metadata=metadata,
+                excluded_symbols=base_plan.corporate_action_symbols,
             )
             if recovery["recovered"]:
                 stored, metadata = load_daily_checkpoint_evidence(connection, dataset_id)
@@ -721,6 +758,8 @@ def run(
                 (symbol, target) for symbol in metadata["succeeded_symbols"]
             ),
             target_session=target,
+            corporate_action_inventory=corporate_action_rows,
+            corporate_action_inventory_source=corporate_action_inventory.source,
         )
     finally:
         connection.close()
@@ -733,6 +772,7 @@ def run(
         recovered_symbols=recovery["recovered"],
         recovery_candidate_datasets=recovery["candidate_datasets"],
         recovery_rejected_datasets=recovery["rejected_datasets"],
+        corporate_action_candidates=len(plan.corporate_action_symbols),
     )
 
     all_scope_symbols = list(daily_membership_symbols(plan.expected_membership))
@@ -931,6 +971,7 @@ def run(
         accepted_previous_closes=accepted_closes,
         reported_previous_closes=reported_closes,
         factor_reference_closes=factor_references,
+        lineage_evidence=lineage_rows,
         primary_failures=primary_failures, verification_failures=verification_failures,
     )
     status_source_counts: dict[str, int] = {}
@@ -955,9 +996,14 @@ def run(
         "checkpoint_succeeded_symbol_count": len(metadata["succeeded_symbols"]),
         "checkpoint_blocked_symbol_count": len(metadata["blocked_symbols"]),
     })
+    if supersedes_dataset_id is not None:
+        manifest.update({
+            "supersedes_dataset_id": supersedes_dataset_id,
+            "correction_reason": "corporate_action_inventory_false_green",
+        })
     write_outputs(
         output_dir, manifest, primary_rows, fact_rows, verification_rows,
-        adjusted_rows, event_rows, lineage_rows,
+        adjusted_rows, event_rows, lineage_rows, corporate_action_rows,
     )
     if not manifest["accepted"]:
         failed = [gate for gate in manifest["gates"] if gate["critical"] and not gate["passed"]]
@@ -982,6 +1028,11 @@ def run(
             connection, publication, dataset_id=dataset_id,
             base_history_dataset_id=base_history_dataset_id,
             predecessor_dataset_id=predecessor_dataset_id,
+            supersedes_dataset_id=supersedes_dataset_id,
+            correction_reason=(
+                "corporate_action_inventory_false_green"
+                if supersedes_dataset_id is not None else None
+            ),
         )
     finally:
         connection.close()
@@ -1004,6 +1055,7 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--defer-finalize", action="store_true")
     parser.add_argument("--finalize-only", action="store_true")
+    parser.add_argument("--supersedes-dataset-id")
     args = parser.parse_args()
     observed_at = args.observed_at or datetime.now(SHANGHAI)
     result = run(
@@ -1012,6 +1064,7 @@ def main() -> int:
         initialize_schema=args.init_schema, symbol_attempts=args.symbol_attempts,
         shard_index=args.shard_index, shard_count=args.shard_count,
         defer_finalize=args.defer_finalize, finalize_only=args.finalize_only,
+        supersedes_dataset_id=args.supersedes_dataset_id,
     )
     return 0 if result.get(
         "accepted", result.get("event") in {"daily_noop", "daily_shard_capture_completed"}
