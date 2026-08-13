@@ -22,6 +22,7 @@ from scripts.market_data.quality_gates import GateResult
 
 PRICE_BREAK_TOLERANCE = Decimal("0.0005")
 FACTOR_RATIO_TOLERANCE = Decimal("0.002")
+A_SHARE_REFERENCE_QUANTUM = Decimal("0.01")
 
 
 def _limited(values: Iterable[str], maximum: int = 20) -> tuple[str, ...]:
@@ -93,6 +94,7 @@ def build_daily_adjusted_bars(
     previous_states: Mapping[str, PreviousAdjustedState],
     reported_previous_closes: Mapping[str, Decimal],
     adjustment_events: Iterable[AdjustmentEvent] = (),
+    factor_reference_closes: Mapping[str, Decimal] | None = None,
 ) -> list[HistoricalBar]:
     """Extend immutable QFQ/HFQ factors for all observed target-session bars.
 
@@ -101,6 +103,7 @@ def build_daily_adjusted_bars(
     session and its HFQ factor ratio reconciles to the price discontinuity.
     """
     events = list(adjustment_events)
+    factor_references = factor_reference_closes or {}
     rows: list[HistoricalBar] = []
     for raw in sorted(primary_bars, key=lambda value: (value.symbol, value.business_date, value.source)):
         if raw.business_date != target_session or raw.symbol not in membership:
@@ -122,7 +125,14 @@ def build_daily_adjusted_bars(
         else:
             if event.qfq_factor <= 0 or event.hfq_factor <= 0:
                 raise ValueError(f"nonpositive target adjustment factor for {raw.symbol}")
-            expected_hfq_ratio = (state.raw_close / reported).quantize(
+            factor_reference = factor_references.get(raw.symbol, reported)
+            if factor_reference <= 0:
+                raise ValueError(f"nonpositive factor reference close for {raw.symbol}")
+            if factor_reference.quantize(A_SHARE_REFERENCE_QUANTUM, rounding=ROUND_HALF_UP) != reported:
+                raise ValueError(
+                    f"factor reference close does not round to reported previous close for {raw.symbol}"
+                )
+            expected_hfq_ratio = (state.raw_close / factor_reference).quantize(
                 FACTOR_QUANTUM, rounding=ROUND_HALF_UP,
             )
             observed_hfq_ratio = (event.hfq_factor / state.hfq_factor).quantize(
@@ -166,6 +176,7 @@ def evaluate_daily_adjustments(
     previous_states: Mapping[str, PreviousAdjustedState],
     reported_previous_closes: Mapping[str, Decimal],
     adjustment_events: Iterable[AdjustmentEvent],
+    factor_reference_closes: Mapping[str, Decimal] | None = None,
 ) -> list[GateResult]:
     """Recheck adjustment completeness and arithmetic without trusting the builder."""
     raw_rows = list(primary_bars)
@@ -207,6 +218,7 @@ def evaluate_daily_adjustments(
         if event.symbol not in membership or event.effective_date != target_session
     ]
     event_map = {(event.symbol, event.effective_date): event for event in events}
+    factor_references = factor_reference_closes or {}
 
     for key in sorted(set(raw_map) & set(adjusted_map)):
         raw = raw_map[key]
@@ -259,7 +271,14 @@ def evaluate_daily_adjustments(
         ):
             lineage_errors.append(f"{raw.symbol}:event_factor_mismatch")
         elif event is not None:
-            expected_ratio = (state.raw_close / reported).quantize(
+            factor_reference = factor_references.get(raw.symbol, reported)
+            if (
+                factor_reference <= 0
+                or factor_reference.quantize(A_SHARE_REFERENCE_QUANTUM, rounding=ROUND_HALF_UP) != reported
+            ):
+                lineage_errors.append(f"{raw.symbol}:invalid_factor_reference")
+                continue
+            expected_ratio = (state.raw_close / factor_reference).quantize(
                 FACTOR_QUANTUM, rounding=ROUND_HALF_UP,
             )
             observed_ratio = (event.hfq_factor / state.hfq_factor).quantize(

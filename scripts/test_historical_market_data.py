@@ -489,6 +489,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
             )
         self.assertEqual(reference, Decimal("16.42"))
         self.assertEqual(details["cash_per_ten_shares"], "3.790000")
+        self.assertEqual(details["factor_reference_close"], "16.421000")
         self.assertEqual(details["derived_previous_close"], "16.4200")
         self.assertEqual(details["ex_rights_date"], target.isoformat())
 

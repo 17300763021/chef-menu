@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
-from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
+from scripts.market_data.daily_adjustments import (
+    PreviousAdjustedState,
+    build_daily_adjusted_bars,
+    evaluate_daily_adjustments,
+)
 from scripts.market_data.daily_incremental import (
     DailyIncrementalPlan,
     build_incremental_evidence,
@@ -383,6 +387,91 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertFalse(continuity["passed"])
         self.assertFalse(continuity["critical"])
         self.assertTrue(manifest["accepted"], manifest["gates"])
+
+    def test_cash_dividend_half_tick_uses_exact_factor_reference(self) -> None:
+        symbol = "601866"
+        primary = [bar("akshare_eastmoney", symbol, "2.50")]
+        state = PreviousAdjustedState(
+            symbol=symbol,
+            business_date=PREVIOUS,
+            raw_close=Decimal("2.4700"),
+            qfq_factor=Decimal("1.000000"),
+            hfq_factor=Decimal("1.227273"),
+            source_dataset_id="accepted-2026-07-30",
+        )
+        event = AdjustmentEvent(
+            symbol,
+            TARGET,
+            Decimal("1.000000"),
+            Decimal("1.236110"),
+            source="akshare_sina_factor",
+        )
+        arguments = {
+            "target_session": TARGET,
+            "previous_session": PREVIOUS,
+            "membership": {symbol: "000905"},
+            "primary_bars": primary,
+            "previous_states": {symbol: state},
+            "reported_previous_closes": {symbol: Decimal("2.4600")},
+            "adjustment_events": [event],
+        }
+        with self.assertRaisesRegex(ValueError, "adjustment factor does not reconcile"):
+            build_daily_adjusted_bars(**arguments)
+
+        adjusted = build_daily_adjusted_bars(
+            **arguments,
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )
+        self.assertEqual(adjusted[0].previous_close, Decimal("2.4600"))
+        gates = evaluate_daily_adjustments(
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            membership={symbol: "000905"},
+            primary_bars=primary,
+            adjusted_bars=adjusted,
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            adjustment_events=[event],
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )
+        lineage_gate = next(gate for gate in gates if gate.name == "daily_adjustment_lineage")
+        self.assertTrue(lineage_gate.passed, lineage_gate.details)
+
+        evidence_plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS,
+            expected_membership=((symbol, "000905"),),
+            accepted_existing_symbols=(),
+            fetch_symbols=(symbol,),
+            verification_symbols=(symbol,),
+            primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64,
+            universe_sha256="c" * 64,
+        )
+        manifest = build_incremental_evidence(
+            plan=evidence_plan,
+            primary_bars=primary,
+            tradeability_facts=[fact(symbol, "000905")],
+            verification_bars=[bar("baostock", symbol, "2.50")],
+            adjusted_bars=adjusted,
+            adjustment_events=[event],
+            previous_adjusted_states={symbol: state},
+            accepted_previous_closes={symbol: Decimal("2.4700")},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )[0]
+        manifest_lineage = next(
+            gate for gate in manifest["gates"] if gate["name"] == "daily_adjustment_lineage"
+        )
+        self.assertTrue(manifest_lineage["passed"], manifest_lineage["details"])
+
+        with self.assertRaisesRegex(ValueError, "does not round to reported previous close"):
+            build_daily_adjusted_bars(
+                **arguments,
+                factor_reference_closes={symbol: Decimal("2.440000")},
+            )
 
     def test_missing_active_bar_fails_but_confirmed_suspension_is_allowed(self) -> None:
         plan = small_plan()

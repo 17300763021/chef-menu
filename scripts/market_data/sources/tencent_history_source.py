@@ -247,7 +247,8 @@ class TencentHistorySource:
                 f"Tencent cash-dividend fields disagree for {code}: "
                 f"structured={cash_per_ten} content={content_cash}"
             )
-        exchange_reference = (accepted_previous_close - cash_per_ten / Decimal("10")).quantize(
+        factor_reference = accepted_previous_close - cash_per_ten / Decimal("10")
+        exchange_reference = factor_reference.quantize(
             EXCHANGE_REFERENCE_QUANTUM, rounding=ROUND_HALF_UP,
         )
         reference = exchange_reference.quantize(PRICE_QUANTUM)
@@ -259,6 +260,7 @@ class TencentHistorySource:
             "ex_rights_date": ex_rights_date.isoformat(),
             "accepted_previous_close": format(accepted_previous_close, "f"),
             "cash_per_ten_shares": format(cash_per_ten, "f"),
+            "factor_reference_close": format(factor_reference, "f"),
             "derived_previous_close": format(reference, "f"),
             "action_content": content,
             "vendor_action_sha256": sha256(dict(action)),

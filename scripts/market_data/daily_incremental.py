@@ -27,8 +27,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v5"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v5"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v6"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v6"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
@@ -322,6 +322,7 @@ def build_incremental_evidence(
     previous_adjusted_states: Mapping[str, PreviousAdjustedState],
     accepted_previous_closes: Mapping[str, Decimal],
     reported_previous_closes: Mapping[str, Decimal],
+    factor_reference_closes: Mapping[str, Decimal] | None = None,
     primary_failures: Mapping[str, str] | None = None,
     verification_failures: Mapping[str, str] | None = None,
 ) -> tuple[
@@ -354,6 +355,7 @@ def build_incremental_evidence(
         adjusted_bars=adjusted_rows,
         previous_states=previous_adjusted_states,
         reported_previous_closes=reported_previous_closes,
+        factor_reference_closes=factor_reference_closes,
         adjustment_events=event_rows,
     )]
     canonical_primary = canonical_rows(primary_rows)

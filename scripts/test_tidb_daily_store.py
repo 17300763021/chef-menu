@@ -14,6 +14,7 @@ from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_d
 from scripts.market_data.daily_incremental import DailyIncrementalPlan
 from scripts.market_data.daily_incremental_runner import (
     DailyPrerequisiteTimeout,
+    _factor_reference_closes,
     _select_target,
     capture_symbol,
     run,
@@ -902,6 +903,34 @@ class DailyCaptureTests(unittest.TestCase):
         self.assertEqual(evidence.lineage_evidence[0]["kind"], "cash_dividend_reference")
         self.assertIsNone(evidence.tradeability[0]["limit_up"])
         self.assertIn("unknown_st_status", evidence.tradeability[0]["block_reasons"])
+
+    def test_cash_dividend_factor_reference_is_rebuilt_and_tamper_evident(self) -> None:
+        details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "2.4700",
+            "cash_per_ten_shares": "0.150000",
+            "factor_reference_close": "2.455000",
+            "derived_previous_close": "2.4600",
+            "action_content": "10派0.15元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        lineage = canonical_lineage_evidence({
+            "symbol": "601866",
+            "target_session": TARGET.isoformat(),
+            "kind": "cash_dividend_reference",
+            "source": "tencent_archive",
+            "details": details,
+        })
+        self.assertEqual(
+            _factor_reference_closes([lineage]),
+            {"601866": Decimal("2.455000")},
+        )
+
+        tampered = {**lineage, "details": {**details, "factor_reference_close": "2.456000"}}
+        with self.assertRaisesRegex(ValueError, "does not reconcile"):
+            _factor_reference_closes([tampered])
 
     def test_missing_exact_predecessor_is_recovered_only_with_gap_evidence(self) -> None:
         prior = date(2026, 7, 23)

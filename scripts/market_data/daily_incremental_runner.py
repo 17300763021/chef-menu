@@ -283,6 +283,31 @@ def _target_events(
     ]
 
 
+def _factor_reference_closes(
+    lineage_evidence: Iterable[Mapping[str, Any]],
+) -> dict[str, Decimal]:
+    """Rebuild exact factor references from validated cash-dividend lineage."""
+    references: dict[str, Decimal] = {}
+    for raw in lineage_evidence:
+        row = canonical_lineage_evidence(raw)
+        if row["kind"] != "cash_dividend_reference":
+            continue
+        details = row["details"]
+        accepted_close = Decimal(str(details["accepted_previous_close"]))
+        cash_per_ten = Decimal(str(details["cash_per_ten_shares"]))
+        reference = accepted_close - cash_per_ten / Decimal("10")
+        recorded = details.get("factor_reference_close")
+        if recorded is not None and Decimal(str(recorded)) != reference:
+            raise ValueError(
+                f"cash-dividend factor reference does not reconcile for {row['symbol']}"
+            )
+        existing = references.get(row["symbol"])
+        if existing is not None and existing != reference:
+            raise ValueError(f"conflicting cash-dividend factor references for {row['symbol']}")
+        references[row["symbol"]] = reference
+    return references
+
+
 def capture_symbol(
     *,
     plan: DailyIncrementalPlan,
@@ -479,10 +504,12 @@ def capture_symbol(
                 }))
                 if secondary is not None:
                     secondary["preclose"] = format(reported, "f")
+        factor_references = _factor_reference_closes(lineage_evidence)
         adjusted_rows = build_daily_adjusted_bars(
             target_session=target, previous_session=plan.previous_session,
             membership=plan.membership, primary_bars=[primary], previous_states={symbol: state},
             reported_previous_closes={symbol: reported}, adjustment_events=events,
+            factor_reference_closes=factor_references,
         )
         adjusted = adjusted_rows[0]
     except Exception as error:
@@ -882,6 +909,7 @@ def run(
         key=lambda row: (row["symbol"], row["kind"]),
     )
     reported_closes = metadata["reported_previous_closes"]
+    factor_references = _factor_reference_closes(lineage_rows)
     accepted_closes = {
         symbol: state.raw_close for symbol, state in previous_states.items()
         if symbol in plan.membership
@@ -902,6 +930,7 @@ def run(
         adjustment_events=event_rows, previous_adjusted_states=previous_states,
         accepted_previous_closes=accepted_closes,
         reported_previous_closes=reported_closes,
+        factor_reference_closes=factor_references,
         primary_failures=primary_failures, verification_failures=verification_failures,
     )
     status_source_counts: dict[str, int] = {}
