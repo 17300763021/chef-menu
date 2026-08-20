@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Disabled M3.1 contract acceptance only; never runs a simulation account"
+        description: "M3 contracts or bounded research-only RQAlpha engine acceptance"
         required: true
         default: deterministic
         type: choice
@@ -15,6 +15,7 @@ on:
       - .github/workflows/rqalpha-simulation-acceptance.yml
       - scripts/simulation/**
       - scripts/test_v2_simulation_*.py
+      - scripts/test_v2_rqalpha_*.py
       - scripts/framework-requirements.txt
       - supabase/migrations/20260812090000_add_v2_simulation_ledger.sql
       - .python-version
@@ -42,6 +43,7 @@ jobs:
         run: |
           python -m scripts.test_v2_simulation_contracts
           python -m scripts.test_v2_simulation_data_adapter
+          python -m scripts.test_v2_simulation_history_adapter
           python -m scripts.test_v2_simulation_reconciliation
           python -m scripts.test_v2_simulation_schema
           python -m scripts.test_cloud_runtime
@@ -58,7 +60,7 @@ jobs:
           python-version-file: .python-version
           cache: pip
           cache-dependency-path: scripts/framework-requirements.txt
-      - name: Install pinned RQAlpha without enabling any account
+      - name: Install pinned RQAlpha for isolated backtest acceptance
         run: python -m pip install "rqalpha==6.2.1"
       - name: Verify pinned public API only
         run: |
@@ -78,3 +80,44 @@ jobs:
           PY
       - name: Execute M2 corporate-action regression through RQAlpha accounting
         run: python -m scripts.test_v2_rqalpha_corporate_action_execution
+      - name: Execute deterministic orders, fills, and independent reconciliation
+        run: python -m scripts.test_v2_rqalpha_backtest_execution
+
+  warehouse-backed-engine-acceptance:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'framework-smoke'
+    needs: [deterministic-contracts, framework-public-api-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TIDB_HOST: ${{ secrets.TIDB_HOST }}
+      TIDB_PORT: ${{ secrets.TIDB_PORT }}
+      TIDB_USER: ${{ secrets.TIDB_USER }}
+      TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+      TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+      TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned engine and read-only warehouse client
+        run: python -m pip install "rqalpha==6.2.1" "PyMySQL==1.1.1"
+      - name: Extract six rows from explicitly pinned accepted M2 releases
+        run: |
+          python -m scripts.simulation.extract_m2_rqalpha_input --output m3-acceptance/m2-input.json
+      - name: Run the same RQAlpha backtest twice
+        run: |
+          python -m scripts.simulation.rqalpha_backtest_runner \
+            --input m3-acceptance/m2-input.json --output m3-acceptance/result-1.json
+          python -m scripts.simulation.rqalpha_backtest_runner \
+            --input m3-acceptance/m2-input.json --output m3-acceptance/result-2.json
+          cmp m3-acceptance/result-1.json m3-acceptance/result-2.json
+      - name: Preserve compact non-authoritative evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m3-rqalpha-bounded-acceptance-${{ github.run_id }}
+          path: m3-acceptance/
+          retention-days: 7
+          if-no-files-found: error
