@@ -1229,7 +1229,11 @@ def recover_compatible_daily_checkpoints(
             rejected_datasets[candidate_id] = f"{type(error).__name__}: {error}"
             continue
         succeeded = set(metadata["succeeded_symbols"])
-        for symbol in sorted((succeeded & set(expected)) - already_present):
+        # Candidate datasets may contain a mixture of eligible and explicitly
+        # excluded symbols. Only copy the precomputed missing set; otherwise
+        # an excluded corporate-action candidate can leak back in with the
+        # eligible symbols from the same source dataset.
+        for symbol in sorted(succeeded & set(missing_symbols)):
             primary = [item for item in evidence.primary_bars if item["symbol"] == symbol]
             adjusted = [item for item in evidence.adjusted_bars if item["symbol"] == symbol]
             facts = [item for item in evidence.tradeability if item["symbol"] == symbol]

@@ -602,6 +602,19 @@ def _select_target(
     return requested or next_session
 
 
+def _reusable_existing_keys(
+    succeeded_symbols: Iterable[str],
+    target_session: date,
+    corporate_action_symbols: Iterable[str],
+) -> tuple[tuple[str, date], ...]:
+    """Keep action candidates out of checkpoint reuse for the current session."""
+    candidates = set(corporate_action_symbols)
+    return tuple(
+        (symbol, target_session)
+        for symbol in sorted(set(succeeded_symbols) - candidates)
+    )
+
+
 def run(
     *,
     observed_at: datetime,
@@ -754,8 +767,9 @@ def run(
         plan = build_incremental_plan(
             observed_at=observed, primary_calendar=primary_calendar,
             secondary_calendar=secondary_calendar, snapshots=snapshots,
-            accepted_existing_keys=(
-                (symbol, target) for symbol in metadata["succeeded_symbols"]
+            accepted_existing_keys=_reusable_existing_keys(
+                metadata["succeeded_symbols"], target,
+                base_plan.corporate_action_symbols,
             ),
             target_session=target,
             corporate_action_inventory=corporate_action_rows,

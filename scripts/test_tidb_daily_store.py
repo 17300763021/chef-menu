@@ -757,6 +757,69 @@ class TiDBDailyStoreTests(unittest.TestCase):
         self.assertEqual(rejected_verification["recovered"], 0)
         self.assertEqual(rejected_verification_connection.commits, 0)
 
+    def test_recovery_does_not_copy_excluded_symbols_from_mixed_candidate_evidence(self) -> None:
+        empty = DailyEvidence(
+            manifest={"authoritative": False, "simulation_orders_allowed": False},
+            primary_bars=[], tradeability=[], verification_bars=[], adjusted_bars=[], adjustments=[],
+        )
+        empty_metadata = {
+            "succeeded_symbols": [], "blocked_symbols": [],
+            "verification_required_symbols": [], "reported_previous_closes": {},
+            "status_sources": {}, "reported_previous_close_sources": {},
+            "checkpoint_origin_dataset_ids": {}, "errors": {},
+        }
+        eligible = complete_evidence()
+        excluded_evidence = complete_evidence()
+        for rows in (
+            excluded_evidence.primary_bars, excluded_evidence.adjusted_bars,
+            excluded_evidence.tradeability, excluded_evidence.verification_bars,
+        ):
+            rows[0]["symbol"] = "000002"
+        mixed = DailyEvidence(
+            manifest={"authoritative": False, "simulation_orders_allowed": False},
+            primary_bars=eligible.primary_bars + excluded_evidence.primary_bars,
+            tradeability=eligible.tradeability + excluded_evidence.tradeability,
+            verification_bars=eligible.verification_bars + excluded_evidence.verification_bars,
+            adjusted_bars=eligible.adjusted_bars + excluded_evidence.adjusted_bars,
+            adjustments=[],
+        )
+        mixed_metadata = {
+            **empty_metadata,
+            "succeeded_symbols": ["000001", "000002"],
+            "verification_required_symbols": ["000001", "000002"],
+            "reported_previous_closes": {"000001": Decimal("10"), "000002": Decimal("10")},
+            "status_sources": {"000001": "baostock_daily_status", "000002": "baostock_daily_status"},
+            "reported_previous_close_sources": {
+                "000001": "baostock_reported_preclose", "000002": "baostock_reported_preclose",
+            },
+        }
+        connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                side_effect=lambda _connection, dataset_id: (empty, empty_metadata)
+                if dataset_id == "stable" else (mixed, mixed_metadata),
+            ),
+            patch("scripts.market_data.tidb_daily_store._query_all", return_value=[("mixed",)]),
+        ):
+            result = recover_compatible_daily_checkpoints(
+                connection, dataset_id="stable", target_session=TARGET,
+                expected_membership={"000001": "000300", "000002": "000300"},
+                verification_symbols=("000001", "000002"),
+                previous_states={
+                    "000001": previous_state(),
+                    "000002": replace(previous_state(), symbol="000002"),
+                },
+                excluded_symbols=("000002",),
+            )
+
+        self.assertEqual(result["recovered"], 1)
+        checkpoint_batches = [
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_symbol_checkpoints" in sql
+        ]
+        self.assertEqual([row[1] for row in checkpoint_batches[0]], ["000001"])
+
     def test_tradeability_precision_loss_is_rejected_before_publication(self) -> None:
         evidence = complete_evidence()
         invalid_fact = {**evidence.tradeability[0], "limit_rate": "0.100001"}
