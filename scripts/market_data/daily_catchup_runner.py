@@ -64,6 +64,7 @@ def catch_up(
     *, max_sessions: int, base_history_dataset_id: str, output_dir: Path,
     symbol_attempts: int, parallel_shards: int = 1,
     requested_target: date | None = None,
+    supersedes_dataset_id: str | None = None,
 ) -> dict:
     if not 1 <= max_sessions <= 5:
         raise ValueError("daily catch-up must process between 1 and 5 sessions")
@@ -71,6 +72,10 @@ def catch_up(
         raise ValueError("daily catch-up parallelism must be between 1 and 4 shards")
     if requested_target is not None and max_sessions != 1:
         raise ValueError("a requested daily target requires max_sessions=1")
+    if supersedes_dataset_id is not None and (
+        requested_target is None or max_sessions != 1 or parallel_shards != 1
+    ):
+        raise ValueError("a daily correction requires one explicit target and one shard")
     if parallel_shards > 1:
         connection = connect(TiDBConfig.from_env())
         try:
@@ -101,6 +106,7 @@ def catch_up(
                 requested_target=requested_target,
                 initialize_schema=position == 1,
                 symbol_attempts=symbol_attempts,
+                supersedes_dataset_id=supersedes_dataset_id,
             )
         results.append({key: value for key, value in result.items() if key != "manifest"})
         if result.get("event") == "daily_noop":
@@ -122,10 +128,12 @@ def main() -> int:
     parser.add_argument("--symbol-attempts", type=int, default=2)
     parser.add_argument("--parallel-shards", type=int, default=1)
     parser.add_argument("--target-session", type=date.fromisoformat)
+    parser.add_argument("--supersedes-dataset-id")
     args = parser.parse_args()
     catch_up(max_sessions=args.max_sessions, base_history_dataset_id=args.base_history_dataset_id,
              output_dir=args.output_dir, symbol_attempts=args.symbol_attempts,
-             parallel_shards=args.parallel_shards, requested_target=args.target_session)
+             parallel_shards=args.parallel_shards, requested_target=args.target_session,
+             supersedes_dataset_id=args.supersedes_dataset_id)
     return 0
 
 

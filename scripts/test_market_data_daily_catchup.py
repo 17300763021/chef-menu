@@ -58,6 +58,28 @@ class DailyCatchupTests(unittest.TestCase):
         self.assertEqual(summary["results"][0]["dataset_id"], "d1")
         connection.close.assert_called_once()
 
+    def test_correction_is_single_session_single_shard_and_propagates_target(self) -> None:
+        target = date(2026, 7, 31)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "one explicit target and one shard"):
+                catch_up(
+                    max_sessions=1, base_history_dataset_id="base", output_dir=Path(tmp),
+                    symbol_attempts=2, parallel_shards=4, requested_target=target,
+                    supersedes_dataset_id="bad-run",
+                )
+            with patch(
+                "scripts.market_data.daily_catchup_runner.run",
+                return_value={"accepted": True, "dataset_id": "replacement"},
+            ) as run:
+                summary = catch_up(
+                    max_sessions=1, base_history_dataset_id="base", output_dir=Path(tmp),
+                    symbol_attempts=2, parallel_shards=1, requested_target=target,
+                    supersedes_dataset_id="bad-run",
+                )
+        self.assertEqual(summary["results"][0]["dataset_id"], "replacement")
+        self.assertEqual(run.call_args.kwargs["requested_target"], target)
+        self.assertEqual(run.call_args.kwargs["supersedes_dataset_id"], "bad-run")
+
 
 if __name__ == "__main__":
     unittest.main()

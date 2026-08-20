@@ -17,6 +17,10 @@ on:
         description: "Date the TiDB percentage was checked (YYYY-MM-DD, no older than 7 days)"
         required: true
         type: string
+      supersedes_dataset_id:
+        description: "Optional active daily dataset to replace immutably; requires target_session and max_sessions=1"
+        required: false
+        type: string
       tidb_storage_percent:
         description: "Current TiDB row-storage percentage from Usage this month"
         required: true
@@ -35,11 +39,14 @@ on:
       - scripts/market_data/tidb_daily_store.py
       - scripts/market_data/sources/akshare_history_source.py
       - scripts/market_data/sources/eastmoney_market_state_source.py
+      - scripts/market_data/sources/eastmoney_corporate_action_source.py
       - scripts/market_data/sources/tencent_history_source.py
       - scripts/test_market_data_daily_incremental.py
       - scripts/test_market_data_daily_quota.py
+      - scripts/test_historical_market_data.py
       - scripts/test_tidb_daily_store.py
       - scripts/test_eastmoney_market_state_source.py
+      - scripts/test_eastmoney_corporate_action_source.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
 
@@ -80,6 +87,7 @@ jobs:
         run: |
           python -m scripts.test_market_data_daily_incremental
           python -m scripts.test_market_data_daily_quota
+          python -m scripts.test_historical_market_data
           python -m scripts.test_tidb_daily_store
           python -m scripts.test_market_data_contracts
           python -m scripts.test_market_data_quality
@@ -89,6 +97,7 @@ jobs:
           python -m scripts.test_tradeability
           python -m scripts.test_baostock_calendar_source
           python -m scripts.test_eastmoney_market_state_source
+          python -m scripts.test_eastmoney_corporate_action_source
           python -m scripts.test_baostock_history_source
 
   quota-gate:
@@ -137,6 +146,7 @@ jobs:
         env:
           INPUT_TARGET_SESSION: ${{ inputs.target_session }}
           INPUT_MAX_SESSIONS: ${{ inputs.max_sessions }}
+          INPUT_SUPERSEDES_DATASET_ID: ${{ inputs.supersedes_dataset_id }}
           M2_BASE_HISTORY_DATASET_ID: ${{ vars.M2_BASE_HISTORY_DATASET_ID }}
           TIDB_HOST: ${{ secrets.TIDB_HOST }}
           TIDB_PORT: ${{ secrets.TIDB_PORT }}
@@ -145,14 +155,25 @@ jobs:
           TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: |
+          parallel_shards=4
+          if [[ -n "$INPUT_SUPERSEDES_DATASET_ID" ]]; then
+            if [[ -z "$INPUT_TARGET_SESSION" || "${INPUT_MAX_SESSIONS:-1}" != "1" ]]; then
+              echo "A correction requires target_session and max_sessions=1."
+              exit 2
+            fi
+            parallel_shards=1
+          fi
           args=(
             --max-sessions "${INPUT_MAX_SESSIONS:-1}"
-            --parallel-shards 4
+            --parallel-shards "$parallel_shards"
             --output-dir daily-market-increment
             --symbol-attempts 2
           )
           if [[ -n "$INPUT_TARGET_SESSION" ]]; then
             args+=(--target-session "$INPUT_TARGET_SESSION")
+          fi
+          if [[ -n "$INPUT_SUPERSEDES_DATASET_ID" ]]; then
+            args+=(--supersedes-dataset-id "$INPUT_SUPERSEDES_DATASET_ID")
           fi
           python -u -m scripts.market_data.daily_catchup_runner "${args[@]}"
       - name: Upload compact non-authoritative daily manifest
@@ -162,6 +183,7 @@ jobs:
           name: m2-daily-manifest-${{ github.run_id }}
           path: |
             daily-market-increment/session-*/manifest.json
+            daily-market-increment/session-*/daily-corporate-actions.json.gz
             daily-market-increment/catchup-summary.json
           if-no-files-found: ignore
           retention-days: 7

@@ -56,8 +56,13 @@ def build_release(connection: Any, business_date: date) -> dict[str, Any]:
             FROM m2_fundamental_runs WHERE mode='full' AND accepted=1 ORDER BY as_of_date DESC LIMIT 1""")
         index = _one(cursor, """SELECT dataset_id,business_end,authoritative,simulation_orders_allowed,manifest_sha256
             FROM m2_index_runs WHERE accepted=1 ORDER BY business_end DESC LIMIT 1""")
-        daily = _one(cursor, """SELECT dataset_id,target_session,base_history_dataset_id,authoritative,simulation_orders_allowed,manifest_sha256
-            FROM m2_daily_runs WHERE accepted=1 ORDER BY target_session DESC LIMIT 1""")
+        daily = _one(cursor, """SELECT daily.dataset_id,daily.target_session,daily.base_history_dataset_id,
+                   daily.authoritative,daily.simulation_orders_allowed,daily.manifest_sha256
+            FROM m2_daily_runs AS daily
+            LEFT JOIN m2_daily_run_supersessions AS supersession
+              ON supersession.superseded_dataset_id=daily.dataset_id
+            WHERE daily.accepted=1 AND supersession.superseded_dataset_id IS NULL
+            ORDER BY daily.target_session DESC, daily.published_at DESC LIMIT 1""")
         flow = _one(cursor, """SELECT dataset_id,business_date,data_available,authoritative,simulation_orders_allowed,manifest_sha256
             FROM m2_flow_runs WHERE boundary_accepted=1 AND business_date=%s
             ORDER BY published_at DESC LIMIT 1""", (business_date,))

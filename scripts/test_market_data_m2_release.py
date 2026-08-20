@@ -66,6 +66,9 @@ class M2ReleaseGateTests(unittest.TestCase):
         self.assertFalse(manifest["components"]["flow"]["data_available"])
         flow_call = next(call for call in connection.cursor_value.calls if "FROM m2_flow_runs" in call[0])
         self.assertEqual(flow_call[1], (date(2026, 8, 3),))
+        daily_call = next(call for call in connection.cursor_value.calls if "FROM m2_daily_runs" in call[0])
+        self.assertIn("m2_daily_run_supersessions", daily_call[0])
+        self.assertIn("supersession.superseded_dataset_id IS NULL", daily_call[0])
 
     def test_rejects_mixed_history_lineage(self):
         rows = _rows()

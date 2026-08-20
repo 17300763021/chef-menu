@@ -22,16 +22,17 @@ from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
 from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_quality_gates import evaluate_calendars
-from scripts.market_data.quality_gates import accepted
+from scripts.market_data.quality_gates import GateResult, accepted
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v3"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v3"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v6"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v6"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
+EMPTY_ROWS_SHA256 = sha256([])
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,10 @@ class DailyIncrementalPlan:
     primary_calendar_sha256: str
     secondary_calendar_sha256: str
     universe_sha256: str
+    corporate_action_inventory_source: str = "eastmoney_sharebonus_ex_date"
+    corporate_action_inventory_count: int = 0
+    corporate_action_inventory_sha256: str = EMPTY_ROWS_SHA256
+    corporate_action_symbols: tuple[str, ...] = ()
     schema_version: str = DAILY_INCREMENTAL_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -75,7 +80,20 @@ class DailyIncrementalPlan:
             raise ValueError("verification symbols must be unique and canonically sorted")
         if not self.verification_symbols or not set(self.verification_symbols) <= expected:
             raise ValueError("verification symbols must be a nonempty subset of the expected universe")
-        for value in (self.primary_calendar_sha256, self.secondary_calendar_sha256, self.universe_sha256):
+        if not self.corporate_action_inventory_source.strip():
+            raise ValueError("corporate-action inventory source is required")
+        if self.corporate_action_inventory_count < len(self.corporate_action_symbols):
+            raise ValueError("corporate-action inventory count is smaller than the in-universe candidate count")
+        if tuple(sorted(set(self.corporate_action_symbols))) != self.corporate_action_symbols:
+            raise ValueError("corporate-action symbols must be unique and canonically sorted")
+        if not set(self.corporate_action_symbols) <= expected:
+            raise ValueError("corporate-action symbols must be inside the expected universe")
+        for value in (
+            self.primary_calendar_sha256,
+            self.secondary_calendar_sha256,
+            self.universe_sha256,
+            self.corporate_action_inventory_sha256,
+        ):
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ValueError("plan evidence hashes must be lowercase SHA-256 values")
 
@@ -99,6 +117,10 @@ class DailyIncrementalPlan:
                 for symbol, index_code in self.expected_membership
             ],
             "verification_symbols": list(self.verification_symbols),
+            "corporate_action_inventory_source": self.corporate_action_inventory_source,
+            "corporate_action_inventory_count": self.corporate_action_inventory_count,
+            "corporate_action_inventory_sha256": self.corporate_action_inventory_sha256,
+            "corporate_action_symbols": list(self.corporate_action_symbols),
         }
 
     @property
@@ -227,6 +249,8 @@ def build_incremental_plan(
     accepted_existing_keys: Iterable[tuple[str, date]] = (),
     verification_maximum: int = DEFAULT_VERIFICATION_SYMBOLS,
     target_session: date | None = None,
+    corporate_action_inventory: Iterable[Mapping[str, Any]] = (),
+    corporate_action_inventory_source: str = "eastmoney_sharebonus_ex_date",
 ) -> DailyIncrementalPlan:
     """Build a stable single-session scope and identify only missing symbols to fetch."""
     local_observed_at = _shanghai_time(observed_at)
@@ -256,6 +280,15 @@ def build_incremental_plan(
             present.add(normalized_symbol)
     sorted_symbols = sorted(expected_symbols)
     verification = _verification_sample(sorted_symbols, verification_maximum)
+    corporate_action_rows = sorted(
+        (dict(row) for row in corporate_action_inventory),
+        key=lambda row: str(row.get("symbol", "")),
+    )
+    corporate_action_codes = [normalize_symbol(row.get("symbol")) for row in corporate_action_rows]
+    if len(corporate_action_codes) != len(set(corporate_action_codes)):
+        raise ValueError("corporate-action inventory contains duplicate symbols")
+    if any(str(row.get("ex_dividend_date")) != primary_target.isoformat() for row in corporate_action_rows):
+        raise ValueError("corporate-action inventory contains an out-of-scope ex-date")
     return DailyIncrementalPlan(
         observed_at=local_observed_at,
         target_session=primary_target,
@@ -268,6 +301,10 @@ def build_incremental_plan(
         primary_calendar_sha256=_calendar_scope_sha256(primary_calendar, primary_target),
         secondary_calendar_sha256=_calendar_scope_sha256(secondary_calendar, primary_target),
         universe_sha256=universe_hash,
+        corporate_action_inventory_source=corporate_action_inventory_source,
+        corporate_action_inventory_count=len(corporate_action_rows),
+        corporate_action_inventory_sha256=sha256(corporate_action_rows),
+        corporate_action_symbols=tuple(sorted(set(corporate_action_codes) & expected_symbols)),
     )
 
 
@@ -322,6 +359,8 @@ def build_incremental_evidence(
     previous_adjusted_states: Mapping[str, PreviousAdjustedState],
     accepted_previous_closes: Mapping[str, Decimal],
     reported_previous_closes: Mapping[str, Decimal],
+    factor_reference_closes: Mapping[str, Decimal] | None = None,
+    lineage_evidence: Iterable[Mapping[str, Any]] = (),
     primary_failures: Mapping[str, str] | None = None,
     verification_failures: Mapping[str, str] | None = None,
 ) -> tuple[
@@ -334,6 +373,10 @@ def build_incremental_evidence(
     verification_rows = sorted(verification_bars, key=lambda row: (row.source, row.symbol, row.business_date))
     adjusted_rows = sorted(adjusted_bars, key=lambda row: (row.symbol, row.business_date))
     event_rows = sorted(adjustment_events, key=lambda row: (row.symbol, row.effective_date, row.source))
+    lineage_rows = sorted(
+        (dict(row) for row in lineage_evidence),
+        key=lambda row: (str(row.get("symbol", "")), str(row.get("kind", ""))),
+    )
     gates = [*evaluate_daily_incremental(
         target_session=plan.target_session,
         previous_session=plan.previous_session,
@@ -354,8 +397,30 @@ def build_incremental_evidence(
         adjusted_bars=adjusted_rows,
         previous_states=previous_adjusted_states,
         reported_previous_closes=reported_previous_closes,
+        factor_reference_closes=factor_reference_closes,
         adjustment_events=event_rows,
     )]
+    candidate_symbols = set(plan.corporate_action_symbols)
+    event_symbols = {row.symbol for row in event_rows if row.effective_date == plan.target_session}
+    cash_lineage_symbols = {
+        str(row.get("symbol")) for row in lineage_rows
+        if row.get("kind") == "cash_dividend_reference"
+    }
+    missing_candidate_events = sorted(candidate_symbols - event_symbols)
+    missing_candidate_lineage = sorted(candidate_symbols - cash_lineage_symbols)
+    gates.append(GateResult(
+        "daily_corporate_action_candidate_evidence",
+        not missing_candidate_events and not missing_candidate_lineage,
+        (
+            f"events={len(candidate_symbols) - len(missing_candidate_events)}/{len(candidate_symbols)},"
+            f"cash_lineage={len(candidate_symbols) - len(missing_candidate_lineage)}/{len(candidate_symbols)}"
+        ),
+        "all in-universe candidates have target factor events and structured cash lineage",
+        details=tuple(
+            [f"missing_event:{symbol}" for symbol in missing_candidate_events]
+            + [f"missing_cash_lineage:{symbol}" for symbol in missing_candidate_lineage]
+        ),
+    ))
     canonical_primary = canonical_rows(primary_rows)
     canonical_facts = [row.canonical() for row in fact_rows]
     canonical_verification = canonical_rows(verification_rows)
@@ -378,6 +443,11 @@ def build_incremental_evidence(
         "primary_calendar_sha256": plan.primary_calendar_sha256,
         "secondary_calendar_sha256": plan.secondary_calendar_sha256,
         "universe_sha256": plan.universe_sha256,
+        "corporate_action_inventory_source": plan.corporate_action_inventory_source,
+        "corporate_action_inventory_count": plan.corporate_action_inventory_count,
+        "corporate_action_inventory_sha256": plan.corporate_action_inventory_sha256,
+        "corporate_action_candidate_count": len(plan.corporate_action_symbols),
+        "corporate_action_symbols": list(plan.corporate_action_symbols),
         "expected_membership_sha256": sha256([
             {"symbol": symbol, "index_code": index_code}
             for symbol, index_code in plan.expected_membership
@@ -387,6 +457,7 @@ def build_incremental_evidence(
         "verification_row_count": len(verification_rows),
         "adjusted_row_count": len(adjusted_rows),
         "adjustment_event_count": len(event_rows),
+        "lineage_evidence_count": len(lineage_rows),
         "primary_failures": dict(sorted((primary_failures or {}).items())),
         "verification_failures": dict(sorted((verification_failures or {}).items())),
         "primary_sha256": sha256(canonical_primary),
@@ -394,6 +465,7 @@ def build_incremental_evidence(
         "verification_sha256": sha256(canonical_verification),
         "adjusted_sha256": sha256(canonical_adjusted),
         "adjustments_sha256": sha256(canonical_events),
+        "lineage_evidence_sha256": sha256(lineage_rows),
         "quality_sha256": sha256([gate.canonical() for gate in gates]),
         "accepted": accepted(gates),
         "gates": [gate.canonical() for gate in gates],
@@ -416,6 +488,8 @@ def write_outputs(
     verification_bars: Iterable[DailyBar],
     adjusted_bars: Iterable[HistoricalBar],
     adjustment_events: Iterable[AdjustmentEvent],
+    lineage_evidence: Iterable[Mapping[str, Any]] = (),
+    corporate_action_inventory: Iterable[Mapping[str, Any]] = (),
 ) -> None:
     canonical_primary = canonical_rows(primary_bars)
     canonical_facts = [
@@ -431,17 +505,27 @@ def write_outputs(
         row.canonical()
         for row in sorted(adjustment_events, key=lambda value: (value.symbol, value.effective_date, value.source))
     ]
+    canonical_lineage = sorted(
+        (dict(row) for row in lineage_evidence),
+        key=lambda row: (str(row.get("symbol", "")), str(row.get("kind", ""))),
+    )
+    canonical_corporate_actions = sorted(
+        (dict(row) for row in corporate_action_inventory),
+        key=lambda row: str(row.get("symbol", "")),
+    )
     expected_evidence = {
         "primary_row_count": len(canonical_primary),
         "tradeability_row_count": len(canonical_facts),
         "verification_row_count": len(canonical_verification),
         "adjusted_row_count": len(canonical_adjusted),
         "adjustment_event_count": len(canonical_events),
+        "lineage_evidence_count": len(canonical_lineage),
         "primary_sha256": sha256(canonical_primary),
         "tradeability_sha256": sha256(canonical_facts),
         "verification_sha256": sha256(canonical_verification),
         "adjusted_sha256": sha256(canonical_adjusted),
         "adjustments_sha256": sha256(canonical_events),
+        "lineage_evidence_sha256": sha256(canonical_lineage),
     }
     mismatches = {
         key: {"manifest": manifest.get(key), "actual": value}
@@ -450,6 +534,10 @@ def write_outputs(
     }
     if mismatches:
         raise ValueError(f"manifest does not match daily evidence: {mismatches}")
+    if manifest.get("corporate_action_inventory_count") != len(canonical_corporate_actions):
+        raise ValueError("manifest does not match corporate-action inventory count")
+    if manifest.get("corporate_action_inventory_sha256") != sha256(canonical_corporate_actions):
+        raise ValueError("manifest does not match corporate-action inventory hash")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_gzip(output_dir / "daily-primary-bars.json.gz", canonical_primary)
@@ -457,6 +545,8 @@ def write_outputs(
     _write_gzip(output_dir / "daily-verification-bars.json.gz", canonical_verification)
     _write_gzip(output_dir / "daily-adjusted-bars.json.gz", canonical_adjusted)
     _write_gzip(output_dir / "daily-adjustment-events.json.gz", canonical_events)
+    _write_gzip(output_dir / "daily-lineage-evidence.json.gz", canonical_lineage)
+    _write_gzip(output_dir / "daily-corporate-actions.json.gz", canonical_corporate_actions)
     (output_dir / "manifest.json").write_text(
         json.dumps(dict(manifest), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
