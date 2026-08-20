@@ -41,6 +41,7 @@ jobs:
       - name: Verify disabled simulation contracts, reconciliation, and schema
         run: |
           python -m scripts.test_v2_simulation_contracts
+          python -m scripts.test_v2_simulation_data_adapter
           python -m scripts.test_v2_simulation_reconciliation
           python -m scripts.test_v2_simulation_schema
           python -m scripts.test_cloud_runtime
@@ -66,8 +67,14 @@ jobs:
           from importlib.metadata import version
           from rqalpha import run_func
           from rqalpha.api import order_shares
+          from rqalpha.environment import Environment
+          from rqalpha.interface import AbstractDataSource
           assert version("rqalpha") == "6.2.1"
           assert "config" in inspect.getdoc(run_func)
           assert list(inspect.signature(order_shares).parameters)[:2] == ["id_or_ins", "amount"]
-          print("RQAlpha 6.2.1 public API accepted; no simulation account was run")
+          assert hasattr(Environment, "set_data_source")
+          assert "get_dividend" in AbstractDataSource.__dict__
+          print("RQAlpha 6.2.1 public data and order APIs accepted; no simulation account was activated")
           PY
+      - name: Execute M2 corporate-action regression through RQAlpha accounting
+        run: python -m scripts.test_v2_rqalpha_corporate_action_execution
