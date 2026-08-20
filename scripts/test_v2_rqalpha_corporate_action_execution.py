@@ -113,7 +113,9 @@ class RQAlphaCorporateActionExecutionTests(unittest.TestCase):
         receivable, position = _execute("601727", "6.8900", "0.1425")
         self.assertAlmostEqual(receivable, 14.25)
         self.assertAlmostEqual(position._avg_price, 6.87575)
-        self.assertEqual(position._dividend_receivable[0], (date(2026, 7, 31), 14.25))
+        payable_date, payable_amount = position._dividend_receivable[0]
+        self.assertEqual(payable_date, date(2026, 7, 31))
+        self.assertAlmostEqual(payable_amount, 14.25)
 
     def test_601866_half_tick_cash_is_applied_by_rqalpha(self) -> None:
         receivable, position = _execute("601866", "2.4700", "0.1500")
