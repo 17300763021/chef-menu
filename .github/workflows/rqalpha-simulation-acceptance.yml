@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "M3 contracts or bounded research-only RQAlpha engine acceptance"
+        description: "M3 contracts, bounded engine acceptance, or disabled online-ledger acceptance"
         required: true
         default: deterministic
         type: choice
-        options: [deterministic, framework-smoke]
+        options: [deterministic, framework-smoke, ledger-online]
   pull_request:
     branches: [main, codex/m2-industry-pit]
     paths:
@@ -45,11 +45,12 @@ jobs:
           python -m scripts.test_v2_simulation_data_adapter
           python -m scripts.test_v2_simulation_history_adapter
           python -m scripts.test_v2_simulation_reconciliation
+          python -m scripts.test_v2_simulation_ledger_acceptance
           python -m scripts.test_v2_simulation_schema
           python -m scripts.test_cloud_runtime
 
   framework-public-api-smoke:
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'framework-smoke')
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'framework-smoke' || inputs.mode == 'ledger-online'))
     needs: deterministic-contracts
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -120,4 +121,43 @@ jobs:
           name: m3-rqalpha-bounded-acceptance-${{ github.run_id }}
           path: m3-acceptance/
           retention-days: 7
+          if-no-files-found: error
+
+  disabled-online-ledger-acceptance:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ledger-online'
+    needs: [deterministic-contracts, framework-public-api-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TIDB_HOST: ${{ secrets.TIDB_HOST }}
+      TIDB_PORT: ${{ secrets.TIDB_PORT }}
+      TIDB_USER: ${{ secrets.TIDB_USER }}
+      TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+      TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+      TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - name: Install pinned engine and read-only warehouse client
+        run: python -m pip install "rqalpha==6.2.1" "PyMySQL==1.1.1"
+      - name: Extract the explicitly pinned bounded M2 input
+        run: python -m scripts.simulation.extract_m2_rqalpha_input --output m3-ledger/m2-input.json
+      - name: Publish once atomically, retry ten times, and verify immutable read-back
+        run: >-
+          python -m scripts.simulation.ledger_acceptance
+          --input m3-ledger/m2-input.json
+          --report-out m3-ledger/acceptance-report.json
+      - name: Preserve compact non-sensitive online-ledger evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: m3-disabled-online-ledger-${{ github.run_id }}
+          path: m3-ledger/acceptance-report.json
+          retention-days: 30
           if-no-files-found: error

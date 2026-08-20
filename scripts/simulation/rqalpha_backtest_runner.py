@@ -123,7 +123,13 @@ def _normalized_results(result: dict[str, Any], input_sha256: str) -> dict[str, 
     return normalized
 
 
-def run_bounded_backtest(input_path: Path) -> dict[str, Any]:
+def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
+    """Run the accepted bounded strategy and retain RQAlpha's in-memory result.
+
+    M3.4 reuses this public project boundary to build the disabled online-ledger
+    acceptance package.  The normalized M3.3 output remains produced by
+    ``run_bounded_backtest`` so its accepted schema and hash do not change.
+    """
     value = load_bounded_input(input_path)
     bars = {
         (str(row["symbol"]), date.fromisoformat(str(row["business_date"]))): row
@@ -197,7 +203,12 @@ def run_bounded_backtest(input_path: Path) -> dict[str, Any]:
         },
     }
     result = adapter.run_strategy(config=config, init=init, handle_bar=handle_bar)
-    return _normalized_results(result, value.input_sha256)
+    return result, value.input_sha256
+
+
+def run_bounded_backtest(input_path: Path) -> dict[str, Any]:
+    result, input_sha256 = execute_bounded_backtest(input_path)
+    return _normalized_results(result, input_sha256)
 
 
 def main() -> None:
