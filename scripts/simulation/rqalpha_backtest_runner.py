@@ -123,13 +123,11 @@ def _normalized_results(result: dict[str, Any], input_sha256: str) -> dict[str, 
     return normalized
 
 
-def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
-    """Run the accepted bounded strategy and retain RQAlpha's in-memory result.
+def _execute_bounded_backtest(
+    input_path: Path,
+) -> tuple[dict[str, Any], str, tuple[dict[str, Any], ...]]:
+    """Run the accepted strategy once and retain end-of-day engine state."""
 
-    M3.4 reuses this public project boundary to build the disabled online-ledger
-    acceptance package.  The normalized M3.3 output remains produced by
-    ``run_bounded_backtest`` so its accepted schema and hash do not change.
-    """
     value = load_bounded_input(input_path)
     bars = {
         (str(row["symbol"]), date.fromisoformat(str(row["business_date"]))): row
@@ -140,6 +138,7 @@ def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
         for row in value.tradeability
     }
     adapter = RQAlphaAdapter()
+    daily_trace: list[dict[str, Any]] = []
 
     def init(context: Any) -> None:
         context.m3_orders = set()
@@ -181,6 +180,19 @@ def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
         if session == ACCEPTANCE_SESSIONS[1]:
             submit(context, "600519", "buy", 100)
 
+    def after_trading(context: Any) -> None:
+        from rqalpha.const import POSITION_DIRECTION
+
+        session = context.now.date()
+        position = context.portfolio.get_position("600519.XSHG", POSITION_DIRECTION.LONG)
+        daily_trace.append({
+            "business_date": session.isoformat(),
+            "symbol": "600519",
+            "total_shares": int(position.quantity),
+            "sellable_shares": int(position.closable),
+            "average_execution_price": format(_money(position.avg_price), "f"),
+        })
+
     config = {
         "base": {
             "start_date": ACCEPTANCE_SESSIONS[0].isoformat(),
@@ -202,8 +214,32 @@ def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
             },
         },
     }
-    result = adapter.run_strategy(config=config, init=init, handle_bar=handle_bar)
-    return result, value.input_sha256
+    result = adapter.run_strategy(
+        config=config,
+        init=init,
+        handle_bar=handle_bar,
+        after_trading=after_trading,
+    )
+    return result, value.input_sha256, tuple(daily_trace)
+
+
+def execute_bounded_backtest(input_path: Path) -> tuple[dict[str, Any], str]:
+    """Run the accepted bounded strategy and retain RQAlpha's in-memory result.
+
+    M3.4 reuses this public project boundary to build the disabled online-ledger
+    acceptance package.  The normalized M3.3 output remains produced by
+    ``run_bounded_backtest`` so its accepted schema and hash do not change.
+    """
+    result, input_sha256, _ = _execute_bounded_backtest(input_path)
+    return result, input_sha256
+
+
+def execute_continuity_backtest(
+    input_path: Path,
+) -> tuple[dict[str, Any], str, tuple[dict[str, Any], ...]]:
+    """Expose the same run's daily T+1 state for disabled continuity acceptance."""
+
+    return _execute_bounded_backtest(input_path)
 
 
 def run_bounded_backtest(input_path: Path) -> dict[str, Any]:
