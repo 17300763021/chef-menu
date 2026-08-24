@@ -120,12 +120,12 @@ jobs:
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
       - name: Capture resumable financial-statement checkpoints
         env:
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_RESEARCH_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_RESEARCH_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_RESEARCH_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_RESEARCH_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_RESEARCH_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.fundamental_runner
           --operation capture --mode "${{ inputs.mode }}"
@@ -147,12 +147,12 @@ jobs:
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
       - name: Validate global coverage and atomically publish
         env:
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_RESEARCH_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_RESEARCH_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_RESEARCH_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_RESEARCH_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_RESEARCH_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.fundamental_runner
           --operation finalize --mode "${{ inputs.mode }}"
