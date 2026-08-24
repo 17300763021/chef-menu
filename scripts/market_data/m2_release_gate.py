@@ -13,6 +13,7 @@ from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
 
 
 RELEASE_SCHEMA_VERSION = "m2-data-release-v1"
+RESEARCH_WINDOW_SESSIONS = 1250
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS m2_data_releases (
   release_id VARCHAR(160) NOT NULL PRIMARY KEY,
@@ -106,6 +107,12 @@ def build_release(connection: Any, business_date: date) -> dict[str, Any]:
         "simulation_orders_allowed": False,
         "accepted": True,
         "components": component_rows,
+        "market_data_window": {
+            "mode": "last_n_closed_trading_sessions",
+            "session_count": RESEARCH_WINDOW_SESSIONS,
+            "physical_retention": "immutable_append_only",
+            "corporate_action_owner": "rqalpha",
+        },
         "flow_policy": "optional verified enhancement; unavailable flow disables the factor and cannot be represented as zero or neutral data",
     }
     manifest["release_id"] = f"m2-release-{business_date.isoformat()}-{sha256(manifest)}"

@@ -101,7 +101,7 @@ jobs:
           python -m scripts.test_baostock_history_source
 
   quota-gate:
-    if: github.event_name == 'workflow_dispatch' || vars.M2_DAILY_ENABLED == 'true'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.M2_DAILY_ENABLED == 'true')
     needs: deterministic-tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -129,7 +129,7 @@ jobs:
           --checked-at "${MANUAL_CHECKED_AT:-$SCHEDULED_CHECKED_AT}"
 
   ingest:
-    if: github.event_name == 'workflow_dispatch' || vars.M2_DAILY_ENABLED == 'true'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.M2_DAILY_ENABLED == 'true')
     needs: [deterministic-tests, quota-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 300
@@ -155,16 +155,24 @@ jobs:
           TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: |
+          max_sessions="${INPUT_MAX_SESSIONS:-}"
+          if [[ -z "$max_sessions" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+              max_sessions=5
+            else
+              max_sessions=1
+            fi
+          fi
           parallel_shards=4
           if [[ -n "$INPUT_SUPERSEDES_DATASET_ID" ]]; then
-            if [[ -z "$INPUT_TARGET_SESSION" || "${INPUT_MAX_SESSIONS:-1}" != "1" ]]; then
+            if [[ -z "$INPUT_TARGET_SESSION" || "$max_sessions" != "1" ]]; then
               echo "A correction requires target_session and max_sessions=1."
               exit 2
             fi
             parallel_shards=1
           fi
           args=(
-            --max-sessions "${INPUT_MAX_SESSIONS:-1}"
+            --max-sessions "$max_sessions"
             --parallel-shards "$parallel_shards"
             --output-dir daily-market-increment
             --symbol-attempts 2

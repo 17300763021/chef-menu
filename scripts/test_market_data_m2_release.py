@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from scripts.market_data.m2_release_gate import build_release
+from scripts.market_data.m2_release_gate import RESEARCH_WINDOW_SESSIONS, build_release
 
 
 class _Cursor:
@@ -64,6 +64,12 @@ class M2ReleaseGateTests(unittest.TestCase):
         self.assertFalse(manifest["authoritative"])
         self.assertFalse(manifest["simulation_orders_allowed"])
         self.assertFalse(manifest["components"]["flow"]["data_available"])
+        self.assertEqual(manifest["market_data_window"], {
+            "mode": "last_n_closed_trading_sessions",
+            "session_count": RESEARCH_WINDOW_SESSIONS,
+            "physical_retention": "immutable_append_only",
+            "corporate_action_owner": "rqalpha",
+        })
         flow_call = next(call for call in connection.cursor_value.calls if "FROM m2_flow_runs" in call[0])
         self.assertEqual(flow_call[1], (date(2026, 8, 3),))
         daily_call = next(call for call in connection.cursor_value.calls if "FROM m2_daily_runs" in call[0])

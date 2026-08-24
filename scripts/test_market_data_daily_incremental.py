@@ -527,6 +527,107 @@ class DailyIncrementalTests(unittest.TestCase):
                 factor_reference_closes={symbol: Decimal("2.440000")},
             )
 
+    def test_exact_cash_evidence_exposes_incomparable_vendor_factor_as_diagnostic(self) -> None:
+        symbol = "601727"
+        primary = [bar("akshare_eastmoney", symbol, "10.10")]
+        state = PreviousAdjustedState(
+            symbol=symbol,
+            business_date=PREVIOUS,
+            raw_close=Decimal("10.020730"),
+            qfq_factor=Decimal("1.000000"),
+            hfq_factor=Decimal("1.000000"),
+            source_dataset_id="accepted-predecessor-with-another-factor-base",
+        )
+        event = AdjustmentEvent(
+            symbol,
+            TARGET,
+            Decimal("1.000000"),
+            Decimal("1.030020"),
+            source="akshare_sina_absolute_factor",
+        )
+        arguments = {
+            "target_session": TARGET,
+            "previous_session": PREVIOUS,
+            "membership": {symbol: "000905"},
+            "primary_bars": primary,
+            "previous_states": {symbol: state},
+            "reported_previous_closes": {symbol: Decimal("10.0000")},
+            "adjustment_events": [event],
+        }
+        with self.assertRaisesRegex(ValueError, "adjustment factor does not reconcile"):
+            build_daily_adjusted_bars(**arguments)
+
+        adjusted = build_daily_adjusted_bars(
+            **arguments,
+            factor_reference_closes={symbol: Decimal("10.000000")},
+        )
+        self.assertEqual(adjusted[0].qfq_factor, state.qfq_factor)
+        self.assertEqual(adjusted[0].hfq_factor, state.hfq_factor)
+        self.assertEqual(adjusted[0].factor_source, "rqalpha_deferred_cash_action")
+        gates = evaluate_daily_adjustments(
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            membership={symbol: "000905"},
+            primary_bars=primary,
+            adjusted_bars=adjusted,
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: Decimal("10.0000")},
+            adjustment_events=[event],
+            factor_reference_closes={symbol: Decimal("10.000000")},
+        )
+        lineage = next(gate for gate in gates if gate.name == "daily_adjustment_lineage")
+        comparability = next(
+            gate for gate in gates if gate.name == "daily_vendor_absolute_factor_comparability"
+        )
+        self.assertTrue(lineage.passed, lineage.details)
+        self.assertFalse(comparability.passed)
+        self.assertFalse(comparability.critical)
+        self.assertEqual(comparability.details, (
+            "601727:expected=1.002073:observed=1.030020",
+        ))
+        plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS,
+            expected_membership=((symbol, "000905"),),
+            accepted_existing_symbols=(),
+            fetch_symbols=(symbol,),
+            verification_symbols=(symbol,),
+            primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64,
+            universe_sha256="c" * 64,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="d" * 64,
+            corporate_action_symbols=(symbol,),
+        )
+        manifest = build_incremental_evidence(
+            plan=plan,
+            primary_bars=primary,
+            tradeability_facts=[fact(symbol, "000905")],
+            verification_bars=[bar("baostock", symbol, "10.10")],
+            adjusted_bars=adjusted,
+            adjustment_events=[event],
+            previous_adjusted_states={symbol: state},
+            accepted_previous_closes={symbol: state.raw_close},
+            reported_previous_closes={symbol: Decimal("10.0000")},
+            factor_reference_closes={symbol: Decimal("10.000000")},
+            lineage_evidence=[{
+                "symbol": symbol,
+                "target_session": TARGET.isoformat(),
+                "kind": "cash_dividend_reference",
+                "source": "tencent_archive",
+                "details": {"factor_reference_close": "10.000000"},
+            }],
+        )[0]
+        self.assertTrue(manifest["accepted"], manifest["gates"])
+        manifest_comparability = next(
+            gate for gate in manifest["gates"]
+            if gate["name"] == "daily_vendor_absolute_factor_comparability"
+        )
+        self.assertFalse(manifest_comparability["passed"])
+        self.assertFalse(manifest_comparability["critical"])
+
     def test_missing_active_bar_fails_but_confirmed_suspension_is_allowed(self) -> None:
         plan = small_plan()
         primary = [bar("akshare_eastmoney", "600519")]

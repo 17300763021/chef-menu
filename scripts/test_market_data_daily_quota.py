@@ -70,6 +70,15 @@ class DailyQuotaGuardTests(unittest.TestCase):
             / ".github" / "workflows" / "market-data-daily-incremental.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("vars.M2_DAILY_ENABLED == 'true'", workflow)
+        self.assertEqual(
+            workflow.count(
+                "github.event_name == 'workflow_dispatch' || "
+                "(github.event_name == 'schedule' && vars.M2_DAILY_ENABLED == 'true')"
+            ),
+            2,
+        )
+        self.assertIn('if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]', workflow)
+        self.assertIn("max_sessions=5", workflow)
         self.assertIn("--reported-percent", workflow)
         self.assertIn("--storage-percent", workflow)
         self.assertIn("retention-days: 7", workflow)

@@ -23,6 +23,7 @@ from scripts.market_data.quality_gates import GateResult
 PRICE_BREAK_TOLERANCE = Decimal("0.0005")
 FACTOR_RATIO_TOLERANCE = Decimal("0.002")
 A_SHARE_REFERENCE_QUANTUM = Decimal("0.01")
+RQALPHA_DEFERRED_CASH_ACTION_SOURCE = "rqalpha_deferred_cash_action"
 
 
 def _limited(values: Iterable[str], maximum: int = 20) -> tuple[str, ...]:
@@ -100,7 +101,10 @@ def build_daily_adjusted_bars(
 
     A normal session carries both factors forward.  A reference-price break is
     accepted only when a separately attributed event exists on the target
-    session and its HFQ factor ratio reconciles to the price discontinuity.
+    session.  Factor-ratio reconciliation remains mandatory unless an exact
+    structured cash-dividend reference is supplied: absolute factors from two
+    vendors do not share a guaranteed normalization base, so that comparison is
+    diagnostic while RQAlpha remains responsible for applying the action.
     """
     events = list(adjustment_events)
     factor_references = factor_reference_closes or {}
@@ -138,14 +142,23 @@ def build_daily_adjusted_bars(
             observed_hfq_ratio = (event.hfq_factor / state.hfq_factor).quantize(
                 FACTOR_QUANTUM, rounding=ROUND_HALF_UP,
             )
-            if not _within_rate(expected_hfq_ratio, observed_hfq_ratio, FACTOR_RATIO_TOLERANCE):
+            exact_cash_reference = raw.symbol in factor_references
+            factor_ratio_matches = _within_rate(
+                expected_hfq_ratio, observed_hfq_ratio, FACTOR_RATIO_TOLERANCE,
+            )
+            if not exact_cash_reference and not factor_ratio_matches:
                 raise ValueError(
                     f"adjustment factor does not reconcile for {raw.symbol}: "
                     f"expected ratio {expected_hfq_ratio}, observed {observed_hfq_ratio}"
                 )
-            qfq_factor = event.qfq_factor
-            hfq_factor = event.hfq_factor
-            factor_source = event.source
+            if exact_cash_reference and not factor_ratio_matches:
+                qfq_factor = state.qfq_factor
+                hfq_factor = state.hfq_factor
+                factor_source = RQALPHA_DEFERRED_CASH_ACTION_SOURCE
+            else:
+                qfq_factor = event.qfq_factor
+                hfq_factor = event.hfq_factor
+                factor_source = event.source
         rows.append(HistoricalBar.build(
             symbol=raw.symbol,
             business_date=raw.business_date,
@@ -206,6 +219,7 @@ def evaluate_daily_adjustments(
     ]
     arithmetic_errors: list[str] = []
     lineage_errors: list[str] = []
+    vendor_factor_mismatches: list[str] = []
     event_keys = Counter((event.symbol, event.effective_date) for event in events)
     duplicate_events = [
         f"{symbol}:{effective_date.isoformat()}"
@@ -264,12 +278,6 @@ def evaluate_daily_adjustments(
             or adjusted.hfq_factor != state.hfq_factor
         ):
             lineage_errors.append(f"{raw.symbol}:unexpected_factor_change")
-        elif event is not None and (
-            adjusted.qfq_factor != event.qfq_factor
-            or adjusted.hfq_factor != event.hfq_factor
-            or adjusted.factor_source != event.source
-        ):
-            lineage_errors.append(f"{raw.symbol}:event_factor_mismatch")
         elif event is not None:
             factor_reference = factor_references.get(raw.symbol, reported)
             if (
@@ -285,7 +293,24 @@ def evaluate_daily_adjustments(
                 FACTOR_QUANTUM, rounding=ROUND_HALF_UP,
             )
             if not _within_rate(expected_ratio, observed_ratio, FACTOR_RATIO_TOLERANCE):
-                lineage_errors.append(f"{raw.symbol}:event_ratio_mismatch")
+                if raw.symbol in factor_references:
+                    vendor_factor_mismatches.append(
+                        f"{raw.symbol}:expected={expected_ratio}:observed={observed_ratio}"
+                    )
+                    if (
+                        adjusted.qfq_factor != state.qfq_factor
+                        or adjusted.hfq_factor != state.hfq_factor
+                        or adjusted.factor_source != RQALPHA_DEFERRED_CASH_ACTION_SOURCE
+                    ):
+                        lineage_errors.append(f"{raw.symbol}:deferred_factor_mismatch")
+                else:
+                    lineage_errors.append(f"{raw.symbol}:event_ratio_mismatch")
+            elif (
+                adjusted.qfq_factor != event.qfq_factor
+                or adjusted.hfq_factor != event.hfq_factor
+                or adjusted.factor_source != event.source
+            ):
+                lineage_errors.append(f"{raw.symbol}:event_factor_mismatch")
 
     return [
         GateResult(
@@ -319,5 +344,12 @@ def evaluate_daily_adjustments(
             "daily_adjustment_lineage", not lineage_errors,
             len(lineage_errors), "= 0 unconfirmed price/factor discontinuities",
             details=_limited(lineage_errors),
+        ),
+        GateResult(
+            "daily_vendor_absolute_factor_comparability", not vendor_factor_mismatches,
+            len(vendor_factor_mismatches),
+            "= 0 cross-vendor normalization mismatches; diagnostic when exact cash evidence exists",
+            critical=False,
+            details=_limited(vendor_factor_mismatches),
         ),
     ]
