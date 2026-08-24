@@ -3,12 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import date
 from decimal import Decimal
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport
 from scripts.market_data.fundamental_quality_gates import evaluate_fundamentals
-from scripts.market_data.fundamental_runner import reusable_checkpoint
+from scripts.market_data.fundamental_runner import _connection_configs, _load_market_scope, reusable_checkpoint
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.eastmoney_fundamental_source import EastmoneyFundamentalSource
 
@@ -28,6 +29,39 @@ def frame(statement: str) -> pd.DataFrame:
 
 
 class FundamentalTests(unittest.TestCase):
+    def test_dual_connection_configs_keep_market_read_and_research_write_distinct(self) -> None:
+        env = {
+            "TIDB_HOST": "research.example", "TIDB_PORT": "4000", "TIDB_USER": "research",
+            "TIDB_PASSWORD": "research-secret", "TIDB_DATABASE": "chef_menu_research",
+            "TIDB_MARKET_HOST": "market.example", "TIDB_MARKET_PORT": "4000", "TIDB_MARKET_USER": "market",
+            "TIDB_MARKET_PASSWORD": "market-secret", "TIDB_MARKET_DATABASE": "chef_menu_market",
+        }
+        market, research = _connection_configs(env)
+        self.assertEqual(market.database, "chef_menu_market")
+        self.assertEqual(research.database, "chef_menu_research")
+
+    def test_dual_connection_configs_reject_same_database_identity(self) -> None:
+        env = {
+            "TIDB_HOST": "same.example", "TIDB_PORT": "4000", "TIDB_USER": "same",
+            "TIDB_PASSWORD": "one", "TIDB_DATABASE": "same_db",
+            "TIDB_MARKET_HOST": "same.example", "TIDB_MARKET_PORT": "4000", "TIDB_MARKET_USER": "same",
+            "TIDB_MARKET_PASSWORD": "two", "TIDB_MARKET_DATABASE": "same_db",
+        }
+        with self.assertRaisesRegex(RuntimeError, "must be distinct"):
+            _connection_configs(env)
+
+    @patch("scripts.market_data.fundamental_runner._scope")
+    @patch("scripts.market_data.fundamental_runner.connect")
+    def test_market_connection_is_closed_after_scope_only_read(self, mock_connect: Mock, mock_scope: Mock) -> None:
+        connection = Mock()
+        mock_connect.return_value = connection
+        mock_scope.return_value = ["scope-row"]
+        config = Mock()
+        result = _load_market_scope(config, "base", "sample")
+        self.assertEqual(result, ["scope-row"])
+        mock_scope.assert_called_once_with(connection, "base", "sample")
+        connection.close.assert_called_once_with()
+
     def test_effective_date_uses_later_update_and_prevents_lookahead(self) -> None:
         report = FundamentalReport.build(
             symbol="000001", statement_type="balance", report_date="2025-12-31",

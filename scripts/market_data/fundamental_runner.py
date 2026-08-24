@@ -66,6 +66,24 @@ def _scope(connection: Any, base_id: str, mode: str):
     return [by_symbol[symbol] for symbol in SAMPLE_SYMBOLS]
 
 
+def _connection_configs(env: Mapping[str, str] | None = None) -> tuple[TiDBConfig, TiDBConfig]:
+    research = TiDBConfig.from_env(env)
+    market = TiDBConfig.from_env(env, prefix="TIDB_MARKET")
+    research_identity = (research.host, research.port, research.user, research.database)
+    market_identity = (market.host, market.port, market.user, market.database)
+    if research_identity == market_identity:
+        raise RuntimeError("market read connection and research write connection must be distinct")
+    return market, research
+
+
+def _load_market_scope(config: TiDBConfig, base_id: str, mode: str):
+    connection = connect(config)
+    try:
+        return _scope(connection, base_id, mode)
+    finally:
+        connection.close()
+
+
 def dataset_id(*, base_id: str, mode: str, as_of_date: date, symbols: list[str]) -> str:
     seed = {
         "schema_version": FUNDAMENTAL_SCHEMA_VERSION,
@@ -87,11 +105,11 @@ def capture(
     shard_count: int,
     attempts: int,
 ) -> dict[str, Any]:
-    config = TiDBConfig.from_env()
-    connection = connect(config)
+    market_config, research_config = _connection_configs()
+    scope = _load_market_scope(market_config, base_id, mode)
+    connection = connect(research_config)
     try:
         ensure_fundamental_schema(connection)
-        scope = _scope(connection, base_id, mode)
         symbols = [row.symbol for row in scope]
         run_id = dataset_id(base_id=base_id, mode=mode, as_of_date=as_of_date, symbols=symbols)
         with connection.cursor() as cursor:
@@ -137,7 +155,7 @@ def capture(
                         "confirmed_delisted_source_empty_after_two_responses;"
                         f"out_date={security.out_date.isoformat()}"
                     )
-                    checkpoint_connection = connect(config)
+                    checkpoint_connection = connect(research_config)
                     try:
                         publish_symbol_checkpoint(
                             checkpoint_connection, dataset_id=run_id, symbol=security.symbol,
@@ -158,7 +176,7 @@ def capture(
             except Exception as verification_error:  # diagnostic only; primary dates remain explicit.
                 verifications = ()
                 _progress("fundamental_verification_unavailable", symbol=security.symbol, error=str(verification_error))
-            checkpoint_connection = connect(config)
+            checkpoint_connection = connect(research_config)
             try:
                 publish_symbol_checkpoint(
                     checkpoint_connection,
@@ -174,7 +192,7 @@ def capture(
             succeeded += 1
             _progress("fundamental_symbol_completed", symbol=security.symbol, reports=len(reports), facts=len(facts))
         except Exception as error:  # noqa: BLE001 - persisted for resumable cloud repair.
-            failed_connection = connect(config)
+            failed_connection = connect(research_config)
             try:
                 publish_symbol_checkpoint(
                     failed_connection, dataset_id=run_id, symbol=security.symbol, status="failed", error=error,
@@ -209,10 +227,11 @@ def _fact_from_db(row: Mapping[str, Any]) -> FundamentalFact:
 
 
 def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> dict[str, Any]:
-    connection = connect(TiDBConfig.from_env())
+    market_config, research_config = _connection_configs()
+    scope = _load_market_scope(market_config, base_id, mode)
+    connection = connect(research_config)
     try:
         ensure_fundamental_schema(connection)
-        scope = _scope(connection, base_id, mode)
         symbols = [row.symbol for row in scope]
         run_id = dataset_id(base_id=base_id, mode=mode, as_of_date=as_of_date, symbols=symbols)
         report_dicts, fact_dicts, checkpoints = load_dataset(connection, run_id)

@@ -126,6 +126,12 @@ jobs:
           TIDB_PASSWORD: ${{ secrets.TIDB_RESEARCH_PASSWORD }}
           TIDB_DATABASE: ${{ secrets.TIDB_RESEARCH_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_RESEARCH_SSL_MODE }}
+          TIDB_MARKET_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_MARKET_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_MARKET_USER: ${{ secrets.TIDB_USER }}
+          TIDB_MARKET_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_MARKET_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_MARKET_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.fundamental_runner
           --operation capture --mode "${{ inputs.mode }}"
@@ -153,6 +159,12 @@ jobs:
           TIDB_PASSWORD: ${{ secrets.TIDB_RESEARCH_PASSWORD }}
           TIDB_DATABASE: ${{ secrets.TIDB_RESEARCH_DATABASE }}
           TIDB_SSL_MODE: ${{ secrets.TIDB_RESEARCH_SSL_MODE }}
+          TIDB_MARKET_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_MARKET_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_MARKET_USER: ${{ secrets.TIDB_USER }}
+          TIDB_MARKET_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_MARKET_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_MARKET_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.fundamental_runner
           --operation finalize --mode "${{ inputs.mode }}"

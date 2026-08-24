@@ -45,6 +45,8 @@ class M2WorkflowTests(unittest.TestCase):
         self.assertIn('else 16', text)
         self.assertIn("max-parallel: 4", text)
         self.assertIn("timeout-minutes: 180", text)
+        self.assertEqual(text.count("TIDB_MARKET_HOST: ${{ secrets.TIDB_HOST }}"), 2)
+        self.assertEqual(text.count("TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}"), 2)
 
 
 if __name__ == "__main__":
