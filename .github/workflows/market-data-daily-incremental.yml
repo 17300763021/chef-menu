@@ -148,12 +148,12 @@ jobs:
           INPUT_MAX_SESSIONS: ${{ inputs.max_sessions }}
           INPUT_SUPERSEDES_DATASET_ID: ${{ inputs.supersedes_dataset_id }}
           M2_BASE_HISTORY_DATASET_ID: ${{ vars.M2_BASE_HISTORY_DATASET_ID }}
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          TIDB_HOST: ${{ secrets.TIDB_MARKET_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_MARKET_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_MARKET_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_MARKET_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_MARKET_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_MARKET_SSL_MODE }}
         run: |
           max_sessions="${INPUT_MAX_SESSIONS:-}"
           if [[ -z "$max_sessions" ]]; then

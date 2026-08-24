@@ -70,6 +70,10 @@ class DailyQuotaGuardTests(unittest.TestCase):
             / ".github" / "workflows" / "market-data-daily-incremental.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("vars.M2_DAILY_ENABLED == 'true'", workflow)
+        self.assertIn("TIDB_MARKET_HOST", workflow)
+        self.assertIn("TIDB_MARKET_DATABASE", workflow)
+        self.assertNotIn("TIDB_HOST: ${{ secrets.TIDB_HOST }}", workflow)
+        self.assertNotIn("TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}", workflow)
         self.assertEqual(
             workflow.count(
                 "github.event_name == 'workflow_dispatch' || "
