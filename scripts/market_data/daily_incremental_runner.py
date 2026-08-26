@@ -795,9 +795,19 @@ def run(
         all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
     ))
     if finalize_only and plan.fetch_symbols:
-        raise RuntimeError(
-            f"daily capture is incomplete; remaining_symbols={len(plan.fetch_symbols)}"
-        )
+        blocked_result = {
+            "event": "daily_blocked",
+            "dataset_id": dataset_id,
+            "target_session": target.isoformat(),
+            "accepted": False,
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "remaining_symbols": len(plan.fetch_symbols),
+            "blocked_symbols": sorted(plan.fetch_symbols),
+            "reason": "symbol checkpoints incomplete; see TiDB checkpoint error details",
+        }
+        _progress("daily_blocked", **blocked_result)
+        return blocked_result
     if finalize_only:
         selected_fetch_symbols = []
     _progress(

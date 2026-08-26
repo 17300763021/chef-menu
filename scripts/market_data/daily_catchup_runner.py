@@ -83,6 +83,7 @@ def catch_up(
         finally:
             connection.close()
     results = []
+    blocked = False
     for position in range(1, max_sessions + 1):
         observed_at = datetime.now(SHANGHAI)
         session_output = output_dir / f"session-{position}"
@@ -111,9 +112,16 @@ def catch_up(
         results.append({key: value for key, value in result.items() if key != "manifest"})
         if result.get("event") == "daily_noop":
             break
+        if result.get("event") == "daily_blocked":
+            blocked = True
+            break
         if not result.get("accepted"):
             raise RuntimeError(f"daily catch-up stopped at atomic session {position}: {result.get('dataset_id')}")
-    summary = {"event": "daily_catchup_completed", "requested_max_sessions": max_sessions, "results": results}
+    summary = {
+        "event": "daily_catchup_blocked" if blocked else "daily_catchup_completed",
+        "requested_max_sessions": max_sessions,
+        "results": results,
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "catchup-summary.json").write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)

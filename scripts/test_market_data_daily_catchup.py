@@ -29,6 +29,27 @@ class DailyCatchupTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "stopped"):
                     catch_up(max_sessions=2, base_history_dataset_id="base", output_dir=Path(tmp), symbol_attempts=2)
 
+    def test_blocked_session_is_normal_flow_and_does_not_advance(self) -> None:
+        blocked = {
+            "event": "daily_blocked",
+            "accepted": False,
+            "dataset_id": "blocked-day",
+            "target_session": "2026-08-03",
+            "blocked_symbols": ["689009"],
+            "reason": "verification sources failed",
+            "simulation_orders_allowed": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "scripts.market_data.daily_catchup_runner.run", return_value=blocked,
+        ) as mocked:
+            summary = catch_up(
+                max_sessions=5, base_history_dataset_id="base", output_dir=Path(tmp),
+                symbol_attempts=2,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(summary["event"], "daily_catchup_blocked")
+        self.assertEqual(summary["results"][0]["blocked_symbols"], ["689009"])
+
     def test_stable_shards_do_not_change_when_other_checkpoints_finish(self) -> None:
         membership = [(f"{value:06d}", "000300" if value < 6 else "000905") for value in range(12)]
         scope = list(daily_membership_symbols(membership))
