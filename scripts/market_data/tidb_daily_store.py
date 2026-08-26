@@ -1525,14 +1525,19 @@ def daily_correction_context(
     target_session: date,
 ) -> tuple[date, str]:
     """Validate a correction of the active lineage tip without mutating it."""
+    normalized_superseded_dataset_id = str(superseded_dataset_id).strip()
+    if not normalized_superseded_dataset_id:
+        raise RuntimeError("daily correction requires a non-empty superseded dataset id")
     active_session, active_dataset_id = latest_accepted_lineage(
         connection, base_history_dataset_id,
     )
-    if active_session != target_session or active_dataset_id != superseded_dataset_id:
+    if active_session != target_session or active_dataset_id != normalized_superseded_dataset_id:
         raise RuntimeError(
             "daily correction is limited to the active lineage tip: "
-            f"active tip {active_session.isoformat()}/{active_dataset_id}; "
-            f"requested {target_session.isoformat()}/{superseded_dataset_id}"
+            f"active tip {active_session.isoformat()}/{active_dataset_id!r} "
+            f"(len={len(active_dataset_id)}); "
+            f"requested {target_session.isoformat()}/{normalized_superseded_dataset_id!r} "
+            f"(len={len(normalized_superseded_dataset_id)})"
         )
     rows = _query_all(connection, """
         SELECT run.target_session, run.previous_session, run.predecessor_dataset_id,
@@ -1542,7 +1547,7 @@ def daily_correction_context(
         LEFT JOIN m2_daily_run_supersessions AS supersession
           ON supersession.superseded_dataset_id=run.dataset_id
         WHERE run.dataset_id=%s
-    """, (superseded_dataset_id,))
+    """, (normalized_superseded_dataset_id,))
     if len(rows) != 1:
         raise RuntimeError("superseded daily dataset does not exist")
     row = rows[0]

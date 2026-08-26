@@ -479,7 +479,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
             daily_correction_context(
                 FakeConnection(valid_router),
                 base_history_dataset_id="base",
-                superseded_dataset_id="bad-daily-run",
+                superseded_dataset_id=" bad-daily-run \t",
                 target_session=TARGET,
             ),
             (PREVIOUS, "daily-previous"),
@@ -891,7 +891,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            r"active tip 2026-07-31/active-daily; requested 2026-08-03/requested-daily",
+            r"active tip 2026-07-31/'active-daily' \(len=12\); requested 2026-08-03/'requested-daily' \(len=15\)",
         ):
             daily_correction_context(
                 FakeConnection(router),
