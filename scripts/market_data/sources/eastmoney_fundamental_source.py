@@ -17,6 +17,14 @@ from scripts.market_data.fundamental_contracts import (
 )
 
 
+class FundamentalSourceEmptyResponse(RuntimeError):
+    """A statement endpoint returned no usable payload for a symbol."""
+
+
+class FundamentalSourceRowAnomaly(ValueError):
+    """A single source row violates the point-in-time contract."""
+
+
 class EastmoneyFundamentalSource:
     name = "akshare_eastmoney_financial_statements"
 
@@ -89,6 +97,10 @@ class EastmoneyFundamentalSource:
                 last_error = error
                 if attempt < self.attempts:
                     time.sleep(attempt)
+        if isinstance(last_error, KeyError) and "data" in str(last_error).lower():
+            raise FundamentalSourceEmptyResponse(
+                f"{self.name} {statement_type} empty response: missing data payload"
+            ) from last_error
         raise RuntimeError(f"{self.name} {statement_type} failed: {last_error}") from last_error
 
     def fetch(
@@ -103,6 +115,9 @@ class EastmoneyFundamentalSource:
         vendor_symbol = self.vendor_symbol(code)
         reports: list[FundamentalReport] = []
         facts: list[FundamentalFact] = []
+        statement_reports: dict[str, int] = {statement: 0 for statement in METRIC_COLUMNS}
+        statement_candidates: dict[str, int] = {statement: 0 for statement in METRIC_COLUMNS}
+        row_anomalies: list[str] = []
         for statement_type in METRIC_COLUMNS:
             frame = self._call(statement_type, vendor_symbol, delisted=delisted)
             required = {
@@ -123,23 +138,31 @@ class EastmoneyFundamentalSource:
                     notice_value = update_value
                 if update_missing:
                     update_value = notice_value
-                report = FundamentalReport.build(
-                    symbol=raw.get("SECURITY_CODE") or code,
-                    statement_type=statement_type,
-                    report_date=raw.get("REPORT_DATE"),
-                    notice_date=notice_value,
-                    update_date=update_value,
-                    report_type=raw.get("REPORT_TYPE"),
-                    currency=raw.get("CURRENCY"),
-                    organization_type=raw.get("ORG_TYPE"),
-                    source=self.name + ("_delisted" if delisted else ""),
-                    source_row=raw,
-                )
+                try:
+                    report = FundamentalReport.build(
+                        symbol=raw.get("SECURITY_CODE") or code,
+                        statement_type=statement_type,
+                        report_date=raw.get("REPORT_DATE"),
+                        notice_date=notice_value,
+                        update_date=update_value,
+                        report_type=raw.get("REPORT_TYPE"),
+                        currency=raw.get("CURRENCY"),
+                        organization_type=raw.get("ORG_TYPE"),
+                        source=self.name + ("_delisted" if delisted else ""),
+                        source_row=raw,
+                    )
+                except ValueError as error:
+                    if "notice date cannot precede report period end" not in str(error):
+                        raise
+                    row_anomalies.append(f"{statement_type}:{error}")
+                    continue
                 if report.symbol != code:
                     raise RuntimeError(f"financial source returned {report.symbol} for {code}")
                 if report.report_date < history_start or report.effective_on > as_of_date:
                     continue
+                statement_candidates[statement_type] += 1
                 reports.append(report)
+                statement_reports[statement_type] += 1
                 for metric in METRIC_COLUMNS[statement_type]:
                     value = decimal_or_none(raw.get(metric))
                     if value is not None:
@@ -153,6 +176,15 @@ class EastmoneyFundamentalSource:
                             value=value,
                             unit=report.currency or "CNY",
                         ))
+        missing_statements = [
+            statement for statement, count in statement_reports.items()
+            if count == 0 and (statement_candidates[statement] > 0 or any(item.startswith(statement + ":") for item in row_anomalies))
+        ]
+        if missing_statements:
+            detail = ";".join(row_anomalies[:5])
+            raise FundamentalSourceEmptyResponse(
+                f"{self.name} missing usable statements={missing_statements}; anomalies={detail}"
+            )
         report_map = {row.key: row for row in reports}
         if len(report_map) != len(reports):
             raise RuntimeError(f"duplicate financial report versions for {code}")

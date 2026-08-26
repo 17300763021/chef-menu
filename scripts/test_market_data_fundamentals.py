@@ -11,7 +11,10 @@ from scripts.market_data.fundamental_contracts import FundamentalFact, Fundament
 from scripts.market_data.fundamental_quality_gates import evaluate_fundamentals
 from scripts.market_data.fundamental_runner import _connection_configs, _load_market_scope, reusable_checkpoint
 from scripts.market_data.quality_gates import accepted
-from scripts.market_data.sources.eastmoney_fundamental_source import EastmoneyFundamentalSource
+from scripts.market_data.sources.eastmoney_fundamental_source import (
+    EastmoneyFundamentalSource,
+    FundamentalSourceEmptyResponse,
+)
 
 
 def frame(statement: str) -> pd.DataFrame:
@@ -29,6 +32,30 @@ def frame(statement: str) -> pd.DataFrame:
 
 
 class FundamentalTests(unittest.TestCase):
+    def test_malformed_notice_row_isolated_when_statement_has_valid_rows(self) -> None:
+        valid = frame("balance").iloc[0].to_dict()
+        malformed = dict(valid, NOTICE_DATE="2025-01-01")
+        loaders = {
+            "balance": lambda _symbol: pd.DataFrame([malformed, valid]),
+            "income": lambda _symbol: frame("income"),
+            "cashflow": lambda _symbol: frame("cashflow"),
+        }
+        reports, facts = EastmoneyFundamentalSource(loaders=loaders).fetch(
+            "000001", history_start=date(2017, 1, 1), as_of_date=date(2026, 4, 25),
+        )
+        self.assertEqual(len([row for row in reports if row.statement_type == "balance"]), 1)
+        self.assertTrue(facts)
+
+    def test_missing_data_payload_is_structured_empty_response(self) -> None:
+        def missing(_symbol: str) -> pd.DataFrame:
+            raise KeyError("data")
+
+        loaders = {kind: missing for kind in ("balance", "income", "cashflow")}
+        with self.assertRaisesRegex(FundamentalSourceEmptyResponse, "empty response"):
+            EastmoneyFundamentalSource(loaders=loaders).fetch(
+                "000001", history_start=date(2017, 1, 1), as_of_date=date(2026, 4, 25),
+            )
+
     def test_dual_connection_configs_keep_market_read_and_research_write_distinct(self) -> None:
         env = {
             "TIDB_HOST": "research.example", "TIDB_PORT": "4000", "TIDB_USER": "research",
