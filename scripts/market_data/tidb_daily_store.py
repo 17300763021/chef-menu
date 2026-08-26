@@ -1529,7 +1529,11 @@ def daily_correction_context(
         connection, base_history_dataset_id,
     )
     if active_session != target_session or active_dataset_id != superseded_dataset_id:
-        raise RuntimeError("daily correction is limited to the active lineage tip")
+        raise RuntimeError(
+            "daily correction is limited to the active lineage tip: "
+            f"active tip {active_session.isoformat()}/{active_dataset_id}; "
+            f"requested {target_session.isoformat()}/{superseded_dataset_id}"
+        )
     rows = _query_all(connection, """
         SELECT run.target_session, run.previous_session, run.predecessor_dataset_id,
                run.base_history_dataset_id, run.accepted, run.authoritative,

@@ -878,6 +878,28 @@ class TiDBDailyStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "gap or predecessor mismatch"):
             latest_accepted_lineage(FakeConnection(broken_router), "base")
 
+    def test_correction_tip_error_reports_actual_and_requested_tip(self) -> None:
+        active_session = date(2026, 7, 31)
+        requested_session = date(2026, 8, 3)
+
+        def router(sql: str, params: Any):
+            if "FROM m2_history_runs" in sql:
+                return [(PREVIOUS, 1, 0, 0)]
+            if "FROM m2_daily_runs" in sql:
+                return [("active-daily", active_session, PREVIOUS, "base", 0, 0)]
+            return []
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"active tip 2026-07-31/active-daily; requested 2026-08-03/requested-daily",
+        ):
+            daily_correction_context(
+                FakeConnection(router),
+                base_history_dataset_id="base",
+                superseded_dataset_id="requested-daily",
+                target_session=requested_session,
+            )
+
     def test_target_selection_never_skips_a_missing_session(self) -> None:
         sessions = (PREVIOUS, TARGET, date(2026, 7, 28))
         self.assertEqual(_select_target(sessions, PREVIOUS, date(2026, 7, 28), None), TARGET)
