@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.market_data.calendar_contracts import TradingCalendar
@@ -23,7 +24,7 @@ from scripts.market_data.daily_incremental import (
     latest_closed_session,
     write_outputs,
 )
-from scripts.market_data.daily_incremental_runner import _reusable_existing_keys
+from scripts.market_data.daily_incremental_runner import _progress_result, _reusable_existing_keys
 from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
 from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
@@ -152,6 +153,22 @@ def adjustment_inputs(
 
 
 class DailyIncrementalTests(unittest.TestCase):
+    def test_blocked_result_progress_emits_event_once(self) -> None:
+        result = {
+            "event": "daily_blocked",
+            "dataset_id": "blocked-day",
+            "accepted": False,
+            "blocked_symbols": ["689009"],
+        }
+        with patch("scripts.market_data.daily_incremental_runner._progress") as progress:
+            _progress_result(result)
+        progress.assert_called_once_with(
+            "daily_blocked",
+            dataset_id="blocked-day",
+            accepted=False,
+            blocked_symbols=["689009"],
+        )
+
     def calendar(self, sessions=(PREVIOUS, TARGET)) -> TradingCalendar:
         return TradingCalendar.build("fixture", date(2026, 7, 1), TARGET, sessions)
 

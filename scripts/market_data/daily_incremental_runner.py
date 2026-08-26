@@ -160,6 +160,16 @@ def _progress(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, **values}, ensure_ascii=False, sort_keys=True), flush=True)
 
 
+def _progress_result(result: dict[str, Any]) -> None:
+    """Emit a result whose event name is already part of the payload."""
+    event = result.get("event")
+    if not isinstance(event, str) or not event:
+        raise ValueError("progress result must contain a non-empty event")
+    values = dict(result)
+    values.pop("event", None)
+    _progress(event, **values)
+
+
 def _one_target_row(rows: Iterable[DailyBar], symbol: str, target: date, label: str) -> DailyBar:
     values = list(rows)
     matches = [row for row in values if row.symbol == symbol and row.business_date == target]
@@ -806,7 +816,7 @@ def run(
             "blocked_symbols": sorted(plan.fetch_symbols),
             "reason": "symbol checkpoints incomplete; see TiDB checkpoint error details",
         }
-        _progress("daily_blocked", **blocked_result)
+        _progress_result(blocked_result)
         return blocked_result
     if finalize_only:
         selected_fetch_symbols = []
