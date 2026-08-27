@@ -119,7 +119,22 @@ class EastmoneyFundamentalSource:
         statement_candidates: dict[str, int] = {statement: 0 for statement in METRIC_COLUMNS}
         row_anomalies: list[str] = []
         for statement_type in METRIC_COLUMNS:
-            frame = self._call(statement_type, vendor_symbol, delisted=delisted)
+            statement_delisted = delisted
+            try:
+                frame = self._call(statement_type, vendor_symbol, delisted=delisted)
+            except FundamentalSourceEmptyResponse as primary_empty:
+                # Some historical symbols are absent from the normal endpoint
+                # even though Eastmoney exposes them through its delisted API.
+                # Probe that already-supported route once; never synthesize data.
+                if delisted or not self._delisted_loaders:
+                    raise
+                try:
+                    frame = self._call(statement_type, vendor_symbol, delisted=True)
+                    statement_delisted = True
+                except Exception as fallback_error:  # noqa: BLE001 - preserve both source diagnostics.
+                    raise FundamentalSourceEmptyResponse(
+                        f"{primary_empty}; delisted_route={type(fallback_error).__name__}: {fallback_error}"
+                    ) from fallback_error
             required = {
                 "SECURITY_CODE", "REPORT_DATE", "NOTICE_DATE", "UPDATE_DATE",
                 "REPORT_TYPE", "CURRENCY", "ORG_TYPE",
@@ -148,7 +163,7 @@ class EastmoneyFundamentalSource:
                         report_type=raw.get("REPORT_TYPE"),
                         currency=raw.get("CURRENCY"),
                         organization_type=raw.get("ORG_TYPE"),
-                        source=self.name + ("_delisted" if delisted else ""),
+                        source=self.name + ("_delisted" if statement_delisted else ""),
                         source_row=raw,
                     )
                 except ValueError as error:
