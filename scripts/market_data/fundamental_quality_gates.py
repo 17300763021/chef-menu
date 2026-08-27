@@ -110,7 +110,11 @@ def evaluate_fundamentals(
             difference = abs(assets - metrics["TOTAL_LIABILITIES"] - metrics["TOTAL_EQUITY"])
             tolerance = max(Decimal("1"), abs(assets) * Decimal("0.005"))
             if difference > tolerance:
-                equation_issues.append(f"{key[0]}:{key[1]}:{difference}")
+                equation_issues.append(
+                    f"{key[0]}:{key[1]}:difference={difference};"
+                    f"assets={assets};liabilities={metrics['TOTAL_LIABILITIES']};"
+                    f"equity={metrics['TOTAL_EQUITY']}"
+                )
     results.append(GateResult(
         "balance_sheet_accounting_equation",
         checked > 0 and not equation_issues,
