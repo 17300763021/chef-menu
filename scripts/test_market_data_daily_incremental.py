@@ -24,7 +24,11 @@ from scripts.market_data.daily_incremental import (
     latest_closed_session,
     write_outputs,
 )
-from scripts.market_data.daily_incremental_runner import _progress_result, _reusable_existing_keys
+from scripts.market_data.daily_incremental_runner import (
+    _checkpoint_reuse_exclusions,
+    _progress_result,
+    _reusable_existing_keys,
+)
 from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
 from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
@@ -227,10 +231,25 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertEqual(first.scope_sha256, repeated.scope_sha256)
 
     def test_corporate_action_candidates_are_not_reused_as_existing_checkpoints(self) -> None:
+        capture_exclusions = _checkpoint_reuse_exclusions(
+            ("000002", "600000"), finalize_only=False,
+        )
         keys = _reusable_existing_keys(
-            ("000001", "000002", "600000"), TARGET, ("000002", "600000"),
+            ("000001", "000002", "600000"), TARGET, capture_exclusions,
         )
         self.assertEqual(keys, (("000001", TARGET),))
+
+    def test_finalization_reuses_verified_corporate_action_checkpoints(self) -> None:
+        finalization_exclusions = _checkpoint_reuse_exclusions(
+            ("000002", "600000"), finalize_only=True,
+        )
+        keys = _reusable_existing_keys(
+            ("000001", "000002", "600000"), TARGET, finalization_exclusions,
+        )
+        self.assertEqual(
+            keys,
+            (("000001", TARGET), ("000002", TARGET), ("600000", TARGET)),
+        )
 
     def test_weekend_retry_keeps_the_same_business_scope_hash(self) -> None:
         friday_calendar = TradingCalendar.build("fixture", date(2026, 7, 1), TARGET, [PREVIOUS, TARGET])

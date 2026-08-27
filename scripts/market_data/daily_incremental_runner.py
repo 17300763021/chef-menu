@@ -625,6 +625,15 @@ def _reusable_existing_keys(
     )
 
 
+def _checkpoint_reuse_exclusions(
+    corporate_action_symbols: Iterable[str], *, finalize_only: bool,
+) -> tuple[str, ...]:
+    """Refresh action candidates during capture, then reuse verified final checkpoints."""
+    if finalize_only:
+        return ()
+    return tuple(sorted(set(corporate_action_symbols)))
+
+
 def run(
     *,
     observed_at: datetime,
@@ -779,7 +788,10 @@ def run(
             secondary_calendar=secondary_calendar, snapshots=snapshots,
             accepted_existing_keys=_reusable_existing_keys(
                 metadata["succeeded_symbols"], target,
-                base_plan.corporate_action_symbols,
+                _checkpoint_reuse_exclusions(
+                    base_plan.corporate_action_symbols,
+                    finalize_only=finalize_only,
+                ),
             ),
             target_session=target,
             corporate_action_inventory=corporate_action_rows,
