@@ -97,7 +97,11 @@ class EastmoneyFundamentalSource:
                 last_error = error
                 if attempt < self.attempts:
                     time.sleep(attempt)
-        if isinstance(last_error, KeyError) and "data" in str(last_error).lower():
+        error_text = str(last_error).lower()
+        if (
+            (isinstance(last_error, KeyError) and "data" in error_text)
+            or (isinstance(last_error, TypeError) and "nonetype" in error_text and "subscriptable" in error_text)
+        ):
             raise FundamentalSourceEmptyResponse(
                 f"{self.name} {statement_type} empty response: missing data payload"
             ) from last_error

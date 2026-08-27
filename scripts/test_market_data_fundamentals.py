@@ -73,6 +73,18 @@ class FundamentalTests(unittest.TestCase):
         self.assertTrue(any(row.source.endswith("_delisted") for row in reports if row.statement_type == "balance"))
         self.assertTrue(facts)
 
+    def test_delisted_none_payload_is_structured_empty_response(self) -> None:
+        def none_payload(_symbol: str) -> pd.DataFrame:
+            raise TypeError("'NoneType' object is not subscriptable")
+
+        loaders = {kind: lambda _symbol: pd.DataFrame() for kind in ("balance", "income", "cashflow")}
+        source = EastmoneyFundamentalSource(loaders=loaders)
+        source._delisted_loaders = {kind: none_payload for kind in ("balance", "income", "cashflow")}
+        with self.assertRaisesRegex(FundamentalSourceEmptyResponse, "empty response"):
+            source.fetch(
+                "000627", history_start=date(2017, 1, 1), as_of_date=date(2026, 7, 28), delisted=True,
+            )
+
     def test_dual_connection_configs_keep_market_read_and_research_write_distinct(self) -> None:
         env = {
             "TIDB_HOST": "research.example", "TIDB_PORT": "4000", "TIDB_USER": "research",
