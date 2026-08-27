@@ -20,7 +20,10 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.cninfo_announcement_source import CninfoAnnouncementSource
-from scripts.market_data.sources.eastmoney_fundamental_source import EastmoneyFundamentalSource
+from scripts.market_data.sources.eastmoney_fundamental_source import (
+    EastmoneyFundamentalSource,
+    FundamentalSourceEmptyResponse,
+)
 from scripts.market_data.tidb_fundamental_store import (
     TiDBConfig,
     connect,
@@ -133,21 +136,27 @@ def capture(
             succeeded += 1
             continue
         try:
-            reports, facts = primary.fetch(
-                security.symbol,
-                history_start=HISTORY_START,
-                as_of_date=as_of_date,
-                delisted=security.out_date is not None and security.out_date <= as_of_date,
-            )
+            try:
+                reports, facts = primary.fetch(
+                    security.symbol,
+                    history_start=HISTORY_START,
+                    as_of_date=as_of_date,
+                    delisted=security.out_date is not None and security.out_date <= as_of_date,
+                )
+            except FundamentalSourceEmptyResponse:
+                reports, facts = [], []
             if not reports or not facts:
                 if security.out_date is not None and security.out_date <= as_of_date:
                     confirmation_source = EastmoneyFundamentalSource(attempts=attempts)
-                    reports, facts = confirmation_source.fetch(
-                        security.symbol,
-                        history_start=HISTORY_START,
-                        as_of_date=as_of_date,
-                        delisted=True,
-                    )
+                    try:
+                        reports, facts = confirmation_source.fetch(
+                            security.symbol,
+                            history_start=HISTORY_START,
+                            as_of_date=as_of_date,
+                            delisted=True,
+                        )
+                    except FundamentalSourceEmptyResponse:
+                        reports, facts = [], []
                 if not reports or not facts:
                     if security.out_date is None or security.out_date > as_of_date:
                         raise RuntimeError("no eligible financial reports or facts")
