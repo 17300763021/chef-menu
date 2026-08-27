@@ -30,7 +30,9 @@ def normalize_delisting_frame(
         raise RuntimeError(f"{exchange} official delisting inventory returned no rows")
     code_column = _column(frame, ("证券代码", "公司代码"))
     name_column = _column(frame, ("证券简称", "公司简称"))
-    date_column = _column(frame, ("终止上市日期", "暂停上市日期"))
+    # Suspension is not delisting.  Only an explicit termination date may
+    # support a fail-closed exclusion decision.
+    date_column = _column(frame, ("终止上市日期",))
     source = "szse_official_delisting" if exchange == "SZ" else "sse_official_delisting"
     rows: list[IndustryDelistingEvidence] = []
     for record in frame.to_dict("records"):

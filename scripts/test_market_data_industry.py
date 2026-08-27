@@ -331,6 +331,14 @@ class IndustryContractTest(unittest.TestCase):
 
         self.assertEqual(rows, (delisting_fixture(),))
 
+    def test_suspension_date_alone_cannot_be_used_as_delisting_evidence(self) -> None:
+        frame = pd.DataFrame([{
+            "证券代码": "000046", "证券简称": "*ST泛海",
+            "上市日期": "1994-09-12", "暂停上市日期": "2024-02-07",
+        }])
+        with self.assertRaisesRegex(RuntimeError, "missing required column"):
+            normalize_delisting_frame(frame, exchange="SZ")
+
     def test_shard_excludes_only_after_two_confirmed_empty_official_responses(self) -> None:
         scope = [IndustryScopeSecurity.build("000046", "1994-09-12")]
         nodes = node_fixture()

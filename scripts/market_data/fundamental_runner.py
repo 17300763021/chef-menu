@@ -20,6 +20,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.cninfo_announcement_source import CninfoAnnouncementSource
+from scripts.market_data.industry_contracts import IndustryDelistingEvidence
 from scripts.market_data.sources.eastmoney_fundamental_source import (
     EastmoneyFundamentalSource,
     FundamentalSourceEmptyResponse,
@@ -87,6 +88,19 @@ def _load_market_scope(config: TiDBConfig, base_id: str, mode: str):
         connection.close()
 
 
+def _load_delisting_evidence(path: Path | None) -> dict[str, IndustryDelistingEvidence]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "m4-official-delisting-evidence-v1":
+        raise RuntimeError("unsupported M4 delisting evidence schema")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise RuntimeError("M4 delisting evidence rows are missing")
+    evidence = [IndustryDelistingEvidence.build(**row) for row in rows]
+    return {row.symbol: row for row in evidence}
+
+
 def dataset_id(*, base_id: str, mode: str, as_of_date: date, symbols: list[str]) -> str:
     seed = {
         "schema_version": FUNDAMENTAL_SCHEMA_VERSION,
@@ -107,6 +121,7 @@ def capture(
     shard_index: int,
     shard_count: int,
     attempts: int,
+    delisting_evidence_path: Path | None = None,
 ) -> dict[str, Any]:
     market_config, research_config = _connection_configs()
     scope = _load_market_scope(market_config, base_id, mode)
@@ -127,6 +142,7 @@ def capture(
     finally:
         connection.close()
     selected = [row for position, row in enumerate(scope) if position % shard_count == shard_index]
+    delisting_evidence = _load_delisting_evidence(delisting_evidence_path)
     primary = EastmoneyFundamentalSource(attempts=attempts)
     verifier = CninfoAnnouncementSource(attempts=1)
     succeeded = failed = excluded = 0
@@ -146,7 +162,12 @@ def capture(
             except FundamentalSourceEmptyResponse:
                 reports, facts = [], []
             if not reports or not facts:
-                if security.out_date is not None and security.out_date <= as_of_date:
+                official = delisting_evidence.get(security.symbol)
+                effective_out_date = security.out_date
+                if (effective_out_date is None or effective_out_date > as_of_date) and official is not None:
+                    if official.delisted_on <= as_of_date:
+                        effective_out_date = official.delisted_on
+                if effective_out_date is not None and effective_out_date <= as_of_date:
                     confirmation_source = EastmoneyFundamentalSource(attempts=attempts)
                     try:
                         reports, facts = confirmation_source.fetch(
@@ -158,11 +179,12 @@ def capture(
                     except FundamentalSourceEmptyResponse:
                         reports, facts = [], []
                 if not reports or not facts:
-                    if security.out_date is None or security.out_date > as_of_date:
+                    if effective_out_date is None or effective_out_date > as_of_date:
                         raise RuntimeError("no eligible financial reports or facts")
                     exclusion = RuntimeError(
                         "confirmed_delisted_source_empty_after_two_responses;"
-                        f"out_date={security.out_date.isoformat()}"
+                        f"out_date={effective_out_date.isoformat()};"
+                        f"delisting_source={(official.source if official is not None else 'm2_history_security_reference')}"
                     )
                     checkpoint_connection = connect(research_config)
                     try:
@@ -176,7 +198,7 @@ def capture(
                     _progress(
                         "fundamental_symbol_excluded", symbol=security.symbol,
                         reason="confirmed_delisted_source_empty_after_two_responses",
-                        out_date=security.out_date.isoformat(),
+                        out_date=effective_out_date.isoformat(),
                     )
                     continue
             latest_notice = max(row.notice_date for row in reports)
@@ -235,10 +257,12 @@ def _fact_from_db(row: Mapping[str, Any]) -> FundamentalFact:
     )
 
 
-def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> dict[str, Any]:
+def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path,
+             delisting_evidence_path: Path | None = None) -> dict[str, Any]:
     market_config, research_config = _connection_configs()
     scope = _load_market_scope(market_config, base_id, mode)
     connection = connect(research_config)
+    delisting_evidence = _load_delisting_evidence(delisting_evidence_path)
     try:
         ensure_fundamental_schema(connection)
         symbols = [row.symbol for row in scope]
@@ -255,7 +279,8 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
         excluded = {symbol for symbol, value in status.items() if value == "excluded"}
         allowed_excluded = {
             row.symbol for row in scope
-            if row.out_date is not None and row.out_date <= as_of_date
+            if (row.out_date is not None and row.out_date <= as_of_date)
+            or (row.symbol in delisting_evidence and delisting_evidence[row.symbol].delisted_on <= as_of_date)
         }
         gates = evaluate_fundamentals(
             expected_symbols=symbols, reports=reports, facts=facts,
@@ -271,8 +296,10 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
             {
                 "symbol": str(row["symbol"]),
                 "out_date": (
-                    None if scope_by_symbol[str(row["symbol"])].out_date is None
-                    else scope_by_symbol[str(row["symbol"])].out_date.isoformat()
+                    (scope_by_symbol[str(row["symbol"])].out_date.isoformat()
+                     if scope_by_symbol[str(row["symbol"])].out_date is not None
+                     else (delisting_evidence[str(row["symbol"])].delisted_on.isoformat()
+                           if str(row["symbol"]) in delisting_evidence else None))
                 ),
                 "reason": str(row["error_message"]),
             }
@@ -304,6 +331,8 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> 
             "quality_sha256": sha256(quality_rows),
             "accepted": accepted(gates),
             "gates": quality_rows,
+            "delisting_evidence_sha256": (sha256(json.loads(delisting_evidence_path.read_text(encoding="utf-8")))
+                                           if delisting_evidence_path is not None else None),
         }
         if not manifest["accepted"]:
             raise RuntimeError(f"fundamental critical quality gate failed: {[g.name for g in gates if g.critical and not g.passed]}")
@@ -326,16 +355,19 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--attempts", type=int, default=2)
     parser.add_argument("--output-dir", type=Path, default=Path("fundamental-acceptance"))
+    parser.add_argument("--delisting-evidence", type=Path, default=None)
     args = parser.parse_args()
     as_of = date.fromisoformat(args.as_of_date) if args.as_of_date else datetime.now(SHANGHAI).date()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         raise SystemExit("invalid fundamental shard coordinates")
     if args.operation == "capture":
         result = capture(mode=args.mode, as_of_date=as_of, base_id=args.base_history_dataset_id,
-                         shard_index=args.shard_index, shard_count=args.shard_count, attempts=args.attempts)
+                         shard_index=args.shard_index, shard_count=args.shard_count, attempts=args.attempts,
+                         delisting_evidence_path=args.delisting_evidence)
         _progress("fundamental_capture_completed", **result)
         return 0
-    finalize(mode=args.mode, as_of_date=as_of, base_id=args.base_history_dataset_id, output_dir=args.output_dir)
+    finalize(mode=args.mode, as_of_date=as_of, base_id=args.base_history_dataset_id, output_dir=args.output_dir,
+             delisting_evidence_path=args.delisting_evidence)
     return 0
 
 

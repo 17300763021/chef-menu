@@ -33,6 +33,8 @@ on:
       - scripts/market_data/tidb_fundamental_store.py
       - scripts/market_data/sources/eastmoney_fundamental_source.py
       - scripts/market_data/sources/cninfo_announcement_source.py
+      - scripts/market_data/sources/exchange_delisting_source.py
+      - scripts/market_data/industry_contracts.py
       - scripts/test_market_data_fundamentals.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
@@ -80,6 +82,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
       - name: Enforce fresh TiDB quota attestations below 80 percent
         run: >-
           python -m scripts.market_data.industry_quota_guard
@@ -101,6 +104,24 @@ jobs:
               stream.write(f"as_of_date={value}\n")
               stream.write("matrix=" + json.dumps({"shard_index": list(range(count)), "shard_count": [count]}, separators=(",", ":")) + "\n")
           PY
+      - name: Freeze official termination-date evidence once for all shards
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from scripts.market_data.sources.exchange_delisting_source import ExchangeDelistingSource
+          rows = [row.canonical() for row in ExchangeDelistingSource(attempts=3).fetch()]
+          Path("m4-delisting-evidence.json").write_text(json.dumps({
+              "schema_version": "m4-official-delisting-evidence-v1",
+              "rows": rows,
+          }, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m4-delisting-evidence-${{ github.run_id }}
+          path: m4-delisting-evidence.json
+          retention-days: 7
+          if-no-files-found: error
 
   capture:
     needs: prepare
@@ -118,6 +139,9 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/market_data/requirements.lock.txt
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m4-delisting-evidence-${{ github.run_id }}
       - name: Capture resumable financial-statement checkpoints
         env:
           TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}
@@ -138,6 +162,7 @@ jobs:
           --as-of-date "${{ needs.prepare.outputs.as_of_date }}"
           --shard-index "${{ matrix.shard_index }}"
           --shard-count "${{ matrix.shard_count }}" --attempts 2
+          --delisting-evidence m4-delisting-evidence.json
 
   finalize:
     needs: [prepare, capture]
@@ -151,6 +176,9 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/market_data/requirements.lock.txt
       - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m4-delisting-evidence-${{ github.run_id }}
       - name: Validate global coverage and atomically publish
         env:
           TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}
@@ -170,6 +198,7 @@ jobs:
           --operation finalize --mode "${{ inputs.mode }}"
           --as-of-date "${{ needs.prepare.outputs.as_of_date }}"
           --output-dir fundamental-acceptance
+          --delisting-evidence m4-delisting-evidence.json
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: m2-fundamental-manifest-${{ github.run_id }}
