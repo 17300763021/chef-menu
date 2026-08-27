@@ -774,7 +774,7 @@ def publish_daily_symbol_checkpoint(
         raise ValueError("daily symbol checkpoint permits at most one row per evidence type")
     if status == "succeeded" and len(fact_rows) != 1:
         raise ValueError("succeeded daily checkpoint requires a tradeability fact")
-    if primary_rows and len(adjusted_rows) != 1:
+    if status == "succeeded" and primary_rows and len(adjusted_rows) != 1:
         raise ValueError("a stored daily primary bar requires one adjusted bar")
     if verification_required and status == "succeeded" and primary_rows and len(verification_rows) != 1:
         raise ValueError("succeeded verification target requires an independent verification row")

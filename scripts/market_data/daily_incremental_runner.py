@@ -463,7 +463,7 @@ def capture_symbol(
     if error is not None:
         blocked_fact = derive_tradeability(
             symbol=symbol, business_date=target, index_code=plan.membership[symbol],
-            listing_age_sessions=age, primary=None, secondary=secondary,
+            listing_age_sessions=age, primary=_tradeability_row(primary), secondary=secondary,
         )
         blocked_fact = replace(
             blocked_fact,
@@ -472,7 +472,7 @@ def capture_symbol(
             block_reasons=tuple(sorted(set(blocked_fact.block_reasons) | {"missing_adjustment_predecessor"})),
         )
         return _checkpoint_evidence(
-            primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            primary=primary, fact=blocked_fact, verification=None, adjusted=None, events=[],
             status_source=status_source, previous_close_source=previous_close_source,
             lineage_evidence=lineage_evidence,
         ), reported, "blocked", error
@@ -534,7 +534,7 @@ def capture_symbol(
     except Exception as error:
         blocked_fact = derive_tradeability(
             symbol=symbol, business_date=target, index_code=plan.membership[symbol],
-            listing_age_sessions=age, primary=None, secondary=secondary,
+            listing_age_sessions=age, primary=_tradeability_row(primary), secondary=secondary,
         )
         blocked_fact = replace(
             blocked_fact,
@@ -543,7 +543,7 @@ def capture_symbol(
             block_reasons=tuple(sorted(set(blocked_fact.block_reasons) | {"invalid_adjustment_continuity"})),
         )
         return _checkpoint_evidence(
-            primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            primary=primary, fact=blocked_fact, verification=None, adjusted=None, events=[],
             status_source=status_source, previous_close_source=previous_close_source,
             lineage_evidence=lineage_evidence,
         ), reported, "blocked", error

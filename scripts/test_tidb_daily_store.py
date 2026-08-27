@@ -277,6 +277,28 @@ class TiDBDailyStoreTests(unittest.TestCase):
         self.assertEqual(adjusted_batch[0][-1], sha256(canonical))
         self.assertEqual(checkpoint_batch[0][14], sha256([canonical]))
 
+    def test_blocked_checkpoint_retains_primary_bar_without_adjusted_bar(self) -> None:
+        evidence = complete_evidence()
+        evidence.adjusted_bars.clear()
+        evidence.verification_bars.clear()
+        evidence.tradeability[0]["can_buy"] = False
+        evidence.tradeability[0]["can_sell"] = False
+        connection = FakeConnection()
+        counts = publish_daily_symbol_checkpoint(
+            connection, evidence, dataset_id="daily-scope", symbol="000001",
+            target_session=TARGET, verification_required=True,
+            reported_previous_close=Decimal("10"), status="blocked",
+            error=RuntimeError("missing adjustment factor"),
+        )
+        self.assertEqual(counts["primary_bars"], 1)
+        self.assertEqual(counts["adjusted_bars"], 0)
+        self.assertEqual(counts["verification_bars"], 0)
+        checkpoint_batch = next(
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_symbol_checkpoints" in sql
+        )
+        self.assertEqual(checkpoint_batch[0][4:9], (1, 0, 1, 1, 0))
+
     def test_lineage_evidence_is_canonical_persisted_and_rehydrates_predecessor(self) -> None:
         evidence = complete_evidence()
         lineage = canonical_lineage_evidence({
@@ -1124,6 +1146,8 @@ class DailyCaptureTests(unittest.TestCase):
         )
         self.assertEqual(status, "blocked")
         self.assertIn("no target factor event", str(error))
+        self.assertEqual(len(blocked.primary_bars), 1)
+        self.assertNotIn("missing_primary_bar", blocked.tradeability[0]["block_reasons"])
         self.assertEqual(blocked.adjusted_bars, [])
 
     def test_baostock_is_last_resort_independent_verification_only(self) -> None:
@@ -1243,6 +1267,8 @@ class DailyCaptureTests(unittest.TestCase):
         )
         self.assertEqual(status, "blocked")
         self.assertIn("malformed factor payload", str(error))
+        self.assertEqual(len(malformed.primary_bars), 1)
+        self.assertNotIn("missing_primary_bar", malformed.tradeability[0]["block_reasons"])
         self.assertEqual(malformed.adjusted_bars, [])
 
     def test_sina_ex_date_uses_tencent_cash_evidence_and_recomputes_limits(self) -> None:
@@ -1359,7 +1385,8 @@ class DailyCaptureTests(unittest.TestCase):
         )
         self.assertEqual(status, "blocked")
         self.assertIn("predecessor", str(error))
-        self.assertEqual(missing.primary_bars, [])
+        self.assertEqual(len(missing.primary_bars), 1)
+        self.assertNotIn("missing_primary_bar", missing.tradeability[0]["block_reasons"])
         self.assertFalse(missing.tradeability[0]["can_buy"])
 
         unverified, _reported, status, error = capture_symbol(
