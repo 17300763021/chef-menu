@@ -335,6 +335,10 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path,
                                            if delisting_evidence_path is not None else None),
         }
         if not manifest["accepted"]:
+            _progress(
+                "fundamental_finalize_rejected",
+                critical_gates=[gate.canonical() for gate in gates if gate.critical and not gate.passed],
+            )
             raise RuntimeError(f"fundamental critical quality gate failed: {[g.name for g in gates if g.critical and not g.passed]}")
         result = publish_run(connection, manifest)
         output_dir.mkdir(parents=True, exist_ok=True)
