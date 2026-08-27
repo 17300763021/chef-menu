@@ -339,6 +339,14 @@ class IndustryContractTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing required column"):
             normalize_delisting_frame(frame, exchange="SZ")
 
+    def test_shanghai_akshare_termination_alias_is_accepted(self) -> None:
+        frame = pd.DataFrame([{
+            "公司代码": "600291", "公司简称": "西水股份",
+            "上市日期": "2000-07-19", "暂停上市日期": "2022-06-14",
+        }])
+        rows = normalize_delisting_frame(frame, exchange="SH")
+        self.assertEqual(rows[0].delisted_on, date(2022, 6, 14))
+
     def test_shard_excludes_only_after_two_confirmed_empty_official_responses(self) -> None:
         scope = [IndustryScopeSecurity.build("000046", "1994-09-12")]
         nodes = node_fixture()
