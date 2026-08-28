@@ -43,6 +43,7 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
 )
 HISTORY_START = date(2017, 1, 1)
 MODE_COUNTS = {"sample": 20, "full": 1403}
+REPORT_EXCLUSIONS_PATH = Path(__file__).with_name("evidence") / "m4_fundamental_report_exclusions_v1.json"
 
 
 def reusable_checkpoint(status: object, error_message: object) -> bool:
@@ -99,6 +100,46 @@ def _load_delisting_evidence(path: Path | None) -> dict[str, IndustryDelistingEv
         raise RuntimeError("M4 delisting evidence rows are missing")
     evidence = [IndustryDelistingEvidence.build(**row) for row in rows]
     return {row.symbol: row for row in evidence}
+
+
+def _apply_report_exclusions(
+    reports: list[FundamentalReport], facts: list[FundamentalFact], path: Path = REPORT_EXCLUSIONS_PATH,
+) -> tuple[list[FundamentalReport], list[FundamentalFact], list[dict[str, Any]], str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "m4-fundamental-report-exclusions-v1":
+        raise RuntimeError("unsupported fundamental report exclusion schema")
+    facts_by_version: dict[str, dict[str, FundamentalFact]] = {}
+    for fact in facts:
+        facts_by_version.setdefault(fact.report_version_id, {})[fact.metric_code] = fact
+    excluded_versions: set[str] = set()
+    evidence_rows: list[dict[str, Any]] = []
+    for evidence in payload.get("rows", []):
+        candidates = [
+            report for report in reports
+            if report.symbol == str(evidence["symbol"])
+            and report.statement_type == str(evidence["statement_type"])
+            and report.report_date == date.fromisoformat(str(evidence["report_date"]))
+        ]
+        matched: list[FundamentalReport] = []
+        for report in candidates:
+            metrics = facts_by_version.get(report.version_id, {})
+            expected = {
+                "TOTAL_ASSETS": str(evidence["source_total_assets"]),
+                "TOTAL_LIABILITIES": str(evidence["source_total_liabilities"]),
+                "TOTAL_EQUITY": str(evidence["source_total_equity"]),
+            }
+            if all(code in metrics and str(metrics[code].value) == value for code, value in expected.items()):
+                matched.append(report)
+        if len(matched) != 1:
+            raise RuntimeError(
+                f"fundamental report exclusion must match exactly one version: {evidence['symbol']}:{evidence['report_date']}"
+            )
+        report = matched[0]
+        excluded_versions.add(report.version_id)
+        evidence_rows.append({**evidence, "report_version_id": report.version_id})
+    filtered_reports = [report for report in reports if report.version_id not in excluded_versions]
+    filtered_facts = [fact for fact in facts if fact.report_version_id not in excluded_versions]
+    return filtered_reports, filtered_facts, evidence_rows, sha256(payload)
 
 
 def dataset_id(*, base_id: str, mode: str, as_of_date: date, symbols: list[str]) -> str:
@@ -275,6 +316,7 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path,
             raise RuntimeError(f"fundamental capture inventory incomplete; missing={missing[:20]}")
         reports = [_report_from_db(row) for row in report_dicts]
         facts = [_fact_from_db(row) for row in fact_dicts]
+        reports, facts, excluded_report_versions, report_exclusions_sha256 = _apply_report_exclusions(reports, facts)
         succeeded = {symbol for symbol, value in status.items() if value == "succeeded"}
         excluded = {symbol for symbol, value in status.items() if value == "excluded"}
         allowed_excluded = {
@@ -321,6 +363,8 @@ def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path,
             "successful_symbol_count": len(succeeded),
             "excluded_symbol_count": len(excluded),
             "excluded_symbols": exclusion_evidence,
+            "excluded_report_versions": excluded_report_versions,
+            "report_exclusions_sha256": report_exclusions_sha256,
             "failed_symbol_count": len(failed),
             "failed_symbols": failed,
             "report_count": len(reports),

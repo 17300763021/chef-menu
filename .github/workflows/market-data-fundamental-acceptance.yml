@@ -30,6 +30,7 @@ on:
     paths:
       - .github/workflows/market-data-fundamental-acceptance.yml
       - scripts/market_data/fundamental_*.py
+      - scripts/market_data/evidence/m4_fundamental_report_exclusions_v1.json
       - scripts/market_data/tidb_fundamental_store.py
       - scripts/market_data/sources/eastmoney_fundamental_source.py
       - scripts/market_data/sources/cninfo_announcement_source.py

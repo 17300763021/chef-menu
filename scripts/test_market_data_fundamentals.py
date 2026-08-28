@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport
 from scripts.market_data.fundamental_quality_gates import evaluate_fundamentals
-from scripts.market_data.fundamental_runner import _connection_configs, _load_market_scope, reusable_checkpoint
+from scripts.market_data.fundamental_runner import (
+    _apply_report_exclusions,
+    _connection_configs,
+    _load_market_scope,
+    reusable_checkpoint,
+)
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.eastmoney_fundamental_source import (
     EastmoneyFundamentalSource,
@@ -208,6 +216,40 @@ class FundamentalTests(unittest.TestCase):
             excluded_symbols={"000001"}, allowed_excluded_symbols=set(),
         )
         self.assertFalse(next(g for g in gates if g.name == "fundamental_exclusion_eligibility").passed)
+
+    def test_evidenced_vendor_equity_mislabel_excludes_exact_report_version(self) -> None:
+        report = FundamentalReport.build(
+            symbol="001203", statement_type="balance", report_date="2021-03-31",
+            notice_date="2021-05-07", update_date="2021-05-07", report_type="一季报",
+            currency="CNY", organization_type="通用", source="fixture", source_row={"id": 1},
+        )
+        facts = [
+            FundamentalFact(report.version_id, report.symbol, "balance", report.report_date,
+                            report.effective_on, code, Decimal(value))
+            for code, value in (
+                ("TOTAL_ASSETS", "7462304776.850000"),
+                ("TOTAL_LIABILITIES", "4864853233.020000"),
+                ("TOTAL_EQUITY", "2541981737.690000"),
+            )
+        ]
+        payload = {
+            "schema_version": "m4-fundamental-report-exclusions-v1",
+            "rows": [{
+                "symbol": "001203", "statement_type": "balance", "report_date": "2021-03-31",
+                "reason": "vendor_total_equity_equals_official_parent_equity_not_total_equity",
+                "source_total_assets": "7462304776.850000",
+                "source_total_liabilities": "4864853233.020000",
+                "source_total_equity": "2541981737.690000",
+            }],
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "exclusions.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            kept_reports, kept_facts, evidence, digest = _apply_report_exclusions([report], facts, path)
+        self.assertEqual(kept_reports, [])
+        self.assertEqual(kept_facts, [])
+        self.assertEqual(evidence[0]["report_version_id"], report.version_id)
+        self.assertEqual(len(digest), 64)
 
 
 if __name__ == "__main__":
