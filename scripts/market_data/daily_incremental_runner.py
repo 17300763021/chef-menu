@@ -714,6 +714,25 @@ def _select_target(
     return requested or next_session
 
 
+def _accepted_replay_result(
+    latest_accepted: date,
+    accepted_dataset_id: str,
+    requested: date | None,
+) -> dict[str, Any] | None:
+    """Return the existing immutable result for an exact accepted-date replay."""
+    if requested is None or requested != latest_accepted:
+        return None
+    return {
+        "event": "daily_accepted",
+        "dataset_id": accepted_dataset_id,
+        "target_session": latest_accepted.isoformat(),
+        "accepted": True,
+        "idempotent_replay": True,
+        "authoritative": False,
+        "simulation_orders_allowed": False,
+    }
+
+
 def _reusable_existing_keys(
     succeeded_symbols: Iterable[str],
     target_session: date,
@@ -796,6 +815,15 @@ def run(
         latest_ready = latest_closed_session(primary_calendar, observed)
     finally:
         connection.close()
+
+    replay = None
+    if supersedes_dataset_id is None:
+        replay = _accepted_replay_result(
+            latest_accepted, predecessor_dataset_id, requested_target,
+        )
+    if replay is not None:
+        _progress_result(replay)
+        return replay
 
     target = _select_target(primary_calendar.open_dates, latest_accepted, latest_ready, requested_target)
     if target is None:

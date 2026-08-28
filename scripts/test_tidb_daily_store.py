@@ -15,6 +15,7 @@ from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_d
 from scripts.market_data.daily_incremental import DailyIncrementalPlan
 from scripts.market_data.daily_incremental_runner import (
     DailyPrerequisiteTimeout,
+    _accepted_replay_result,
     _factor_reference_closes,
     _select_target,
     capture_symbol,
@@ -948,6 +949,20 @@ class TiDBDailyStoreTests(unittest.TestCase):
         self.assertEqual(_select_target(sessions, PREVIOUS, date(2026, 7, 28), None), TARGET)
         with self.assertRaisesRegex(RuntimeError, "cannot skip"):
             _select_target(sessions, PREVIOUS, date(2026, 7, 28), date(2026, 7, 28))
+
+    def test_exact_accepted_target_returns_immutable_idempotent_replay(self) -> None:
+        result = _accepted_replay_result(TARGET, "accepted-daily", TARGET)
+        self.assertEqual(result, {
+            "event": "daily_accepted",
+            "dataset_id": "accepted-daily",
+            "target_session": TARGET.isoformat(),
+            "accepted": True,
+            "idempotent_replay": True,
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+        })
+        self.assertIsNone(_accepted_replay_result(TARGET, "accepted-daily", None))
+        self.assertIsNone(_accepted_replay_result(TARGET, "accepted-daily", date(2026, 7, 28)))
 
 
 class FakePrimary:
