@@ -30,6 +30,18 @@ from scripts.market_data.contracts import (
 from scripts.market_data.historical_contracts import AdjustmentEvent, SecurityReference
 
 
+class SinaFactorsUnavailableError(RuntimeError):
+    """Both Sina QFQ and HFQ factor series are confirmed unavailable."""
+
+
+def _confirmed_sina_factor_absence(error: Exception) -> bool:
+    """Recognize only AKShare's explicit factor-unavailable signal."""
+    return isinstance(error, ValueError) and str(error).strip().lower() in {
+        "sina qfq factor not available",
+        "sina hfq factor not available",
+    }
+
+
 class AkshareHistorySource:
     name = "akshare_sina"
 
@@ -249,8 +261,8 @@ class AkshareEastmoneyHistorySource:
         prefix = "sh" if exchange_for_symbol(code) == "SSE" else "sz"
 
         def factor_frame(adjust: str):
-            frame = None
-            last_error: Exception | None = None
+            confirmed_absence = False
+            operational_errors: list[Exception] = []
             for attempt in range(1, self.attempts + 1):
                 try:
                     frame = ak.stock_zh_a_daily(
@@ -261,20 +273,53 @@ class AkshareEastmoneyHistorySource:
                     )
                     if frame is not None and not frame.empty:
                         return frame
+                    confirmed_absence = True
                 except Exception as error:
-                    last_error = error
+                    if _confirmed_sina_factor_absence(error):
+                        confirmed_absence = True
+                    else:
+                        operational_errors.append(error)
                 if attempt < self.attempts:
                     time.sleep(2 ** (attempt - 1))
-            suffix = f": {last_error}" if last_error else ""
-            raise RuntimeError(f"AKShare Sina returned no {adjust} rows for {code}{suffix}")
+            if operational_errors:
+                details = "; ".join(
+                    f"{type(error).__name__}: {error}" for error in operational_errors
+                )
+                raise RuntimeError(
+                    f"AKShare Sina {adjust} request failed for {code}: {details}"
+                ) from operational_errors[-1]
+            if confirmed_absence:
+                return None
+            raise RuntimeError(f"AKShare Sina {adjust} returned an indeterminate result for {code}")
+
+        frames: dict[str, object | None] = {}
+        failures: list[str] = []
+        for adjust in ("qfq-factor", "hfq-factor"):
+            try:
+                frames[adjust] = factor_frame(adjust)
+            except RuntimeError as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        qfq_frame = frames["qfq-factor"]
+        hfq_frame = frames["hfq-factor"]
+        if qfq_frame is None and hfq_frame is None:
+            raise SinaFactorsUnavailableError(
+                f"AKShare Sina confirmed both factor series unavailable for {code}"
+            )
+        if qfq_frame is None or hfq_frame is None:
+            missing = "qfq-factor" if qfq_frame is None else "hfq-factor"
+            raise RuntimeError(
+                f"AKShare Sina returned partial factor availability for {code}: missing {missing}"
+            )
 
         qfq_rows = {
             parse_date(row.get("date")): decimal_value(row.get("qfq_factor"), "qfq_factor", Decimal("0.000001"))
-            for row in factor_frame("qfq-factor").to_dict(orient="records")
+            for row in qfq_frame.to_dict(orient="records")
         }
         hfq_rows = {
             parse_date(row.get("date")): decimal_value(row.get("hfq_factor"), "hfq_factor", Decimal("0.000001"))
-            for row in factor_frame("hfq-factor").to_dict(orient="records")
+            for row in hfq_frame.to_dict(orient="records")
         }
         events: list[AdjustmentEvent] = []
         for effective_date in sorted(set(qfq_rows) & set(hfq_rows)):
@@ -314,6 +359,88 @@ class AkshareEastmoneyHistorySource:
         except Exception as error:
             failures.append(f"tencent_archive: {type(error).__name__}: {error}")
         raise RuntimeError(f"raw sources failed for {code}: {'; '.join(failures)}")
+
+    def fetch_daily_raw_with_reference(
+        self,
+        symbol: str,
+        previous_session: date,
+        target_session: date,
+    ) -> tuple[dict[date, DailyBar], str, Decimal, str]:
+        """Fetch a target bar plus an attributed previous-close reference.
+
+        Eastmoney publishes the target-session change amount, so its exchange
+        reference price is ``close - change_amount`` even on an ex-date.  Sina
+        and Tencent do not expose that field through their admitted adapters;
+        for those fallbacks the exact predecessor close is returned and the
+        caller must reject any independently observed target adjustment event.
+        """
+        if previous_session >= target_session:
+            raise ValueError("daily reference requires an earlier predecessor session")
+        code = normalize_symbol(symbol)
+        failures: list[str] = []
+        try:
+            frame = self._frame(code, target_session, target_session, "")
+            columns = list(frame.columns)
+            records = frame.to_dict(orient="records")
+            rows = {row.business_date: row for row in (
+                normalize_akshare_row(record, code) for record in records
+            )}
+            target = rows.get(target_session)
+            if target is None or len(records) != 1:
+                raise RuntimeError("Eastmoney did not return exactly one target-session row")
+            change_key = next(
+                (key for key in ("涨跌额", "change_amount") if key in records[0]),
+                columns[10] if len(columns) >= 11 else None,
+            )
+            if change_key is None:
+                raise RuntimeError("Eastmoney daily row lacks its change-amount field")
+            change_amount = decimal_value(
+                records[0].get(change_key),
+                "Eastmoney change amount",
+                PRICE_QUANTUM,
+            )
+            assert change_amount is not None
+            reported = (target.close - change_amount).quantize(PRICE_QUANTUM)
+            if reported <= 0:
+                raise RuntimeError("Eastmoney derived a nonpositive previous close")
+            return rows, "akshare_eastmoney", reported, "akshare_eastmoney_change_amount"
+        except Exception as error:
+            failures.append(f"akshare_eastmoney: {type(error).__name__}: {error}")
+
+        try:
+            frame = self._sina_frame(code, previous_session, target_session, "")
+            rows = {row.business_date: row for row in self._sina_raw_bars(code, frame)}
+            if target_session not in rows or previous_session not in rows:
+                raise RuntimeError("Sina daily fallback lacks the exact target/predecessor pair")
+            return (
+                rows,
+                "akshare_sina",
+                rows[previous_session].close,
+                "akshare_sina_exact_predecessor_close",
+            )
+        except Exception as error:
+            failures.append(f"akshare_sina: {type(error).__name__}: {error}")
+
+        from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+        try:
+            rows = {
+                row.business_date: row
+                for row in TencentHistorySource(
+                    timeout_seconds=self.timeout_seconds,
+                    attempts=min(self.attempts, 2),
+                ).fetch_raw(code, previous_session, target_session)
+            }
+            if target_session not in rows or previous_session not in rows:
+                raise RuntimeError("Tencent daily fallback lacks the exact target/predecessor pair")
+            return (
+                rows,
+                "tencent_archive",
+                rows[previous_session].close,
+                "tencent_exact_predecessor_close",
+            )
+        except Exception as error:
+            failures.append(f"tencent_archive: {type(error).__name__}: {error}")
+        raise RuntimeError(f"daily raw/reference sources failed for {code}: {'; '.join(failures)}")
 
     def fetch_bundle(
         self,

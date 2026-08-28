@@ -17,6 +17,7 @@ def evaluate_daily_quota(
     event_name: str,
     schedule_enabled: str,
     reported_percent: str,
+    storage_percent: str,
     checked_at: str,
     now: datetime,
 ) -> dict[str, object]:
@@ -27,11 +28,16 @@ def evaluate_daily_quota(
         raise RuntimeError("scheduled M2 daily ingestion is disabled")
     try:
         percent = DecimalPercent(reported_percent)
+        storage = DecimalPercent(storage_percent)
     except ValueError as error:
-        raise RuntimeError("a numeric TiDB monthly RU percentage is required") from error
+        raise RuntimeError("numeric TiDB monthly RU and storage percentages are required") from error
     if percent >= MAX_USAGE_PERCENT:
         raise RuntimeError(
             f"TiDB monthly RU usage {percent:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
+        )
+    if storage >= MAX_USAGE_PERCENT:
+        raise RuntimeError(
+            f"TiDB row-storage usage {storage:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
         )
     try:
         observed_date = date.fromisoformat(checked_at)
@@ -48,6 +54,7 @@ def evaluate_daily_quota(
         "allowed": True,
         "event_name": event_name,
         "reported_percent": percent,
+        "storage_percent": storage,
         "checked_at": observed_date.isoformat(),
         "attestation_age_days": age.days,
         "threshold_percent": MAX_USAGE_PERCENT,
@@ -70,12 +77,14 @@ def main() -> int:
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--schedule-enabled", default="false")
     parser.add_argument("--reported-percent", required=True)
+    parser.add_argument("--storage-percent", required=True)
     parser.add_argument("--checked-at", required=True)
     args = parser.parse_args()
     result = evaluate_daily_quota(
         event_name=args.event_name,
         schedule_enabled=args.schedule_enabled,
         reported_percent=args.reported_percent,
+        storage_percent=args.storage_percent,
         checked_at=args.checked_at,
         now=datetime.now(timezone.utc),
     )

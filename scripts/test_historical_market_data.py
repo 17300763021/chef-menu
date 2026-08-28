@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import unittest
 from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.market_data.calendar_contracts import TradingCalendar
@@ -14,7 +16,11 @@ from scripts.market_data.adjustment_engine import build_adjusted_series_from_fac
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
 from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, enrich_repair_plan, fetch_bundle_from_live_or_archive, fetch_primary, frozen_archive_source, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
 from scripts.market_data.manifest import sha256
-from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
+from scripts.market_data.sources.akshare_history_source import (
+    AkshareEastmoneyHistorySource,
+    AkshareHistorySource,
+    SinaFactorsUnavailableError,
+)
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.frozen_archive_history_source import (
     ARCHIVE_BUSINESS_END,
@@ -27,12 +33,113 @@ from scripts.market_data.sources.frozen_archive_history_source import (
     FrozenArchiveHistorySource,
     validate_archive_document,
 )
-from scripts.market_data.sources.tencent_history_source import TencentHistorySource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource, TencentIndexCalendarSource
 from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
 
 class HistoricalMarketDataTests(unittest.TestCase):
+    @staticmethod
+    def _daily_bar(business_date: date, close: str, source: str = "akshare_eastmoney") -> DailyBar:
+        return DailyBar(
+            source=source, symbol="000001", exchange="SZSE",
+            business_date=business_date, open=Decimal(close), high=Decimal(close),
+            low=Decimal(close), close=Decimal(close), previous_close=None,
+            volume_shares=100, amount_cny=Decimal("1000"),
+            turnover_percent=Decimal("0.1"), trade_status="trading", is_st=None,
+        )
+
+    def test_daily_eastmoney_reference_uses_reported_change_amount(self) -> None:
+        target = date(2026, 7, 27)
+        bar = self._daily_bar(target, "11.11")
+
+        class Frame:
+            columns = [f"column-{index}" for index in range(10)] + ["涨跌额"]
+
+            @staticmethod
+            def to_dict(*, orient: str):
+                self.assertEqual(orient, "records")
+                return [{"涨跌额": "0.01"}]
+
+        source = AkshareEastmoneyHistorySource(attempts=1)
+        with (
+            patch.object(source, "_frame", return_value=Frame()),
+            patch(
+                "scripts.market_data.sources.akshare_history_source.normalize_akshare_row",
+                return_value=bar,
+            ),
+        ):
+            rows, source_name, reported, reference_source = source.fetch_daily_raw_with_reference(
+                "000001", date(2026, 7, 24), target,
+            )
+        self.assertEqual(rows, {target: bar})
+        self.assertEqual(source_name, "akshare_eastmoney")
+        self.assertEqual(reported, Decimal("11.1000"))
+        self.assertEqual(reference_source, "akshare_eastmoney_change_amount")
+
+    def test_daily_reference_falls_back_to_exact_sina_predecessor(self) -> None:
+        previous = date(2026, 7, 24)
+        target = date(2026, 7, 27)
+        predecessor = self._daily_bar(previous, "10.00", "akshare_sina")
+        target_bar = self._daily_bar(target, "10.20", "akshare_sina")
+        source = AkshareEastmoneyHistorySource(attempts=1)
+        with (
+            patch.object(source, "_frame", side_effect=RuntimeError("Eastmoney offline")),
+            patch.object(source, "_sina_frame", return_value=object()),
+            patch.object(source, "_sina_raw_bars", return_value=[predecessor, target_bar]),
+        ):
+            rows, source_name, reported, reference_source = source.fetch_daily_raw_with_reference(
+                "000001", previous, target,
+            )
+        self.assertEqual(rows, {previous: predecessor, target: target_bar})
+        self.assertEqual(source_name, "akshare_sina")
+        self.assertEqual(reported, Decimal("10.00"))
+        self.assertEqual(reference_source, "akshare_sina_exact_predecessor_close")
+
+    def test_sina_factor_absence_requires_both_series_and_no_provider_error(self) -> None:
+        test_case = self
+
+        class Frame:
+            empty = False
+
+            def __init__(self, adjust: str) -> None:
+                self.adjust = adjust
+
+            def to_dict(self, *, orient: str):
+                test_case.assertEqual(orient, "records")
+                field = "qfq_factor" if self.adjust == "qfq-factor" else "hfq_factor"
+                return [{"date": "2026-07-27", field: "1.000000"}]
+
+        source = AkshareEastmoneyHistorySource(attempts=1)
+
+        def both_absent(**kwargs):
+            raise ValueError(f"sina {kwargs['adjust'].split('-')[0]} factor not available")
+
+        with patch.dict(sys.modules, {"akshare": SimpleNamespace(stock_zh_a_daily=both_absent)}):
+            with self.assertRaisesRegex(SinaFactorsUnavailableError, "both factor series"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
+
+        def partial(**kwargs):
+            if kwargs["adjust"] == "qfq-factor":
+                raise ValueError("sina qfq factor not available")
+            return Frame(kwargs["adjust"])
+
+        with patch.dict(sys.modules, {"akshare": SimpleNamespace(stock_zh_a_daily=partial)}):
+            with self.assertRaisesRegex(RuntimeError, "partial factor availability"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
+
+        def provider_failure(**kwargs):
+            if kwargs["adjust"] == "qfq-factor":
+                raise ConnectionError("provider offline")
+            raise ValueError("sina hfq factor not available")
+
+        with patch.dict(
+            sys.modules,
+            {"akshare": SimpleNamespace(stock_zh_a_daily=provider_failure)},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "request failed.*provider offline"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
+
     def test_frozen_archive_is_bounded_dual_source_and_hash_verified(self) -> None:
         source = FrozenArchiveHistorySource()
         self.assertEqual(source.document["schema_version"], ARCHIVE_SCHEMA_VERSION)
@@ -216,7 +323,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FailingCalendarSource),
-            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FailingCalendarSource),
+            patch("scripts.market_data.historical_bars.TencentIndexCalendarSource", FailingCalendarSource),
         ):
             primary, secondary, gates, _source = load_calendars(
                 date(2026, 7, 3),
@@ -237,9 +344,9 @@ class HistoricalMarketDataTests(unittest.TestCase):
             def fetch(self, start: date, end: date) -> TradingCalendar:
                 return FakeCalendar.build("akshare_calendar")
 
-        class FakeBaostockCalendarSource:
+        class FakeTencentCalendarSource:
             def fetch(self, start: date, end: date) -> TradingCalendar:
-                return FakeCalendar.build("baostock_calendar")
+                return FakeCalendar.build("tencent_sse_index_calendar")
 
         class FakeCsiSource:
             def fetch_current(self) -> CurrentUniverse:
@@ -261,7 +368,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.AkshareCalendarSource", FakeCalendarSource),
-            patch("scripts.market_data.historical_bars.BaostockCalendarSource", FakeBaostockCalendarSource),
+            patch("scripts.market_data.historical_bars.TencentIndexCalendarSource", FakeTencentCalendarSource),
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
         ):
             plan = build_plan(date(2026, 7, 16), "preflight")
@@ -271,7 +378,10 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(plan["current_snapshot"]["as_of_date"], "2026-07-16")
         self.assertEqual(plan["current_snapshot"]["source_hashes"]["000300"], "a" * 64)
         self.assertEqual(plan["primary_calendar"]["source"], "akshare_calendar")
-        self.assertEqual(plan["secondary_calendar"]["source"], "baostock_calendar")
+        self.assertEqual(
+            plan["secondary_calendar"]["source"],
+            "tencent_sse_index_calendar",
+        )
         self.assertNotEqual(plan["calendar_source"]["primary_calendar_sha256"], plan["calendar_source"]["secondary_calendar_sha256"])
         self.assertEqual(plan["csi_discovered_notice_ids"], [11518])
         self.assertEqual(plan["csi_event_index_source"]["accepted_manifest_event_sha256"], "fixture")
@@ -381,6 +491,98 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(bars[0].volume_shares, 8_678_850)
         self.assertEqual(bars[0].amount_cny, Decimal("3558300.00"))
         self.assertEqual(bars[0].turnover_percent, Decimal("1.250000"))
+
+        star_row = [
+            "2026-07-27", "33.58", "34.02", "34.60", "33.18", "5913104.00",
+            {}, "2.04", "201185.97", "0.00", "0.00",
+        ]
+        with patch.object(TencentHistorySource, "_rows", return_value=[star_row]):
+            star_bars = source.fetch_raw("688037", date(2026, 7, 27), date(2026, 7, 27))
+        self.assertEqual(star_bars[0].volume_shares, 5_913_104)
+        self.assertEqual(star_bars[0].amount_cny, Decimal("2011859700.00"))
+
+    def test_tencent_hfq_continuity_requires_exact_consistent_pair(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        previous = date(2026, 7, 24)
+        target = date(2026, 7, 27)
+        raw = [
+            ["2026-07-24", "38.00", "38.18", "38.50", "37.80", "1"],
+            ["2026-07-27", "39.00", "39.41", "39.80", "38.80", "1"],
+        ]
+        hfq = [
+            ["2026-07-24", "39.80", "39.99", "40.32", "39.59", "1"],
+            ["2026-07-27", "40.80", "41.22", "41.63", "40.59", "1"],
+        ]
+        with patch.object(source, "_rows", side_effect=[raw, hfq]):
+            result = source.verify_no_adjustment_continuity("689009", previous, target)
+        self.assertEqual(result, "tencent_hfq_no_adjustment_continuity")
+
+        changed_hfq = [hfq[0], ["2026-07-27", "44.80", "45.22", "45.63", "44.59", "1"]]
+        with patch.object(source, "_rows", side_effect=[raw, changed_hfq]):
+            with self.assertRaisesRegex(RuntimeError, "HFQ factor changed"):
+                source.verify_no_adjustment_continuity("689009", previous, target)
+
+    def test_tencent_cash_dividend_reference_requires_exact_structured_action(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        previous = date(2026, 7, 27)
+        target = date(2026, 7, 28)
+        row = [
+            "2026-07-28", "16.30", "16.42", "16.50", "16.20", "1",
+            {
+                "nd": "2025", "fh_sh": "3.79", "djr": "2026-07-27",
+                "cqr": "2026-07-28", "FHcontent": "10派3.79元",
+            },
+        ]
+        with patch.object(source, "_rows", return_value=[row]):
+            reference, details = source.fetch_cash_dividend_reference(
+                "600062", previous, target, Decimal("16.80"),
+            )
+        self.assertEqual(reference, Decimal("16.42"))
+        self.assertEqual(details["cash_per_ten_shares"], "3.790000")
+        self.assertEqual(details["factor_reference_close"], "16.421000")
+        self.assertEqual(details["derived_previous_close"], "16.4200")
+        self.assertEqual(details["ex_rights_date"], target.isoformat())
+
+        unsupported = copy.deepcopy(row)
+        unsupported[6]["FHcontent"] = "10送1派3.79元"
+        with patch.object(source, "_rows", return_value=[unsupported]):
+            with self.assertRaisesRegex(RuntimeError, "unsupported corporate action"):
+                source.fetch_cash_dividend_reference(
+                    "600062", previous, target, Decimal("16.80"),
+                )
+
+        inconsistent = copy.deepcopy(row)
+        inconsistent[6]["fh_sh"] = "3.78"
+        with patch.object(source, "_rows", return_value=[inconsistent]):
+            with self.assertRaisesRegex(RuntimeError, "fields disagree"):
+                source.fetch_cash_dividend_reference(
+                    "600062", previous, target, Decimal("16.80"),
+                )
+
+    def test_tencent_gap_recovery_requires_every_session_and_unchanged_factor(self) -> None:
+        source = TencentHistorySource(attempts=1)
+        prior = date(2026, 7, 24)
+        previous = date(2026, 7, 27)
+        raw = [
+            ["2026-07-24", "38.00", "38.18", "38.50", "37.80", "1"],
+            ["2026-07-27", "39.00", "39.41", "39.80", "38.80", "1"],
+        ]
+        hfq = [
+            ["2026-07-24", "39.80", "39.99", "40.32", "39.59", "1"],
+            ["2026-07-27", "40.80", "41.22", "41.63", "40.59", "1"],
+        ]
+        with patch.object(source, "_rows", side_effect=[raw, hfq]):
+            recovered, details = source.recover_no_adjustment_predecessor(
+                "689009", prior, previous, Decimal("38.18"), (prior, previous),
+            )
+        self.assertEqual(recovered, Decimal("39.4100"))
+        self.assertEqual(details["observed_sessions"], [prior.isoformat(), previous.isoformat()])
+
+        with patch.object(source, "_rows", side_effect=[raw[1:], hfq[1:]]):
+            with self.assertRaisesRegex(RuntimeError, "every required session"):
+                source.recover_no_adjustment_predecessor(
+                    "689009", prior, previous, Decimal("38.18"), (prior, previous),
+                )
 
     def test_primary_history_run_does_not_require_baostock_history_login(self) -> None:
         calendar = TradingCalendar.build(
