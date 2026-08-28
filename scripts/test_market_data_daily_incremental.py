@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 
 from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
-from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
+from scripts.market_data.daily_adjustments import (
+    PreviousAdjustedState,
+    build_daily_adjusted_bars,
+    evaluate_daily_adjustments,
+)
 from scripts.market_data.daily_incremental import (
     DailyIncrementalPlan,
     build_incremental_evidence,
@@ -19,7 +23,9 @@ from scripts.market_data.daily_incremental import (
     latest_closed_session,
     write_outputs,
 )
+from scripts.market_data.daily_incremental_runner import _reusable_existing_keys
 from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
+from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -203,6 +209,12 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertEqual(repeated.fetch_symbols, ())
         self.assertEqual(first.scope_sha256, repeated.scope_sha256)
 
+    def test_corporate_action_candidates_are_not_reused_as_existing_checkpoints(self) -> None:
+        keys = _reusable_existing_keys(
+            ("000001", "000002", "600000"), TARGET, ("000002", "600000"),
+        )
+        self.assertEqual(keys, (("000001", TARGET),))
+
     def test_weekend_retry_keeps_the_same_business_scope_hash(self) -> None:
         friday_calendar = TradingCalendar.build("fixture", date(2026, 7, 1), TARGET, [PREVIOUS, TARGET])
         sunday_calendar = TradingCalendar.build("fixture", date(2026, 7, 1), date(2026, 8, 2), [PREVIOUS, TARGET])
@@ -218,6 +230,42 @@ class DailyIncrementalTests(unittest.TestCase):
         )
         self.assertEqual(friday.target_session, weekend.target_session)
         self.assertEqual(friday.scope_sha256, weekend.scope_sha256)
+
+    def test_scope_identity_ignores_provenance_but_not_membership(self) -> None:
+        baseline = small_plan()
+        changed_provenance = replace(
+            baseline,
+            observed_at=datetime(2026, 7, 29, 17, 0, tzinfo=SHANGHAI),
+            snapshot_effective_session=TARGET,
+            primary_calendar_sha256="d" * 64,
+            secondary_calendar_sha256="e" * 64,
+            universe_sha256="f" * 64,
+        )
+        self.assertEqual(baseline.scope_sha256, changed_provenance.scope_sha256)
+        self.assertNotEqual(baseline.canonical(), changed_provenance.canonical())
+        changed_membership = replace(
+            baseline,
+            expected_membership=(("000001", "000300"), ("600519", "000300")),
+        )
+        self.assertNotEqual(baseline.scope_sha256, changed_membership.scope_sha256)
+
+    def test_corporate_action_inventory_is_scope_bound_and_in_universe_only(self) -> None:
+        baseline = small_plan()
+        record = {
+            "symbol": "000001",
+            "ex_dividend_date": TARGET.isoformat(),
+            "cash_per_ten_shares": "0.15",
+        }
+        candidate = replace(
+            baseline,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256=sha256([record]),
+            corporate_action_symbols=("000001",),
+        )
+        self.assertNotEqual(baseline.scope_sha256, candidate.scope_sha256)
+        self.assertEqual(candidate.canonical()["corporate_action_symbols"], ["000001"])
+        with self.assertRaisesRegex(ValueError, "inside the expected universe"):
+            replace(candidate, corporate_action_symbols=("601866",))
 
     def test_invalid_universe_size_or_overlap_fails_closed(self) -> None:
         snapshots = self.full_snapshots()
@@ -364,6 +412,120 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertFalse(continuity["passed"])
         self.assertFalse(continuity["critical"])
         self.assertTrue(manifest["accepted"], manifest["gates"])
+
+    def test_cash_dividend_half_tick_uses_exact_factor_reference(self) -> None:
+        symbol = "601866"
+        primary = [bar("akshare_eastmoney", symbol, "2.50")]
+        state = PreviousAdjustedState(
+            symbol=symbol,
+            business_date=PREVIOUS,
+            raw_close=Decimal("2.4700"),
+            qfq_factor=Decimal("1.000000"),
+            hfq_factor=Decimal("1.227273"),
+            source_dataset_id="accepted-2026-07-30",
+        )
+        event = AdjustmentEvent(
+            symbol,
+            TARGET,
+            Decimal("1.000000"),
+            Decimal("1.236110"),
+            source="akshare_sina_factor",
+        )
+        arguments = {
+            "target_session": TARGET,
+            "previous_session": PREVIOUS,
+            "membership": {symbol: "000905"},
+            "primary_bars": primary,
+            "previous_states": {symbol: state},
+            "reported_previous_closes": {symbol: Decimal("2.4600")},
+            "adjustment_events": [event],
+        }
+        with self.assertRaisesRegex(ValueError, "adjustment factor does not reconcile"):
+            build_daily_adjusted_bars(**arguments)
+
+        adjusted = build_daily_adjusted_bars(
+            **arguments,
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )
+        self.assertEqual(adjusted[0].previous_close, Decimal("2.4600"))
+        gates = evaluate_daily_adjustments(
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            membership={symbol: "000905"},
+            primary_bars=primary,
+            adjusted_bars=adjusted,
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            adjustment_events=[event],
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )
+        lineage_gate = next(gate for gate in gates if gate.name == "daily_adjustment_lineage")
+        self.assertTrue(lineage_gate.passed, lineage_gate.details)
+
+        evidence_plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS,
+            expected_membership=((symbol, "000905"),),
+            accepted_existing_symbols=(),
+            fetch_symbols=(symbol,),
+            verification_symbols=(symbol,),
+            primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64,
+            universe_sha256="c" * 64,
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="d" * 64,
+            corporate_action_symbols=(symbol,),
+        )
+        manifest = build_incremental_evidence(
+            plan=evidence_plan,
+            primary_bars=primary,
+            tradeability_facts=[fact(symbol, "000905")],
+            verification_bars=[bar("baostock", symbol, "2.50")],
+            adjusted_bars=adjusted,
+            adjustment_events=[event],
+            previous_adjusted_states={symbol: state},
+            accepted_previous_closes={symbol: Decimal("2.4700")},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            factor_reference_closes={symbol: Decimal("2.455000")},
+            lineage_evidence=[{
+                "symbol": symbol,
+                "target_session": TARGET.isoformat(),
+                "kind": "cash_dividend_reference",
+                "source": "tencent_archive",
+                "details": {"factor_reference_close": "2.455000"},
+            }],
+        )[0]
+        manifest_lineage = next(
+            gate for gate in manifest["gates"] if gate["name"] == "daily_adjustment_lineage"
+        )
+        self.assertTrue(manifest_lineage["passed"], manifest_lineage["details"])
+        candidate_gate = next(
+            gate for gate in manifest["gates"]
+            if gate["name"] == "daily_corporate_action_candidate_evidence"
+        )
+        self.assertTrue(candidate_gate["passed"], candidate_gate["details"])
+
+        missing_lineage = build_incremental_evidence(
+            plan=evidence_plan,
+            primary_bars=primary,
+            tradeability_facts=[fact(symbol, "000905")],
+            verification_bars=[bar("baostock", symbol, "2.50")],
+            adjusted_bars=adjusted,
+            adjustment_events=[event],
+            previous_adjusted_states={symbol: state},
+            accepted_previous_closes={symbol: Decimal("2.4700")},
+            reported_previous_closes={symbol: Decimal("2.4600")},
+            factor_reference_closes={symbol: Decimal("2.455000")},
+        )[0]
+        self.assertFalse(missing_lineage["accepted"])
+
+        with self.assertRaisesRegex(ValueError, "does not round to reported previous close"):
+            build_daily_adjusted_bars(
+                **arguments,
+                factor_reference_closes={symbol: Decimal("2.440000")},
+            )
 
     def test_missing_active_bar_fails_but_confirmed_suspension_is_allowed(self) -> None:
         plan = small_plan()
@@ -625,6 +787,48 @@ class DailyIncrementalTests(unittest.TestCase):
                     first[5],
                 )
             self.assertFalse((Path(temporary) / "invalid").exists())
+
+    def test_returned_market_rows_use_the_manifest_hash_order(self) -> None:
+        baseline = healthy_evidence()
+        primary_source_by_symbol = {"000001": "z_primary", "600519": "a_primary"}
+        verification_source_by_symbol = {"000001": "z_verification", "600519": "a_verification"}
+        primary = [
+            replace(row, source=primary_source_by_symbol[row.symbol])
+            for row in baseline[1]
+        ]
+        verification = [
+            replace(row, source=verification_source_by_symbol[row.symbol])
+            for row in baseline[3]
+        ]
+        adjusted = [
+            replace(row, primary_source=primary_source_by_symbol[row.symbol])
+            for row in baseline[4]
+        ]
+        result = build_incremental_evidence(
+            plan=small_plan(), primary_bars=primary, tradeability_facts=baseline[2],
+            verification_bars=verification, adjusted_bars=adjusted,
+            adjustment_events=baseline[5],
+            previous_adjusted_states={
+                symbol: PreviousAdjustedState(
+                    symbol=symbol, business_date=PREVIOUS, raw_close=Decimal("10"),
+                    qfq_factor=Decimal("1"), hfq_factor=Decimal("1"),
+                    source_dataset_id="fixture-predecessor",
+                )
+                for symbol in ("000001", "600519")
+            },
+            accepted_previous_closes={"000001": Decimal("10"), "600519": Decimal("10")},
+            reported_previous_closes={"000001": Decimal("10"), "600519": Decimal("10")},
+        )
+        manifest, returned_primary, _facts, returned_verification, _adjusted, _events = result
+        self.assertEqual([row.source for row in returned_primary], ["a_primary", "z_primary"])
+        self.assertEqual(
+            manifest["primary_sha256"],
+            sha256([row.canonical() for row in returned_primary]),
+        )
+        self.assertEqual(
+            manifest["verification_sha256"],
+            sha256([row.canonical() for row in returned_verification]),
+        )
 
 
 if __name__ == "__main__":

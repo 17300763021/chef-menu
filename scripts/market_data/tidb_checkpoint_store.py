@@ -92,22 +92,28 @@ class TiDBConfig:
         env: Mapping[str, str] | None = None,
         *,
         env_file: Path = DEFAULT_ENV_FILE,
+        prefix: str = "TIDB",
     ) -> "TiDBConfig":
         file_values = load_dotenv(env_file)
         source = {**file_values, **dict(os.environ if env is None else env)}
+        normalized_prefix = prefix.rstrip("_")
+        source_keys = {
+            name: f"{normalized_prefix}_{name}"
+            for name in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE", "SSL_MODE")
+        }
         missing = [
-            key for key in ("TIDB_HOST", "TIDB_PORT", "TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE")
-            if not source.get(key)
+            key for key in source_keys.values()
+            if key != source_keys["SSL_MODE"] and not source.get(key)
         ]
         if missing:
             raise RuntimeError(f"missing TiDB configuration keys: {', '.join(missing)}")
         return cls(
-            host=source["TIDB_HOST"],
-            port=int(source["TIDB_PORT"]),
-            user=source["TIDB_USER"],
-            password=source["TIDB_PASSWORD"],
-            database=source["TIDB_DATABASE"],
-            ssl_mode=source.get("TIDB_SSL_MODE", "REQUIRED"),
+            host=source[source_keys["HOST"]],
+            port=int(source[source_keys["PORT"]]),
+            user=source[source_keys["USER"]],
+            password=source[source_keys["PASSWORD"]],
+            database=source[source_keys["DATABASE"]],
+            ssl_mode=source.get(source_keys["SSL_MODE"], "REQUIRED"),
         )
 
     def safe_summary(self) -> dict[str, Any]:

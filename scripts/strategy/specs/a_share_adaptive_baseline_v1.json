@@ -1,0 +1,92 @@
+{
+  "activation_state": "disabled_preregistration",
+  "factor_policy": {
+    "base_weights": {
+      "quality_risk": "0.25",
+      "residual_momentum": "0.25",
+      "trend_quality": "0.15",
+      "verified_capital_flow": "0.15",
+      "volume_price_liquidity": "0.20"
+    },
+    "flow_missing_policy": {
+      "candidate_missing_when_release_available": "block_candidate",
+      "release_unavailable": "disable_factor_and_proportionally_normalize_observed_non_flow_weights",
+      "zero_or_neutral_imputation_allowed": false
+    },
+    "industry_aware": true,
+    "qlib_owns_scoring_and_ranking": true,
+    "size_aware": true
+  },
+  "market_regime": {
+    "classifier_status": "pending_m4_2_preregistration",
+    "gross_exposure_caps": {
+      "bear": "0.20",
+      "critical_risk": "0.00",
+      "range": "0.40",
+      "strong_bull": "0.80",
+      "weak_bull": "0.60"
+    }
+  },
+  "portfolio": {
+    "allow_full_cash": true,
+    "daily_risk_evaluation": true,
+    "maximum_holdings": 12,
+    "maximum_industry_weight": "0.20",
+    "maximum_initial_stock_weight": "0.08",
+    "maximum_planned_open_risk": "0.03",
+    "maximum_planned_risk_per_stock": "0.005",
+    "minimum_holdings_when_sufficient_candidates": 8,
+    "normal_rebalance": "weekly",
+    "same_day_reentry_allowed": false,
+    "stop_loss_cooldown_trading_days": 10
+  },
+  "recommendation_contract": {
+    "narrative_generated_from_structured_fields_only": true,
+    "required_audit_fields": [
+      "business_date",
+      "data_version",
+      "strategy_version",
+      "regime",
+      "factor_contributions",
+      "risk_budget",
+      "reason_codes",
+      "actionability_state"
+    ],
+    "required_actionable_price_fields": [
+      "entry_price_lower",
+      "entry_price_upper",
+      "stop_price",
+      "defensive_price",
+      "target_prices",
+      "valid_until"
+    ]
+  },
+  "schema_version": "m4-baseline-strategy-contract-v1",
+  "simulation_only": true,
+  "strategy_version": "m4-a-share-adaptive-baseline-v1-contract-only",
+  "universe": {
+    "average_amount_threshold_cny": "100000000",
+    "average_amount_window_trading_days": 20,
+    "initial_scope": "csi300_plus_csi500_point_in_time",
+    "minimum_listing_age_trading_days": 120,
+    "required_gates": [
+      "not_st_or_star_st",
+      "no_delisting_risk",
+      "not_suspended",
+      "sufficient_liquidity",
+      "listing_age",
+      "not_one_price_untradeable",
+      "no_recent_consecutive_limit_down_risk",
+      "outside_highest_risk_volatility_tail"
+    ]
+  },
+  "unresolved_decision_rules": [
+    "exact_market_regime_classifier",
+    "exact_factor_formulas_and_windows",
+    "industry_and_size_neutralization_method",
+    "volatility_tail_cutoff",
+    "consecutive_limit_down_window",
+    "rank_deterioration_exit_threshold",
+    "time_stop_window_and_excess_return_threshold"
+  ]
+}

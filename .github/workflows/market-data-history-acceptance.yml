@@ -75,6 +75,7 @@ jobs:
           python -m scripts.test_adjustment_engine
           python -m scripts.test_tradeability
           python -m scripts.test_baostock_calendar_source
+          python -m scripts.test_eastmoney_market_state_source
           python -m scripts.test_baostock_history_source
 
   sample:

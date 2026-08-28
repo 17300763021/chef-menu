@@ -1,0 +1,18 @@
+{
+  "schema_version": "m4-fundamental-report-exclusions-v1",
+  "rows": [
+    {
+      "symbol": "001203",
+      "statement_type": "balance",
+      "report_date": "2021-03-31",
+      "reason": "vendor_total_equity_equals_official_parent_equity_not_total_equity",
+      "source_total_assets": "7462304776.850000",
+      "source_total_liabilities": "4864853233.020000",
+      "source_total_equity": "2541981737.690000",
+      "official_parent_equity": "2541981737.69",
+      "implied_non_parent_equity_difference": "55469806.14",
+      "official_url": "https://pdf.dfcfw.com/pdf/H2_AN202105061490135051_1.pdf?1620335746000.pdf=",
+      "official_document_sha256": "87451e1f740fa1548f3bd3b0f968a625371e454bf3c3aa53d3ad90214b1ff3cb"
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+{
+  "activation_state": "disabled_acceptance",
+  "exit_rules": {
+    "original_stop_evaluated_daily": true,
+    "rank_deterioration": {
+      "consecutive_weekly_observations": 2,
+      "minimum_percentile": "0.50"
+    },
+    "regime_deterioration_de_risks_to_new_cap": true,
+    "time_stop": {
+      "benchmark": "000905",
+      "maximum_holding_sessions_without_positive_excess": 20,
+      "required_excess_return": "0.00"
+    }
+  },
+  "factor_policy": {
+    "base_weights": {
+      "quality_risk": "0.25",
+      "residual_momentum": "0.25",
+      "trend_quality": "0.15",
+      "verified_capital_flow": "0.15",
+      "volume_price_liquidity": "0.20"
+    },
+    "cross_sectional_processing": {
+      "industry_basis": "point_in_time_shenwan_level1",
+      "method": "winsorize_1_99_then_ols_residual_on_industry_dummies_and_log_total_assets_then_zscore",
+      "minimum_industry_observations": 5,
+      "size_basis": "point_in_time_log_total_assets"
+    },
+    "flow_missing_policy": {
+      "candidate_missing_when_release_available": "block_candidate",
+      "release_unavailable": "disable_factor_and_proportionally_normalize_observed_non_flow_weights",
+      "zero_or_neutral_imputation_allowed": false
+    },
+    "formulas": {
+      "quality_risk": {
+        "cash_conversion_weight": "0.25",
+        "earnings_stability_weight": "0.20",
+        "inverse_leverage_weight": "0.20",
+        "roe_ttm_weight": "0.35",
+        "source": "point_in_time_fundamentals_effective_on_or_before_business_date"
+      },
+      "residual_momentum": {
+        "formula": "log(adjusted_close_t_minus_20 / adjusted_close_t_minus_120)",
+        "lookback_sessions": 120,
+        "skip_recent_sessions": 20
+      },
+      "trend_quality": {
+        "formula": "ols_slope_of_log_adjusted_close_60 / max(ols_residual_std,1e-12)",
+        "lookback_sessions": 60
+      },
+      "verified_capital_flow": {
+        "formula": "sum_main_net_inflow_cny_5 / sum_amount_cny_5",
+        "minimum_release_coverage": "0.98",
+        "window_sessions": 5
+      },
+      "volume_price_liquidity": {
+        "amount_component_weight": "0.40",
+        "price_turnover_correlation_weight": "0.30",
+        "turnover_stability_weight": "0.30",
+        "window_sessions": 20
+      }
+    },
+    "qlib_owns_dataset_scoring_and_ranking": true
+  },
+  "market_regime": {
+    "breadth_definition": "eligible_universe_fraction_with_adjusted_close_above_ma60",
+    "gross_exposure_caps": {
+      "bear": "0.20",
+      "critical_risk": "0.00",
+      "range": "0.40",
+      "strong_bull": "0.80",
+      "weak_bull": "0.60"
+    },
+    "ordered_rules": [
+      "critical_risk_if_required_data_invalid_or_worst_index_20_session_drawdown_lte_minus_10pct_or_breadth_lte_20pct",
+      "strong_bull_if_both_indexes_close_gt_ma120_and_ma20_gt_ma60_and_breadth_gte_65pct",
+      "weak_bull_if_both_indexes_close_gt_ma120_and_breadth_gte_50pct",
+      "bear_if_both_indexes_close_lt_ma120_and_breadth_lt_40pct",
+      "range_otherwise"
+    ],
+    "required_indexes": ["000300", "000905"]
+  },
+  "portfolio": {
+    "allow_full_cash": true,
+    "daily_risk_evaluation_union": "authoritative_open_positions_plus_valid_new_candidates",
+    "maximum_holdings": 12,
+    "maximum_industry_weight": "0.20",
+    "maximum_initial_stock_weight": "0.08",
+    "maximum_planned_open_risk": "0.03",
+    "maximum_planned_risk_per_stock": "0.005",
+    "minimum_holdings_when_sufficient_candidates": 8,
+    "normal_rebalance": "weekly",
+    "same_day_reentry_allowed": false,
+    "stop_loss_cooldown_trading_days": 10,
+    "target_holdings": 10
+  },
+  "price_and_risk": {
+    "defensive_distance_atr_multiple": "1.00",
+    "entry_band_atr_multiple": "0.25",
+    "stop_distance_atr_multiple": "2.00",
+    "target_r_multiples": ["2.00", "3.00"]
+  },
+  "research_input": {
+    "adjusted_price_origin": "rqalpha_public_history_bars_pre_adjusted",
+    "explicit_dataset_ids_and_manifest_hashes_required": true,
+    "fundamental_minimum_coverage": "0.98",
+    "latest_release_lookup_allowed": false,
+    "qlib_interface": "DataHandlerLP_from_df_plus_DatasetH_plus_transparent_Model",
+    "vendor_absolute_adjusted_prices_allowed": false
+  },
+  "schema_version": "m4-baseline-strategy-contract-v2",
+  "simulation_only": true,
+  "strategy_version": "m4-a-share-adaptive-baseline-v2",
+  "universe": {
+    "average_amount_threshold_cny": "100000000",
+    "average_amount_window_sessions": 20,
+    "consecutive_limit_down": {
+      "consecutive_sessions": 2,
+      "lookback_sessions": 10
+    },
+    "initial_scope": "csi300_plus_csi500_point_in_time",
+    "minimum_listing_age_sessions": 120,
+    "volatility_tail": {
+      "lookback_sessions": 60,
+      "maximum_cross_sectional_percentile": "0.95"
+    }
+  }
+}

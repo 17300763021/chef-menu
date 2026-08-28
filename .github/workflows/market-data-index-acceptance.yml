@@ -1,0 +1,73 @@
+name: M2 Benchmark Index Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      business_end:
+        description: "Latest completed trading session (YYYY-MM-DD)"
+        required: true
+        type: string
+      tidb_ru_percent:
+        description: "Current TiDB monthly Request Units percentage"
+        required: true
+        type: string
+      tidb_storage_percent:
+        description: "Current TiDB row-storage percentage"
+        required: true
+        type: string
+      tidb_quota_checked_at:
+        description: "Fresh quota date (YYYY-MM-DD)"
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/market-data-index-acceptance.yml
+      - scripts/market_data/index_*.py
+      - scripts/market_data/tidb_index_store.py
+      - scripts/test_market_data_index_bars.py
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+concurrency:
+  group: m2-benchmark-index
+  cancel-in-progress: false
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: scripts/market_data/requirements.lock.txt
+      - run: python -m pip install -r scripts/market_data/requirements.lock.txt
+      - run: python -m scripts.test_market_data_index_bars
+      - if: github.event_name == 'workflow_dispatch'
+        run: >-
+          python -m scripts.market_data.industry_quota_guard
+          --ru-percent "${{ inputs.tidb_ru_percent }}"
+          --storage-percent "${{ inputs.tidb_storage_percent }}"
+          --checked-at "${{ inputs.tidb_quota_checked_at }}"
+      - if: github.event_name == 'workflow_dispatch'
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: python -u -m scripts.market_data.index_runner --business-end "${{ inputs.business_end }}" --output-dir index-acceptance
+      - if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m2-index-manifest-${{ github.run_id }}
+          path: index-acceptance/manifest.json
+          retention-days: 7

@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -35,8 +35,10 @@ from scripts.market_data.daily_incremental import (
     latest_closed_session,
     write_outputs,
 )
+from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_bars import load_calendars
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
+from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_universe import reconstruct
 from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.akshare_history_source import (
@@ -45,18 +47,26 @@ from scripts.market_data.sources.akshare_history_source import (
 )
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
+from scripts.market_data.sources.eastmoney_corporate_action_source import EastmoneyCorporateActionSource
+from scripts.market_data.sources.eastmoney_market_state_source import EastmoneySuspensionSource
+from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     TiDBConfig,
+    canonical_lineage_evidence,
     connect,
+    daily_correction_context,
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
     load_base_references,
     load_daily_checkpoint_evidence,
+    load_latest_prior_adjusted_states,
     load_previous_adjusted_states,
     publish_daily_run,
     publish_daily_symbol_checkpoint,
+    recover_compatible_daily_checkpoints,
+    recovered_previous_states_from_lineage,
 )
 from scripts.market_data.tradeability import derive_tradeability
 from scripts.market_data.tradeability_contracts import TradeabilityFact
@@ -68,9 +78,29 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
     "993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged"
 )
 SYMBOL_DEADLINE_SECONDS = 90
+CALENDAR_DEADLINE_SECONDS = 180
+
+
+def daily_membership_symbols(expected_membership: Iterable[tuple[str, str]]) -> tuple[str, ...]:
+    return tuple(sorted(symbol for symbol, _index_code in expected_membership))
+
+
+def select_daily_shard_symbols(
+    scope_symbols: Iterable[str], pending_symbols: Iterable[str],
+    shard_index: int, shard_count: int,
+) -> tuple[str, ...]:
+    """Select a stable shard from the full scope, independent of checkpoint timing."""
+    if shard_count < 1 or shard_count > 4 or not 0 <= shard_index < shard_count:
+        raise ValueError("daily shard coordinates must use between 1 and 4 stable shards")
+    assigned = set(sorted(scope_symbols)[shard_index::shard_count])
+    return tuple(symbol for symbol in sorted(set(pending_symbols)) if symbol in assigned)
 
 
 class DailySymbolTimeout(BaseException):
+    pass
+
+
+class DailyPrerequisiteTimeout(BaseException):
     pass
 
 
@@ -89,6 +119,33 @@ def symbol_deadline(seconds: int):
 
     def raise_timeout(signum: int, frame: object) -> None:
         raise DailySymbolTimeout(f"daily symbol acquisition exceeded {seconds} seconds")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+@contextmanager
+def prerequisite_deadline(seconds: int):
+    """Bound cloud-only prerequisite calls that may block inside vendor sockets."""
+    try:
+        import signal
+    except ImportError:
+        yield
+        return
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(signum: int, frame: object) -> None:
+        raise DailyPrerequisiteTimeout(
+            f"daily calendar prerequisites exceeded {seconds} seconds"
+        )
 
     signal.signal(signal.SIGALRM, raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -194,14 +251,26 @@ def _checkpoint_evidence(
     verification: DailyBar | None,
     adjusted: HistoricalBar | None,
     events: Iterable[AdjustmentEvent],
+    status_source: str | None = None,
+    previous_close_source: str | None = None,
+    lineage_evidence: Iterable[dict[str, Any]] = (),
 ) -> DailyEvidence:
     return DailyEvidence(
-        manifest={"authoritative": False, "simulation_orders_allowed": False},
+        manifest={
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "status_source": status_source,
+            "previous_close_source": previous_close_source,
+        },
         primary_bars=[] if primary is None else [primary.canonical()],
         tradeability=[] if fact is None else [fact.canonical()],
         verification_bars=[] if verification is None else [verification.canonical()],
         adjusted_bars=[] if adjusted is None else [adjusted.canonical()],
         adjustments=[event.canonical() for event in events],
+        lineage_evidence=sorted(
+            (canonical_lineage_evidence(row) for row in lineage_evidence),
+            key=lambda row: (row["symbol"], row["kind"]),
+        ),
     )
 
 
@@ -216,28 +285,49 @@ def _target_events(
     ]
 
 
+def _factor_reference_closes(
+    lineage_evidence: Iterable[Mapping[str, Any]],
+) -> dict[str, Decimal]:
+    """Rebuild exact factor references from validated cash-dividend lineage."""
+    references: dict[str, Decimal] = {}
+    for raw in lineage_evidence:
+        row = canonical_lineage_evidence(raw)
+        if row["kind"] != "cash_dividend_reference":
+            continue
+        details = row["details"]
+        accepted_close = Decimal(str(details["accepted_previous_close"]))
+        cash_per_ten = Decimal(str(details["cash_per_ten_shares"]))
+        reference = accepted_close - cash_per_ten / Decimal("10")
+        recorded = details.get("factor_reference_close")
+        if recorded is not None and Decimal(str(recorded)) != reference:
+            raise ValueError(
+                f"cash-dividend factor reference does not reconcile for {row['symbol']}"
+            )
+        existing = references.get(row["symbol"])
+        if existing is not None and existing != reference:
+            raise ValueError(f"conflicting cash-dividend factor references for {row['symbol']}")
+        references[row["symbol"]] = reference
+    return references
+
+
 def capture_symbol(
     *,
     plan: DailyIncrementalPlan,
     symbol: str,
     primary_source: AkshareEastmoneyHistorySource,
     verification_source: AkshareHistorySource,
-    secondary_source: BaostockHistorySource,
+    secondary_source: BaostockHistorySource | None,
+    verification_fallback_source: BaostockHistorySource | None = None,
+    fallback_suspended_symbols: frozenset[str] = frozenset(),
+    fallback_status_available: bool = True,
     previous_states: dict[str, PreviousAdjustedState],
+    fallback_previous_states: dict[str, PreviousAdjustedState] | None = None,
     ipo_dates: dict[str, date],
     calendar_dates: tuple[date, ...],
 ) -> tuple[DailyEvidence, Decimal | None, str, Exception | None]:
     """Capture one symbol and classify its resumable checkpoint state."""
     target = plan.target_session
     verification_required = symbol in set(plan.verification_symbols)
-    status_rows = secondary_source.fetch_status(symbol, target, target)
-    secondary = status_rows.get(target)
-    if secondary is None:
-        raise RuntimeError(f"secondary status missing for {symbol}:{target.isoformat()}")
-    reported = Decimal(str(secondary["preclose"])) if str(secondary.get("preclose", "")).strip() else None
-    trade_status = str(secondary.get("tradestatus", "")).strip()
-    if trade_status not in {"0", "1"}:
-        raise RuntimeError(f"secondary trade status is unknown for {symbol}:{target.isoformat()}")
     ipo_date = ipo_dates.get(symbol)
     if ipo_date is None:
         raise RuntimeError(f"base security reference missing for {symbol}")
@@ -246,12 +336,50 @@ def capture_symbol(
     adjusted: HistoricalBar | None = None
     verification: DailyBar | None = None
     events: list[AdjustmentEvent] = []
+    lineage_evidence: list[dict[str, Any]] = []
     recoverable_error: Exception | None = None
     primary_source_name: str | None = None
+    reported: Decimal | None = None
+    status_source: str | None = None
+    previous_close_source: str | None = None
+    secondary: dict[str, str] | None = None
+
+    if secondary_source is not None:
+        status_rows = secondary_source.fetch_status(symbol, target, target)
+        secondary = status_rows.get(target)
+        if secondary is None:
+            raise RuntimeError(f"secondary status missing for {symbol}:{target.isoformat()}")
+        trade_status = str(secondary.get("tradestatus", "")).strip()
+        if trade_status not in {"0", "1"}:
+            raise RuntimeError(f"secondary trade status is unknown for {symbol}:{target.isoformat()}")
+        reported = Decimal(str(secondary["preclose"])) if str(secondary.get("preclose", "")).strip() else None
+        status_source = "baostock_daily_status"
+        previous_close_source = "baostock_reported_preclose" if reported is not None else None
+    elif fallback_status_available:
+        trade_status = "0" if symbol in fallback_suspended_symbols else "1"
+        secondary = {"tradestatus": trade_status, "isST": "", "preclose": ""}
+        status_source = EastmoneySuspensionSource.name
+    else:
+        trade_status = "1"
+
     if trade_status == "1":
         try:
-            raw_map, primary_source_name = primary_source.fetch_raw_with_fallback(symbol, target, target)
-            primary = _one_target_row(raw_map.values(), symbol, target, "primary source")
+            if secondary_source is None:
+                raw_map, primary_source_name, reported, previous_close_source = (
+                    primary_source.fetch_daily_raw_with_reference(
+                        symbol, plan.previous_session, target,
+                    )
+                )
+                if secondary is not None:
+                    secondary["preclose"] = format(reported, "f")
+            else:
+                raw_map, primary_source_name = primary_source.fetch_raw_with_fallback(symbol, target, target)
+            primary = _one_target_row(
+                (row for row in raw_map.values() if row.business_date == target),
+                symbol,
+                target,
+                "primary source",
+            )
         except Exception as error:
             recoverable_error = error
 
@@ -264,15 +392,65 @@ def capture_symbol(
         if fact.is_suspended and fact.has_secondary_status:
             return _checkpoint_evidence(
                 primary=None, fact=fact, verification=None, adjusted=None, events=[],
+                status_source=status_source, previous_close_source=previous_close_source,
             ), reported, "succeeded", None
         error = recoverable_error or RuntimeError(f"active primary bar missing for {symbol}")
         return _checkpoint_evidence(
             primary=None, fact=fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
         ), reported, "blocked", error
 
     state = previous_states.get(symbol)
     if state is None or state.business_date != plan.previous_session:
-        error = RuntimeError(f"exact predecessor adjusted state missing for {symbol}")
+        prior_state = (fallback_previous_states or {}).get(symbol)
+        recovery_error: Exception | None = None
+        if prior_state is not None and prior_state.business_date < plan.previous_session:
+            required_sessions = tuple(
+                session for session in calendar_dates
+                if prior_state.business_date <= session <= plan.previous_session
+            )
+            try:
+                recovered_close, recovery_details = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).recover_no_adjustment_predecessor(
+                    symbol,
+                    prior_state.business_date,
+                    plan.previous_session,
+                    prior_state.raw_close,
+                    required_sessions,
+                )
+                recovery_details.update({
+                    "prior_source_dataset_id": prior_state.source_dataset_id,
+                    "qfq_factor": format(prior_state.qfq_factor, "f"),
+                    "hfq_factor": format(prior_state.hfq_factor, "f"),
+                })
+                recovery_evidence = canonical_lineage_evidence({
+                    "symbol": symbol,
+                    "target_session": target.isoformat(),
+                    "kind": "gap_no_adjustment_recovery",
+                    "source": "tencent_raw_hfq_continuity",
+                    "details": recovery_details,
+                })
+                lineage_evidence.append(recovery_evidence)
+                state = PreviousAdjustedState(
+                    symbol=symbol,
+                    business_date=plan.previous_session,
+                    raw_close=recovered_close,
+                    qfq_factor=prior_state.qfq_factor,
+                    hfq_factor=prior_state.hfq_factor,
+                    source_dataset_id=f"daily-lineage:{sha256(recovery_evidence)}",
+                )
+                previous_states[symbol] = state
+            except Exception as error:
+                recovery_error = error
+        if state is None or state.business_date != plan.previous_session:
+            error = recovery_error or RuntimeError(f"exact predecessor adjusted state missing for {symbol}")
+        else:
+            error = None
+    else:
+        error = None
+    if error is not None:
         blocked_fact = derive_tradeability(
             symbol=symbol, business_date=target, index_code=plan.membership[symbol],
             listing_age_sessions=age, primary=None, secondary=secondary,
@@ -285,16 +463,62 @@ def capture_symbol(
         )
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
+            lineage_evidence=lineage_evidence,
         ), reported, "blocked", error
     if reported is None or reported <= 0:
         raise RuntimeError(f"positive reported previous close missing for {symbol}")
     try:
-        if has_price_break(state.raw_close, reported):
-            events = _target_events(primary_source, symbol, target)
+        corporate_action_candidate = symbol in set(plan.corporate_action_symbols)
+        if corporate_action_candidate or has_price_break(state.raw_close, reported) or previous_close_source in {
+            "akshare_sina_exact_predecessor_close",
+            "tencent_exact_predecessor_close",
+        }:
+            try:
+                events = _target_events(primary_source, symbol, target)
+            except RuntimeError as factor_error:
+                if (
+                    corporate_action_candidate
+                    or primary_source_name not in {"akshare_sina", "tencent_archive"}
+                    or not str(factor_error).startswith("AKShare Sina returned no ")
+                ):
+                    raise
+                continuity_source = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
+                previous_close_source = f"{previous_close_source}+{continuity_source}"
+            if corporate_action_candidate and not events:
+                raise RuntimeError(f"corporate-action candidate has no target factor event for {symbol}")
+            if events and (
+                corporate_action_candidate
+                or previous_close_source in {
+                    "akshare_sina_exact_predecessor_close",
+                    "tencent_exact_predecessor_close",
+                }
+            ):
+                reported, action_details = TencentHistorySource(
+                    timeout_seconds=primary_source.timeout_seconds,
+                    attempts=min(primary_source.attempts, 2),
+                ).fetch_cash_dividend_reference(
+                    symbol, plan.previous_session, target, state.raw_close,
+                )
+                previous_close_source = "tencent_structured_cash_dividend"
+                lineage_evidence.append(canonical_lineage_evidence({
+                    "symbol": symbol,
+                    "target_session": target.isoformat(),
+                    "kind": "cash_dividend_reference",
+                    "source": "tencent_archive",
+                    "details": action_details,
+                }))
+                if secondary is not None:
+                    secondary["preclose"] = format(reported, "f")
+        factor_references = _factor_reference_closes(lineage_evidence)
         adjusted_rows = build_daily_adjusted_bars(
             target_session=target, previous_session=plan.previous_session,
             membership=plan.membership, primary_bars=[primary], previous_states={symbol: state},
             reported_previous_closes={symbol: reported}, adjustment_events=events,
+            factor_reference_closes=factor_references,
         )
         adjusted = adjusted_rows[0]
     except Exception as error:
@@ -310,7 +534,13 @@ def capture_symbol(
         )
         return _checkpoint_evidence(
             primary=None, fact=blocked_fact, verification=None, adjusted=None, events=[],
+            status_source=status_source, previous_close_source=previous_close_source,
+            lineage_evidence=lineage_evidence,
         ), reported, "blocked", error
+    fact = derive_tradeability(
+        symbol=symbol, business_date=target, index_code=plan.membership[symbol],
+        listing_age_sessions=age, primary=_tradeability_row(primary), secondary=secondary,
+    )
     if verification_required:
         try:
             values = verification_source.fetch_raw(
@@ -319,9 +549,35 @@ def capture_symbol(
             verification = _one_target_row(values, symbol, target, "verification source")
         except Exception as error:
             recoverable_error = error
+            if verification_fallback_source is not None and primary.source != "baostock":
+                try:
+                    fallback_status = verification_fallback_source.fetch_status(
+                        symbol, target, target,
+                    )
+                    fallback_bars = verification_fallback_source.bars_from_status(
+                        symbol, fallback_status,
+                    )
+                    verification = _one_target_row(
+                        fallback_bars.values(), symbol, target, "BaoStock verification source",
+                    )
+                    consistency_errors = cross_source_consistency_errors(primary, verification)
+                    if consistency_errors:
+                        raise RuntimeError(
+                            f"BaoStock verification disagrees for {symbol}: "
+                            f"{','.join(consistency_errors)}"
+                        )
+                    recoverable_error = None
+                except Exception as fallback_error:
+                    verification = None
+                    recoverable_error = RuntimeError(
+                        f"{error}; baostock_verification: "
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
 
     evidence = _checkpoint_evidence(
         primary=primary, fact=fact, verification=verification, adjusted=adjusted, events=events,
+        status_source=status_source, previous_close_source=previous_close_source,
+        lineage_evidence=lineage_evidence,
     )
     if verification_required and verification is None:
         assert recoverable_error is not None
@@ -346,6 +602,19 @@ def _select_target(
     return requested or next_session
 
 
+def _reusable_existing_keys(
+    succeeded_symbols: Iterable[str],
+    target_session: date,
+    corporate_action_symbols: Iterable[str],
+) -> tuple[tuple[str, date], ...]:
+    """Keep action candidates out of checkpoint reuse for the current session."""
+    candidates = set(corporate_action_symbols)
+    return tuple(
+        (symbol, target_session)
+        for symbol in sorted(set(succeeded_symbols) - candidates)
+    )
+
+
 def run(
     *,
     observed_at: datetime,
@@ -354,13 +623,36 @@ def run(
     requested_target: date | None = None,
     initialize_schema: bool = False,
     symbol_attempts: int = 2,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    defer_finalize: bool = False,
+    finalize_only: bool = False,
+    supersedes_dataset_id: str | None = None,
 ) -> dict[str, Any]:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
     if symbol_attempts < 1 or symbol_attempts > 3:
         raise ValueError("symbol attempts must be between 1 and 3")
+    if shard_count < 1 or shard_count > 4 or not 0 <= shard_index < shard_count:
+        raise ValueError("daily shard coordinates must use between 1 and 4 stable shards")
+    if defer_finalize and finalize_only:
+        raise ValueError("daily capture cannot defer and finalize in the same invocation")
+    if supersedes_dataset_id is not None and requested_target is None:
+        raise ValueError("daily correction requires an explicit target session")
     observed = observed_at.astimezone(SHANGHAI)
-    primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_prerequisites_started",
+        phase="calendars",
+        observed_date=observed.date().isoformat(),
+        deadline_seconds=CALENDAR_DEADLINE_SECONDS,
+    )
+    with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
+        primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+    _progress(
+        "daily_calendars_loaded",
+        primary_sessions=len(primary_calendar.open_dates),
+        secondary_sessions=len(secondary_calendar.open_dates),
+    )
     if not accepted(calendar_gates):
         raise RuntimeError("daily primary and secondary calendars are not aligned")
 
@@ -369,9 +661,17 @@ def run(
     try:
         if initialize_schema:
             ensure_daily_schema(connection)
-        latest_accepted, predecessor_dataset_id = latest_accepted_lineage(
-            connection, base_history_dataset_id,
-        )
+        if supersedes_dataset_id is None:
+            latest_accepted, predecessor_dataset_id = latest_accepted_lineage(
+                connection, base_history_dataset_id,
+            )
+        else:
+            latest_accepted, predecessor_dataset_id = daily_correction_context(
+                connection,
+                base_history_dataset_id=base_history_dataset_id,
+                superseded_dataset_id=supersedes_dataset_id,
+                target_session=requested_target,
+            )
         latest_ready = latest_closed_session(primary_calendar, observed)
     finally:
         connection.close()
@@ -385,13 +685,36 @@ def run(
         _progress(**result)
         return result
 
+    _progress("daily_prerequisites_started", phase="corporate_action_inventory")
+    with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
+        corporate_action_inventory = EastmoneyCorporateActionSource(
+            attempts=3, timeout_seconds=25,
+        ).fetch(target)
+    corporate_action_rows = list(corporate_action_inventory.records)
+    _progress(
+        "daily_corporate_action_inventory_loaded",
+        source=corporate_action_inventory.source,
+        target_session=target.isoformat(),
+        record_count=len(corporate_action_rows),
+        records_sha256=corporate_action_inventory.evidence_sha256,
+    )
+
+    _progress("daily_prerequisites_started", phase="point_in_time_universe")
     csi = CsiIndexSource()
     current = csi.fetch_current()
     events, discovered, _event_source = csi.fetch_indexed_events(current.as_of_date)
     snapshots = reconstruct(current, events)
+    _progress(
+        "daily_universe_loaded",
+        current_as_of_date=current.as_of_date.isoformat(),
+        event_count=len(events),
+        discovered_notice_count=len(discovered),
+    )
     base_plan = build_incremental_plan(
         observed_at=observed, primary_calendar=primary_calendar,
         secondary_calendar=secondary_calendar, snapshots=snapshots, target_session=target,
+        corporate_action_inventory=corporate_action_rows,
+        corporate_action_inventory_source=corporate_action_inventory.source,
     )
     dataset_id = default_daily_dataset_id(target, base_plan.scope_sha256)
 
@@ -400,19 +723,58 @@ def run(
         if initialize_schema:
             ensure_daily_schema(connection)
         stored, metadata = load_daily_checkpoint_evidence(connection, dataset_id)
+        previous_states = load_previous_adjusted_states(
+            connection, predecessor_dataset_id=predecessor_dataset_id,
+            previous_session=base_plan.previous_session,
+        )
+        recovered_states = recovered_previous_states_from_lineage(
+            stored.lineage_evidence,
+            previous_session=base_plan.previous_session,
+        )
+        for symbol, recovered_state in recovered_states.items():
+            existing_state = previous_states.get(symbol)
+            if existing_state is not None and existing_state != recovered_state:
+                raise RuntimeError(f"stored lineage conflicts with accepted predecessor for {symbol}")
+            previous_states[symbol] = recovered_state
+        missing_predecessor_symbols = set(base_plan.membership) - set(previous_states)
+        fallback_previous_states = load_latest_prior_adjusted_states(
+            connection,
+            base_history_dataset_id=base_history_dataset_id,
+            previous_session=base_plan.previous_session,
+            symbols=missing_predecessor_symbols,
+        )
+        ipo_dates = load_base_references(connection, base_history_dataset_id)
+        recovery = {
+            "already_present": len(metadata["succeeded_symbols"]),
+            "recovered": 0,
+            "candidate_datasets": 0,
+            "recovered_by_source_dataset": {},
+            "rejected_datasets": {},
+        }
+        if len(metadata["succeeded_symbols"]) < len(base_plan.expected_membership):
+            recovery = recover_compatible_daily_checkpoints(
+                connection,
+                dataset_id=dataset_id,
+                target_session=target,
+                expected_membership=base_plan.membership,
+                verification_symbols=base_plan.verification_symbols,
+                previous_states=previous_states,
+                existing_metadata=metadata,
+                excluded_symbols=base_plan.corporate_action_symbols,
+            )
+            if recovery["recovered"]:
+                stored, metadata = load_daily_checkpoint_evidence(connection, dataset_id)
         plan = build_incremental_plan(
             observed_at=observed, primary_calendar=primary_calendar,
             secondary_calendar=secondary_calendar, snapshots=snapshots,
-            accepted_existing_keys=(
-                (symbol, target) for symbol in metadata["succeeded_symbols"]
+            accepted_existing_keys=_reusable_existing_keys(
+                metadata["succeeded_symbols"], target,
+                base_plan.corporate_action_symbols,
             ),
             target_session=target,
+            corporate_action_inventory=corporate_action_rows,
+            corporate_action_inventory_source=corporate_action_inventory.source,
         )
-        previous_states = load_previous_adjusted_states(
-            connection, predecessor_dataset_id=predecessor_dataset_id,
-            previous_session=plan.previous_session,
-        )
-        ipo_dates = load_base_references(connection, base_history_dataset_id)
     finally:
         connection.close()
 
@@ -421,17 +783,93 @@ def run(
         predecessor_dataset_id=predecessor_dataset_id,
         expected_symbols=len(plan.expected_membership), resumed_symbols=len(plan.accepted_existing_symbols),
         fetch_symbols=len(plan.fetch_symbols), verification_symbols=len(plan.verification_symbols),
+        recovered_symbols=recovery["recovered"],
+        recovery_candidate_datasets=recovery["candidate_datasets"],
+        recovery_rejected_datasets=recovery["rejected_datasets"],
+        corporate_action_candidates=len(plan.corporate_action_symbols),
+    )
+
+    all_scope_symbols = list(daily_membership_symbols(plan.expected_membership))
+    assigned_symbols = set(all_scope_symbols[shard_index::shard_count])
+    selected_fetch_symbols = list(select_daily_shard_symbols(
+        all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
+    ))
+    if finalize_only and plan.fetch_symbols:
+        raise RuntimeError(
+            f"daily capture is incomplete; remaining_symbols={len(plan.fetch_symbols)}"
+        )
+    if finalize_only:
+        selected_fetch_symbols = []
+    _progress(
+        "daily_shard_scope_ready", shard_index=shard_index, shard_count=shard_count,
+        assigned_symbols=len(assigned_symbols), pending_symbols=len(selected_fetch_symbols),
+        finalize_only=finalize_only,
     )
 
     primary_source = AkshareEastmoneyHistorySource(timeout_seconds=25, attempts=2)
     verification_source = AkshareHistorySource(timeout_seconds=25, attempts=2)
-    secondary_context = (
-        BaostockHistorySource(timeout_seconds=25, attempts=2)
-        if plan.fetch_symbols else nullcontext(None)
-    )
-    with secondary_context as secondary_source:
-        for position, symbol in enumerate(plan.fetch_symbols, start=1):
-            assert secondary_source is not None
+    with ExitStack() as source_stack:
+        secondary_source: BaostockHistorySource | None = None
+        verification_fallback_source: BaostockHistorySource | None = None
+        fallback_suspended_symbols: frozenset[str] = frozenset()
+        fallback_status_available = False
+        if selected_fetch_symbols:
+            try:
+                fallback_suspended_symbols = EastmoneySuspensionSource(
+                    attempts=3, timeout_seconds=25,
+                ).fetch(target)
+                fallback_status_available = True
+                _progress(
+                    "daily_status_source_ready",
+                    source=EastmoneySuspensionSource.name,
+                    confirmed_suspended=len(fallback_suspended_symbols),
+                    st_policy="unknown_fail_closed",
+                )
+            except Exception as error:
+                _progress(
+                    "daily_status_source_degraded",
+                    unavailable_source=EastmoneySuspensionSource.name,
+                    error=f"{type(error).__name__}: {error}",
+                    fallback_source="baostock_daily_status",
+                )
+                try:
+                    secondary_source = source_stack.enter_context(
+                        BaostockHistorySource(timeout_seconds=25, attempts=2)
+                    )
+                    _progress(
+                        "daily_status_source_ready",
+                        source="baostock_daily_status",
+                    )
+                except Exception as fallback_error:
+                    _progress(
+                        "daily_status_source_unavailable",
+                        unavailable_source="baostock_daily_status",
+                        error=f"{type(fallback_error).__name__}: {fallback_error}",
+                        trading_policy="missing_status_blocks_buy_and_sell",
+                    )
+        verification_pending = bool(
+            set(selected_fetch_symbols) & set(plan.verification_symbols)
+        )
+        if verification_pending:
+            verification_fallback_source = secondary_source
+            if verification_fallback_source is None:
+                try:
+                    verification_fallback_source = source_stack.enter_context(
+                        BaostockHistorySource(timeout_seconds=25, attempts=1)
+                    )
+                    _progress(
+                        "daily_verification_fallback_ready",
+                        source="baostock_daily_bar",
+                        policy="used_only_after_non_primary_public_sources_fail",
+                    )
+                except Exception as fallback_error:
+                    _progress(
+                        "daily_verification_fallback_unavailable",
+                        unavailable_source="baostock_daily_bar",
+                        error=f"{type(fallback_error).__name__}: {fallback_error}",
+                        verification_policy="missing_verification_fails_closed",
+                    )
+        for position, symbol in enumerate(selected_fetch_symbols, start=1):
             final_error: Exception | str | None = None
             for attempt in range(1, symbol_attempts + 1):
                 try:
@@ -439,7 +877,12 @@ def run(
                         evidence, reported, status, error = capture_symbol(
                             plan=plan, symbol=symbol, primary_source=primary_source,
                             verification_source=verification_source, secondary_source=secondary_source,
-                            previous_states=previous_states, ipo_dates=ipo_dates,
+                            verification_fallback_source=verification_fallback_source,
+                            fallback_suspended_symbols=fallback_suspended_symbols,
+                            fallback_status_available=fallback_status_available,
+                            previous_states=previous_states,
+                            fallback_previous_states=fallback_previous_states,
+                            ipo_dates=ipo_dates,
                             calendar_dates=primary_calendar.open_dates,
                         )
                     final_error = error
@@ -478,6 +921,11 @@ def run(
                         failed_connection,
                         _checkpoint_evidence(
                             primary=None, fact=None, verification=None, adjusted=None, events=[],
+                            status_source=(
+                                "baostock_daily_status" if secondary_source is not None
+                                else EastmoneySuspensionSource.name if fallback_status_available
+                                else None
+                            ),
                         ),
                         dataset_id=dataset_id, symbol=symbol, target_session=target,
                         verification_required=symbol in set(plan.verification_symbols),
@@ -487,8 +935,18 @@ def run(
                     failed_connection.close()
             _progress(
                 "daily_symbol_completed", symbol=symbol, completed=position,
-                total=len(plan.fetch_symbols),
+                total=len(selected_fetch_symbols), shard_index=shard_index,
             )
+
+    if defer_finalize:
+        result = {
+            "event": "daily_shard_capture_completed", "dataset_id": dataset_id,
+            "target_session": target.isoformat(), "shard_index": shard_index,
+            "shard_count": shard_count, "attempted_symbols": len(selected_fetch_symbols),
+            "simulation_orders_allowed": False,
+        }
+        _progress(**result)
+        return result
 
     connection = connect(config)
     try:
@@ -500,7 +958,12 @@ def run(
     verification_rows = [_daily_bar_from_canonical(row) for row in stored.verification_bars]
     adjusted_rows = [_historical_bar_from_canonical(row) for row in stored.adjusted_bars]
     event_rows = [_event_from_canonical(row) for row in stored.adjustments]
+    lineage_rows = sorted(
+        (canonical_lineage_evidence(row) for row in stored.lineage_evidence),
+        key=lambda row: (row["symbol"], row["kind"]),
+    )
     reported_closes = metadata["reported_previous_closes"]
+    factor_references = _factor_reference_closes(lineage_rows)
     accepted_closes = {
         symbol: state.raw_close for symbol, state in previous_states.items()
         if symbol in plan.membership
@@ -521,8 +984,21 @@ def run(
         adjustment_events=event_rows, previous_adjusted_states=previous_states,
         accepted_previous_closes=accepted_closes,
         reported_previous_closes=reported_closes,
+        factor_reference_closes=factor_references,
+        lineage_evidence=lineage_rows,
         primary_failures=primary_failures, verification_failures=verification_failures,
     )
+    status_source_counts: dict[str, int] = {}
+    for source in metadata["status_sources"].values():
+        status_source_counts[source] = status_source_counts.get(source, 0) + 1
+    previous_close_source_counts: dict[str, int] = {}
+    for source in metadata["reported_previous_close_sources"].values():
+        previous_close_source_counts[source] = previous_close_source_counts.get(source, 0) + 1
+    manifest["status_source_counts"] = dict(sorted(status_source_counts.items()))
+    manifest["reported_previous_close_source_counts"] = dict(sorted(previous_close_source_counts.items()))
+    manifest["recovered_checkpoint_count"] = len(metadata["checkpoint_origin_dataset_ids"])
+    manifest["lineage_evidence_count"] = len(lineage_rows)
+    manifest["lineage_evidence_sha256"] = sha256(lineage_rows)
     manifest.update({
         "dataset_id": dataset_id,
         "base_history_dataset_id": base_history_dataset_id,
@@ -534,9 +1010,14 @@ def run(
         "checkpoint_succeeded_symbol_count": len(metadata["succeeded_symbols"]),
         "checkpoint_blocked_symbol_count": len(metadata["blocked_symbols"]),
     })
+    if supersedes_dataset_id is not None:
+        manifest.update({
+            "supersedes_dataset_id": supersedes_dataset_id,
+            "correction_reason": "corporate_action_inventory_false_green",
+        })
     write_outputs(
         output_dir, manifest, primary_rows, fact_rows, verification_rows,
-        adjusted_rows, event_rows,
+        adjusted_rows, event_rows, lineage_rows, corporate_action_rows,
     )
     if not manifest["accepted"]:
         failed = [gate for gate in manifest["gates"] if gate["critical"] and not gate["passed"]]
@@ -553,6 +1034,7 @@ def run(
         verification_bars=[row.canonical() for row in verification_rows],
         adjusted_bars=[row.canonical() for row in adjusted_rows],
         adjustments=[row.canonical() for row in event_rows],
+        lineage_evidence=lineage_rows,
     )
     connection = connect(config)
     try:
@@ -560,6 +1042,11 @@ def run(
             connection, publication, dataset_id=dataset_id,
             base_history_dataset_id=base_history_dataset_id,
             predecessor_dataset_id=predecessor_dataset_id,
+            supersedes_dataset_id=supersedes_dataset_id,
+            correction_reason=(
+                "corporate_action_inventory_false_green"
+                if supersedes_dataset_id is not None else None
+            ),
         )
     finally:
         connection.close()
@@ -578,14 +1065,24 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("daily-market-increment"))
     parser.add_argument("--init-schema", action="store_true")
     parser.add_argument("--symbol-attempts", type=int, default=2)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--defer-finalize", action="store_true")
+    parser.add_argument("--finalize-only", action="store_true")
+    parser.add_argument("--supersedes-dataset-id")
     args = parser.parse_args()
     observed_at = args.observed_at or datetime.now(SHANGHAI)
     result = run(
         observed_at=observed_at, base_history_dataset_id=args.base_history_dataset_id,
         output_dir=args.output_dir, requested_target=args.target_session,
         initialize_schema=args.init_schema, symbol_attempts=args.symbol_attempts,
+        shard_index=args.shard_index, shard_count=args.shard_count,
+        defer_finalize=args.defer_finalize, finalize_only=args.finalize_only,
+        supersedes_dataset_id=args.supersedes_dataset_id,
     )
-    return 0 if result.get("accepted", result.get("event") == "daily_noop") else 2
+    return 0 if result.get(
+        "accepted", result.get("event") in {"daily_noop", "daily_shard_capture_completed"}
+    ) else 2
 
 
 if __name__ == "__main__":
