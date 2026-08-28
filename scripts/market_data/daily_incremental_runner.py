@@ -19,12 +19,13 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from scripts.market_data.contracts import DailyBar, parse_date
 from scripts.market_data.daily_adjustments import (
     PreviousAdjustedState,
+    RQALPHA_DEFERRED_CASH_ACTION_SOURCE,
     build_daily_adjusted_bars,
     has_price_break,
 )
@@ -320,6 +321,68 @@ def _factor_reference_closes(
     return references
 
 
+def _verified_cash_dividend_lineage(
+    *,
+    symbol: str,
+    previous_session: date,
+    target_session: date,
+    accepted_previous_close: Decimal,
+    reported_previous_close: Decimal,
+    action_details: Mapping[str, Any],
+    corporate_action_record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build cash lineage after exact point-in-time source reconciliation."""
+    details = dict(action_details)
+    if parse_date(details.get("previous_session")) != previous_session:
+        raise RuntimeError(f"Tencent previous session does not match for {symbol}")
+    if parse_date(details.get("registration_date")) != previous_session:
+        raise RuntimeError(f"Tencent registration date does not match for {symbol}")
+    if parse_date(details.get("ex_rights_date")) != target_session:
+        raise RuntimeError(f"Tencent ex-rights date does not match for {symbol}")
+    if Decimal(str(details.get("accepted_previous_close"))) != accepted_previous_close:
+        raise RuntimeError(f"Tencent accepted previous close does not match for {symbol}")
+    if Decimal(str(details.get("derived_previous_close"))) != reported_previous_close:
+        raise RuntimeError(f"Tencent derived previous close does not match for {symbol}")
+
+    if corporate_action_record is not None:
+        record_symbol = str(corporate_action_record.get("symbol", ""))
+        if record_symbol != symbol:
+            raise RuntimeError(
+                f"Eastmoney corporate-action symbol does not match for {symbol}: {record_symbol!r}"
+            )
+        if parse_date(corporate_action_record.get("ex_dividend_date")) != target_session:
+            raise RuntimeError(f"Eastmoney ex-dividend date does not match for {symbol}")
+        if parse_date(corporate_action_record.get("equity_record_date")) != previous_session:
+            raise RuntimeError(f"Eastmoney equity-record date does not match for {symbol}")
+        cash_value = corporate_action_record.get("cash_per_ten_shares")
+        if cash_value is None or Decimal(str(cash_value)) <= 0:
+            raise RuntimeError(f"Eastmoney pure-cash dividend is missing or nonpositive for {symbol}")
+        cash_per_ten = Decimal(str(cash_value))
+        for field in ("bonus_ratio", "conversion_ratio"):
+            value = corporate_action_record.get(field)
+            if value is not None and Decimal(str(value)) != 0:
+                raise RuntimeError(
+                    f"Eastmoney corporate action is not pure cash for {symbol}: {field}={value}"
+                )
+        tencent_cash = Decimal(str(details.get("cash_per_ten_shares")))
+        if tencent_cash != cash_per_ten:
+            raise RuntimeError(
+                f"Eastmoney/Tencent cash dividend disagrees for {symbol}: "
+                f"eastmoney={cash_per_ten} tencent={tencent_cash}"
+            )
+        canonical_record = dict(corporate_action_record)
+        details["eastmoney_inventory_record"] = canonical_record
+        details["eastmoney_inventory_record_sha256"] = sha256(canonical_record)
+
+    return canonical_lineage_evidence({
+        "symbol": symbol,
+        "target_session": target_session.isoformat(),
+        "kind": "cash_dividend_reference",
+        "source": "tencent_archive",
+        "details": details,
+    })
+
+
 def capture_symbol(
     *,
     plan: DailyIncrementalPlan,
@@ -334,6 +397,7 @@ def capture_symbol(
     fallback_previous_states: dict[str, PreviousAdjustedState] | None = None,
     ipo_dates: dict[str, date],
     calendar_dates: tuple[date, ...],
+    corporate_action_record: Mapping[str, Any] | None = None,
 ) -> tuple[DailyEvidence, Decimal | None, str, Exception | None]:
     """Capture one symbol and classify its resumable checkpoint state."""
     target = plan.target_session
@@ -480,6 +544,7 @@ def capture_symbol(
         raise RuntimeError(f"positive reported previous close missing for {symbol}")
     try:
         corporate_action_candidate = symbol in set(plan.corporate_action_symbols)
+        structured_cash_reference_captured = False
         if corporate_action_candidate or has_price_break(state.raw_close, reported) or previous_close_source in {
             "akshare_sina_exact_predecessor_close",
             "tencent_exact_predecessor_close",
@@ -487,17 +552,50 @@ def capture_symbol(
             try:
                 events = _target_events(primary_source, symbol, target)
             except RuntimeError as factor_error:
-                if (
+                missing_sina_factors = str(factor_error).startswith("AKShare Sina returned no ")
+                if corporate_action_candidate and missing_sina_factors:
+                    if corporate_action_record is None:
+                        raise RuntimeError(
+                            f"corporate-action inventory record missing for {symbol}"
+                        ) from factor_error
+                    reported, action_details = TencentHistorySource(
+                        timeout_seconds=primary_source.timeout_seconds,
+                        attempts=min(primary_source.attempts, 2),
+                    ).fetch_cash_dividend_reference(
+                        symbol, plan.previous_session, target, state.raw_close,
+                    )
+                    lineage_evidence.append(_verified_cash_dividend_lineage(
+                        symbol=symbol,
+                        previous_session=plan.previous_session,
+                        target_session=target,
+                        accepted_previous_close=state.raw_close,
+                        reported_previous_close=reported,
+                        action_details=action_details,
+                        corporate_action_record=corporate_action_record,
+                    ))
+                    events = [AdjustmentEvent(
+                        symbol=symbol,
+                        effective_date=target,
+                        qfq_factor=state.qfq_factor,
+                        hfq_factor=state.hfq_factor,
+                        source=RQALPHA_DEFERRED_CASH_ACTION_SOURCE,
+                    )]
+                    previous_close_source = "tencent_structured_cash_dividend"
+                    structured_cash_reference_captured = True
+                    if secondary is not None:
+                        secondary["preclose"] = format(reported, "f")
+                elif (
                     corporate_action_candidate
                     or primary_source_name not in {"akshare_sina", "tencent_archive"}
-                    or not str(factor_error).startswith("AKShare Sina returned no ")
+                    or not missing_sina_factors
                 ):
                     raise
-                continuity_source = TencentHistorySource(
-                    timeout_seconds=primary_source.timeout_seconds,
-                    attempts=min(primary_source.attempts, 2),
-                ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
-                previous_close_source = f"{previous_close_source}+{continuity_source}"
+                else:
+                    continuity_source = TencentHistorySource(
+                        timeout_seconds=primary_source.timeout_seconds,
+                        attempts=min(primary_source.attempts, 2),
+                    ).verify_no_adjustment_continuity(symbol, plan.previous_session, target)
+                    previous_close_source = f"{previous_close_source}+{continuity_source}"
             if corporate_action_candidate and not events:
                 raise RuntimeError(f"corporate-action candidate has no target factor event for {symbol}")
             if events and (
@@ -506,7 +604,7 @@ def capture_symbol(
                     "akshare_sina_exact_predecessor_close",
                     "tencent_exact_predecessor_close",
                 }
-            ):
+            ) and not structured_cash_reference_captured:
                 reported, action_details = TencentHistorySource(
                     timeout_seconds=primary_source.timeout_seconds,
                     attempts=min(primary_source.attempts, 2),
@@ -514,13 +612,17 @@ def capture_symbol(
                     symbol, plan.previous_session, target, state.raw_close,
                 )
                 previous_close_source = "tencent_structured_cash_dividend"
-                lineage_evidence.append(canonical_lineage_evidence({
-                    "symbol": symbol,
-                    "target_session": target.isoformat(),
-                    "kind": "cash_dividend_reference",
-                    "source": "tencent_archive",
-                    "details": action_details,
-                }))
+                lineage_evidence.append(_verified_cash_dividend_lineage(
+                    symbol=symbol,
+                    previous_session=plan.previous_session,
+                    target_session=target,
+                    accepted_previous_close=state.raw_close,
+                    reported_previous_close=reported,
+                    action_details=action_details,
+                    corporate_action_record=(
+                        corporate_action_record if corporate_action_candidate else None
+                    ),
+                ))
                 if secondary is not None:
                     secondary["preclose"] = format(reported, "f")
         factor_references = _factor_reference_closes(lineage_evidence)
@@ -812,6 +914,9 @@ def run(
     )
 
     all_scope_symbols = list(daily_membership_symbols(plan.expected_membership))
+    corporate_action_by_symbol = {
+        str(record["symbol"]): record for record in corporate_action_rows
+    }
     assigned_symbols = set(all_scope_symbols[shard_index::shard_count])
     selected_fetch_symbols = list(select_daily_shard_symbols(
         all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
@@ -916,6 +1021,7 @@ def run(
                             fallback_previous_states=fallback_previous_states,
                             ipo_dates=ipo_dates,
                             calendar_dates=primary_calendar.open_dates,
+                            corporate_action_record=corporate_action_by_symbol.get(symbol),
                         )
                     final_error = error
                     if status == "blocked" and attempt < symbol_attempts:

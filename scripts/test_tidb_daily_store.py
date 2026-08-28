@@ -122,6 +122,27 @@ def previous_state() -> PreviousAdjustedState:
     )
 
 
+def corporate_action_record(
+    symbol: str = "000001",
+    *,
+    cash_per_ten: str = "5.000000",
+    bonus_ratio: str | None = None,
+    conversion_ratio: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "ex_dividend_date": TARGET.isoformat(),
+        "equity_record_date": PREVIOUS.isoformat(),
+        "report_date": "2025-12-31",
+        "notice_date": "2026-07-20",
+        "assign_progress": "实施方案",
+        "cash_per_ten_shares": cash_per_ten,
+        "bonus_ratio": bonus_ratio,
+        "conversion_ratio": conversion_ratio,
+        "plan_profile": f"10派{Decimal(cash_per_ten)}元",
+    }
+
+
 def complete_evidence() -> DailyEvidence:
     primary = raw_bar()
     state = previous_state()
@@ -1087,6 +1108,9 @@ class DailyCaptureTests(unittest.TestCase):
                 },
                 ipo_dates={symbol: date(2007, 12, 26)},
                 calendar_dates=(PREVIOUS, TARGET),
+                corporate_action_record=corporate_action_record(
+                    symbol, cash_per_ten="0.150000",
+                ),
             )
         self.assertEqual((reported, status, error), (Decimal("2.4600"), "succeeded", None))
         self.assertEqual(evidence.adjusted_bars[0]["previous_close"], "2.4600")
@@ -1130,6 +1154,7 @@ class DailyCaptureTests(unittest.TestCase):
                 previous_states={"000001": previous_state()},
                 ipo_dates={"000001": date(1991, 4, 3)},
                 calendar_dates=(PREVIOUS, TARGET),
+                corporate_action_record=corporate_action_record(),
             )
         self.assertEqual((reported, status, error), (Decimal("9.5000"), "succeeded", None))
         structured_action.assert_called_once()
@@ -1143,12 +1168,139 @@ class DailyCaptureTests(unittest.TestCase):
             previous_states={"000001": previous_state()},
             ipo_dates={"000001": date(1991, 4, 3)},
             calendar_dates=(PREVIOUS, TARGET),
+            corporate_action_record=corporate_action_record(),
         )
         self.assertEqual(status, "blocked")
         self.assertIn("no target factor event", str(error))
         self.assertEqual(len(blocked.primary_bars), 1)
         self.assertNotIn("missing_primary_bar", blocked.tradeability[0]["block_reasons"])
         self.assertEqual(blocked.adjusted_bars, [])
+
+    def test_candidate_missing_sina_factors_uses_verified_pure_cash_deferred_event(self) -> None:
+        candidate_plan = replace(
+            plan(),
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="f" * 64,
+            corporate_action_symbols=("000001",),
+        )
+        details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "10",
+            "cash_per_ten_shares": "5.000000",
+            "factor_reference_close": "9.500000",
+            "derived_previous_close": "9.5000",
+            "action_content": "10派5元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        capture_kwargs = {
+            "plan": candidate_plan,
+            "symbol": "000001",
+            "primary_source": FakeSinaPrimary(),
+            "verification_source": FakeVerification(),
+            "secondary_source": None,
+            "fallback_suspended_symbols": frozenset(),
+            "fallback_status_available": True,
+            "previous_states": {"000001": previous_state()},
+            "ipo_dates": {"000001": date(1991, 4, 3)},
+            "calendar_dates": (PREVIOUS, TARGET),
+            "corporate_action_record": corporate_action_record(),
+        }
+        with patch.object(
+            TencentHistorySource,
+            "fetch_cash_dividend_reference",
+            return_value=(Decimal("9.5000"), details),
+        ):
+            first = capture_symbol(**capture_kwargs)
+            second = capture_symbol(**capture_kwargs)
+
+        evidence, reported, status, error = first
+        self.assertEqual((reported, status, error), (Decimal("9.5000"), "succeeded", None))
+        self.assertEqual(first, second)
+        self.assertEqual(
+            evidence.adjusted_bars[0]["factor_source"],
+            "rqalpha_deferred_cash_action",
+        )
+        self.assertEqual(evidence.adjusted_bars[0]["qfq_factor"], "1")
+        self.assertEqual(evidence.adjusted_bars[0]["hfq_factor"], "1")
+        self.assertEqual(
+            evidence.adjustments[0]["source"],
+            "rqalpha_deferred_cash_action",
+        )
+        lineage = evidence.lineage_evidence[0]
+        self.assertEqual(lineage["kind"], "cash_dividend_reference")
+        self.assertEqual(
+            lineage["details"]["eastmoney_inventory_record"]["symbol"],
+            "000001",
+        )
+        self.assertEqual(
+            len(lineage["details"]["eastmoney_inventory_record_sha256"]), 64,
+        )
+
+    def test_candidate_missing_factors_blocks_conflicting_or_unsupported_actions(self) -> None:
+        candidate_plan = replace(
+            plan(),
+            corporate_action_inventory_count=1,
+            corporate_action_inventory_sha256="f" * 64,
+            corporate_action_symbols=("000001",),
+        )
+        base_details = {
+            "previous_session": PREVIOUS.isoformat(),
+            "registration_date": PREVIOUS.isoformat(),
+            "ex_rights_date": TARGET.isoformat(),
+            "accepted_previous_close": "10",
+            "cash_per_ten_shares": "4.000000",
+            "factor_reference_close": "9.600000",
+            "derived_previous_close": "9.6000",
+            "action_content": "10派4元",
+            "vendor_action_sha256": "a" * 64,
+        }
+        kwargs = {
+            "plan": candidate_plan,
+            "symbol": "000001",
+            "primary_source": FakeSinaPrimary(),
+            "verification_source": FakeVerification(),
+            "secondary_source": None,
+            "fallback_suspended_symbols": frozenset(),
+            "fallback_status_available": True,
+            "previous_states": {"000001": previous_state()},
+            "ipo_dates": {"000001": date(1991, 4, 3)},
+            "calendar_dates": (PREVIOUS, TARGET),
+        }
+        scenarios = (
+            (corporate_action_record(), base_details, "cash dividend disagrees"),
+            (
+                corporate_action_record(),
+                {**base_details, "cash_per_ten_shares": "5.000000", "registration_date": "2026-07-23"},
+                "registration date does not match",
+            ),
+            (
+                corporate_action_record(bonus_ratio="1.000000"),
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "not pure cash",
+            ),
+        )
+        for inventory_record, details, message in scenarios:
+            with self.subTest(message=message), patch.object(
+                TencentHistorySource,
+                "fetch_cash_dividend_reference",
+                return_value=(Decimal(str(details["derived_previous_close"])), details),
+            ):
+                evidence, _reported, status, error = capture_symbol(
+                    **kwargs, corporate_action_record=inventory_record,
+                )
+            self.assertEqual(status, "blocked")
+            self.assertIn(message, str(error))
+            self.assertEqual(len(evidence.primary_bars), 1)
+            self.assertEqual(len(evidence.tradeability), 1)
+            self.assertEqual(evidence.adjusted_bars, [])
+            self.assertFalse(evidence.tradeability[0]["can_buy"])
+            self.assertFalse(evidence.tradeability[0]["can_sell"])
+            self.assertIn(
+                "invalid_adjustment_continuity",
+                evidence.tradeability[0]["block_reasons"],
+            )
 
     def test_baostock_is_last_resort_independent_verification_only(self) -> None:
         evidence, reported, status, error = capture_symbol(
