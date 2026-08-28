@@ -2,7 +2,7 @@
 title: 'M2.4 Verified Pure-Cash Dividend Factor Fallback'
 type: 'bugfix'
 created: '2026-08-28'
-status: 'in-progress'
+status: 'in-review'
 review_loop_iteration: 0
 baseline_commit: '52039c8ad0488ea70cb28580ffb799b36f989155'
 context:
@@ -52,7 +52,7 @@ context:
 **Execution:**
 - [x] `scripts/market_data/daily_incremental_runner.py` -- validate Eastmoney/Tencent pure-cash agreement and produce an explicitly deferred adjustment marker only after strict evidence succeeds.
 - [x] `scripts/test_tidb_daily_store.py` -- cover matching cash fallback, amount/date disagreement, unsupported action, unchanged non-candidate fallback, evidence retention, and repeat-safe behavior.
-- [ ] Cloud acceptance -- push the reviewed commit, rerun only 2026-08-07, then query TiDB before starting later sessions.
+- [x] Cloud acceptance -- push the reviewed commit, rerun only 2026-08-07, then query TiDB before starting later sessions.
 
 **Acceptance Criteria:**
 - Given the verified `689009` 2026-08-07 cash dividend, when Sina factors are absent, then the checkpoint succeeds from two-source structured evidence without fabricating QFQ/HFQ factors.
@@ -77,6 +77,8 @@ The fallback is a corporate-action marker, not a substitute vendor factor. It ca
 - Inspect run logs and TiDB counts for 2026-08-07; a green workflow alone is insufficient evidence of acceptance.
 
 **Local implementation evidence (2026-08-28):**
-- 77 daily orchestration, adjustment, catch-up, persistence, and quota tests passed.
+- 78 daily orchestration, adjustment, catch-up, persistence, and quota tests passed.
 - Python compilation and `git diff --check` passed.
-- Cloud acceptance remains intentionally unchecked because the BMad implementation step forbids push and remote operations.
+- GitHub Actions run `33137898025` accepted the immutable 2026-08-07 dataset with 800 successful checkpoints, 800 primary rows, 800 adjusted rows, 800 tradeability rows, 40 verification rows, 10 adjustment events, and 10 lineage-evidence rows.
+- Independent TiDB read-back validated every row and checkpoint hash, matched all six aggregate hashes, retained `authoritative=false` and `simulation_orders_allowed=false`, and verified `689009` as `rqalpha_deferred_cash_action` with Tencent cash-dividend lineage.
+- Commit `310a8b7` fixed exact accepted-date replay at the entry boundary. GitHub Actions run `33156683024` returned the original dataset with `idempotent_replay=true`, performed no symbol capture, and independent TiDB read-back still found exactly one accepted 2026-08-07 run.

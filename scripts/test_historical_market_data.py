@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import unittest
 from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.market_data.calendar_contracts import TradingCalendar
@@ -14,7 +16,11 @@ from scripts.market_data.adjustment_engine import build_adjusted_series_from_fac
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar, SecurityReference
 from scripts.market_data.historical_bars import SymbolDeadlineInterrupt, build_plan, bounded_symbols, current_universe_from_canonical, enrich_repair_plan, fetch_bundle_from_live_or_archive, fetch_primary, frozen_archive_source, history_stagger_seconds, load_calendars, run, shard_symbols, verification_symbols
 from scripts.market_data.manifest import sha256
-from scripts.market_data.sources.akshare_history_source import AkshareEastmoneyHistorySource, AkshareHistorySource
+from scripts.market_data.sources.akshare_history_source import (
+    AkshareEastmoneyHistorySource,
+    AkshareHistorySource,
+    SinaFactorsUnavailableError,
+)
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.frozen_archive_history_source import (
     ARCHIVE_BUSINESS_END,
@@ -89,6 +95,50 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(source_name, "akshare_sina")
         self.assertEqual(reported, Decimal("10.00"))
         self.assertEqual(reference_source, "akshare_sina_exact_predecessor_close")
+
+    def test_sina_factor_absence_requires_both_series_and_no_provider_error(self) -> None:
+        test_case = self
+
+        class Frame:
+            empty = False
+
+            def __init__(self, adjust: str) -> None:
+                self.adjust = adjust
+
+            def to_dict(self, *, orient: str):
+                test_case.assertEqual(orient, "records")
+                field = "qfq_factor" if self.adjust == "qfq-factor" else "hfq_factor"
+                return [{"date": "2026-07-27", field: "1.000000"}]
+
+        source = AkshareEastmoneyHistorySource(attempts=1)
+
+        def both_absent(**kwargs):
+            raise ValueError(f"sina {kwargs['adjust'].split('-')[0]} factor not available")
+
+        with patch.dict(sys.modules, {"akshare": SimpleNamespace(stock_zh_a_daily=both_absent)}):
+            with self.assertRaisesRegex(SinaFactorsUnavailableError, "both factor series"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
+
+        def partial(**kwargs):
+            if kwargs["adjust"] == "qfq-factor":
+                raise ValueError("sina qfq factor not available")
+            return Frame(kwargs["adjust"])
+
+        with patch.dict(sys.modules, {"akshare": SimpleNamespace(stock_zh_a_daily=partial)}):
+            with self.assertRaisesRegex(RuntimeError, "partial factor availability"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
+
+        def provider_failure(**kwargs):
+            if kwargs["adjust"] == "qfq-factor":
+                raise ConnectionError("provider offline")
+            raise ValueError("sina hfq factor not available")
+
+        with patch.dict(
+            sys.modules,
+            {"akshare": SimpleNamespace(stock_zh_a_daily=provider_failure)},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "request failed.*provider offline"):
+                source.fetch_sina_adjustments("000001", date(2026, 7, 27))
 
     def test_frozen_archive_is_bounded_dual_source_and_hash_verified(self) -> None:
         source = FrozenArchiveHistorySource()

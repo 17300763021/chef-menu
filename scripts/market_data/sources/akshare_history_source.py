@@ -30,6 +30,18 @@ from scripts.market_data.contracts import (
 from scripts.market_data.historical_contracts import AdjustmentEvent, SecurityReference
 
 
+class SinaFactorsUnavailableError(RuntimeError):
+    """Both Sina QFQ and HFQ factor series are confirmed unavailable."""
+
+
+def _confirmed_sina_factor_absence(error: Exception) -> bool:
+    """Recognize only AKShare's explicit factor-unavailable signal."""
+    return isinstance(error, ValueError) and str(error).strip().lower() in {
+        "sina qfq factor not available",
+        "sina hfq factor not available",
+    }
+
+
 class AkshareHistorySource:
     name = "akshare_sina"
 
@@ -249,8 +261,8 @@ class AkshareEastmoneyHistorySource:
         prefix = "sh" if exchange_for_symbol(code) == "SSE" else "sz"
 
         def factor_frame(adjust: str):
-            frame = None
-            last_error: Exception | None = None
+            confirmed_absence = False
+            operational_errors: list[Exception] = []
             for attempt in range(1, self.attempts + 1):
                 try:
                     frame = ak.stock_zh_a_daily(
@@ -261,20 +273,53 @@ class AkshareEastmoneyHistorySource:
                     )
                     if frame is not None and not frame.empty:
                         return frame
+                    confirmed_absence = True
                 except Exception as error:
-                    last_error = error
+                    if _confirmed_sina_factor_absence(error):
+                        confirmed_absence = True
+                    else:
+                        operational_errors.append(error)
                 if attempt < self.attempts:
                     time.sleep(2 ** (attempt - 1))
-            suffix = f": {last_error}" if last_error else ""
-            raise RuntimeError(f"AKShare Sina returned no {adjust} rows for {code}{suffix}")
+            if operational_errors:
+                details = "; ".join(
+                    f"{type(error).__name__}: {error}" for error in operational_errors
+                )
+                raise RuntimeError(
+                    f"AKShare Sina {adjust} request failed for {code}: {details}"
+                ) from operational_errors[-1]
+            if confirmed_absence:
+                return None
+            raise RuntimeError(f"AKShare Sina {adjust} returned an indeterminate result for {code}")
+
+        frames: dict[str, object | None] = {}
+        failures: list[str] = []
+        for adjust in ("qfq-factor", "hfq-factor"):
+            try:
+                frames[adjust] = factor_frame(adjust)
+            except RuntimeError as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        qfq_frame = frames["qfq-factor"]
+        hfq_frame = frames["hfq-factor"]
+        if qfq_frame is None and hfq_frame is None:
+            raise SinaFactorsUnavailableError(
+                f"AKShare Sina confirmed both factor series unavailable for {code}"
+            )
+        if qfq_frame is None or hfq_frame is None:
+            missing = "qfq-factor" if qfq_frame is None else "hfq-factor"
+            raise RuntimeError(
+                f"AKShare Sina returned partial factor availability for {code}: missing {missing}"
+            )
 
         qfq_rows = {
             parse_date(row.get("date")): decimal_value(row.get("qfq_factor"), "qfq_factor", Decimal("0.000001"))
-            for row in factor_frame("qfq-factor").to_dict(orient="records")
+            for row in qfq_frame.to_dict(orient="records")
         }
         hfq_rows = {
             parse_date(row.get("date")): decimal_value(row.get("hfq_factor"), "hfq_factor", Decimal("0.000001"))
-            for row in factor_frame("hfq-factor").to_dict(orient="records")
+            for row in hfq_frame.to_dict(orient="records")
         }
         events: list[AdjustmentEvent] = []
         for effective_date in sorted(set(qfq_rows) & set(hfq_rows)):

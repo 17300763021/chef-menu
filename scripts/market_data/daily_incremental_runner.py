@@ -45,6 +45,7 @@ from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.akshare_history_source import (
     AkshareEastmoneyHistorySource,
     AkshareHistorySource,
+    SinaFactorsUnavailableError,
 )
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
@@ -551,8 +552,8 @@ def capture_symbol(
         }:
             try:
                 events = _target_events(primary_source, symbol, target)
-            except RuntimeError as factor_error:
-                missing_sina_factors = str(factor_error).startswith("AKShare Sina returned no ")
+            except SinaFactorsUnavailableError as factor_error:
+                missing_sina_factors = True
                 if corporate_action_candidate and missing_sina_factors:
                     if corporate_action_record is None:
                         raise RuntimeError(
@@ -718,9 +719,15 @@ def _accepted_replay_result(
     latest_accepted: date,
     accepted_dataset_id: str,
     requested: date | None,
+    *,
+    base_history_dataset_id: str,
 ) -> dict[str, Any] | None:
     """Return the existing immutable result for an exact accepted-date replay."""
-    if requested is None or requested != latest_accepted:
+    if (
+        requested is None
+        or requested != latest_accepted
+        or accepted_dataset_id == base_history_dataset_id
+    ):
         return None
     return {
         "event": "daily_accepted",
@@ -819,7 +826,10 @@ def run(
     replay = None
     if supersedes_dataset_id is None:
         replay = _accepted_replay_result(
-            latest_accepted, predecessor_dataset_id, requested_target,
+            latest_accepted,
+            predecessor_dataset_id,
+            requested_target,
+            base_history_dataset_id=base_history_dataset_id,
         )
     if replay is not None:
         _progress_result(replay)

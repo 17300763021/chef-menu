@@ -271,7 +271,9 @@ def evaluate_daily_adjustments(
             lineage_errors.append(f"{raw.symbol}:missing_predecessor")
             continue
         price_break = has_price_break(state.raw_close, reported)
-        if price_break != (event is not None):
+        if price_break and event is None:
+            lineage_errors.append(f"{raw.symbol}:event_presence")
+        elif event is not None and not price_break and raw.symbol not in factor_references:
             lineage_errors.append(f"{raw.symbol}:event_presence")
         elif event is None and (
             adjusted.qfq_factor != state.qfq_factor

@@ -563,6 +563,50 @@ class DailyIncrementalTests(unittest.TestCase):
                 factor_reference_closes={symbol: Decimal("2.440000")},
             )
 
+    def test_tiny_cash_dividend_survives_price_rounding_without_hiding_event(self) -> None:
+        symbol = "000001"
+        primary = [bar("akshare_eastmoney", symbol, "10.10")]
+        state = PreviousAdjustedState(
+            symbol=symbol,
+            business_date=PREVIOUS,
+            raw_close=Decimal("10.0000"),
+            qfq_factor=Decimal("1.000000"),
+            hfq_factor=Decimal("1.000000"),
+            source_dataset_id="accepted-predecessor",
+        )
+        event = AdjustmentEvent(
+            symbol,
+            TARGET,
+            Decimal("1.000000"),
+            Decimal("1.000000"),
+            source="rqalpha_deferred_cash_action",
+        )
+        factor_reference = Decimal("9.999000")
+        adjusted = build_daily_adjusted_bars(
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            membership={symbol: "000300"},
+            primary_bars=primary,
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: Decimal("10.00")},
+            adjustment_events=[event],
+            factor_reference_closes={symbol: factor_reference},
+        )
+        gates = evaluate_daily_adjustments(
+            target_session=TARGET,
+            previous_session=PREVIOUS,
+            membership={symbol: "000300"},
+            primary_bars=primary,
+            adjusted_bars=adjusted,
+            previous_states={symbol: state},
+            reported_previous_closes={symbol: Decimal("10.00")},
+            adjustment_events=[event],
+            factor_reference_closes={symbol: factor_reference},
+        )
+        lineage_gate = next(gate for gate in gates if gate.name == "daily_adjustment_lineage")
+        self.assertTrue(lineage_gate.passed, lineage_gate.details)
+        self.assertEqual(adjusted[0].factor_source, "rqalpha_deferred_cash_action")
+
     def test_exact_cash_evidence_exposes_incomparable_vendor_factor_as_diagnostic(self) -> None:
         symbol = "601727"
         primary = [bar("akshare_eastmoney", symbol, "10.10")]

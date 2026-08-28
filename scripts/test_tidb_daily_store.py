@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ from scripts.market_data.daily_incremental_runner import (
 )
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
+from scripts.market_data.sources.akshare_history_source import SinaFactorsUnavailableError
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
@@ -91,6 +93,9 @@ class FakeConnection:
 
     def rollback(self) -> None:
         self.rollbacks += 1
+
+    def close(self) -> None:
+        return None
 
 
 def raw_bar(symbol: str = "000001", source: str = "akshare_eastmoney") -> DailyBar:
@@ -951,7 +956,12 @@ class TiDBDailyStoreTests(unittest.TestCase):
             _select_target(sessions, PREVIOUS, date(2026, 7, 28), date(2026, 7, 28))
 
     def test_exact_accepted_target_returns_immutable_idempotent_replay(self) -> None:
-        result = _accepted_replay_result(TARGET, "accepted-daily", TARGET)
+        result = _accepted_replay_result(
+            TARGET,
+            "accepted-daily",
+            TARGET,
+            base_history_dataset_id="base-history",
+        )
         self.assertEqual(result, {
             "event": "daily_accepted",
             "dataset_id": "accepted-daily",
@@ -961,8 +971,52 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "authoritative": False,
             "simulation_orders_allowed": False,
         })
-        self.assertIsNone(_accepted_replay_result(TARGET, "accepted-daily", None))
-        self.assertIsNone(_accepted_replay_result(TARGET, "accepted-daily", date(2026, 7, 28)))
+        self.assertIsNone(_accepted_replay_result(
+            TARGET, "accepted-daily", None, base_history_dataset_id="base-history",
+        ))
+        self.assertIsNone(_accepted_replay_result(
+            TARGET,
+            "accepted-daily",
+            date(2026, 7, 28),
+            base_history_dataset_id="base-history",
+        ))
+        self.assertIsNone(_accepted_replay_result(
+            TARGET, "base-history", TARGET, base_history_dataset_id="base-history",
+        ))
+
+    def test_runner_returns_accepted_daily_replay_before_acquisition(self) -> None:
+        calendar = SimpleNamespace(
+            open_dates=(PREVIOUS, TARGET),
+            end_date=date(2026, 7, 28),
+        )
+        connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.daily_incremental_runner.load_calendars",
+                return_value=(calendar, calendar, [], {}),
+            ),
+            patch("scripts.market_data.daily_incremental_runner.accepted", return_value=True),
+            patch("scripts.market_data.daily_incremental_runner.TiDBConfig.from_env"),
+            patch("scripts.market_data.daily_incremental_runner.connect", return_value=connection),
+            patch(
+                "scripts.market_data.daily_incremental_runner.latest_accepted_lineage",
+                return_value=(TARGET, "accepted-daily"),
+            ),
+            patch(
+                "scripts.market_data.daily_incremental_runner.EastmoneyCorporateActionSource",
+                side_effect=AssertionError("accepted replay must not acquire source data"),
+            ) as corporate_source,
+        ):
+            result = run(
+                observed_at=datetime(2026, 7, 28, 17, 0, tzinfo=SHANGHAI),
+                base_history_dataset_id="base-history",
+                output_dir=Path("unused-daily-output"),
+                requested_target=TARGET,
+            )
+
+        self.assertTrue(result["idempotent_replay"])
+        self.assertEqual(result["dataset_id"], "accepted-daily")
+        corporate_source.assert_not_called()
 
 
 class FakePrimary:
@@ -1000,7 +1054,9 @@ class FakeSinaPrimary(FakePrimary):
         )
 
     def fetch_sina_adjustments(self, symbol: str, end: date):
-        raise RuntimeError(f"AKShare Sina returned no qfq-factor rows for {symbol}")
+        raise SinaFactorsUnavailableError(
+            f"AKShare Sina confirmed both factor series unavailable for {symbol}"
+        )
 
 
 class FakeDividendSinaPrimary(FakeSinaPrimary):
@@ -1250,7 +1306,8 @@ class DailyCaptureTests(unittest.TestCase):
             "000001",
         )
         self.assertEqual(
-            len(lineage["details"]["eastmoney_inventory_record_sha256"]), 64,
+            lineage["details"]["eastmoney_inventory_record_sha256"],
+            sha256(lineage["details"]["eastmoney_inventory_record"]),
         )
 
     def test_candidate_missing_factors_blocks_conflicting_or_unsupported_actions(self) -> None:
@@ -1292,6 +1349,31 @@ class DailyCaptureTests(unittest.TestCase):
             ),
             (
                 corporate_action_record(bonus_ratio="1.000000"),
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "not pure cash",
+            ),
+            (
+                corporate_action_record(symbol="600000"),
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "symbol does not match",
+            ),
+            (
+                {**corporate_action_record(), "ex_dividend_date": "2026-07-28"},
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "ex-dividend date does not match",
+            ),
+            (
+                {**corporate_action_record(), "equity_record_date": "2026-07-23"},
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "equity-record date does not match",
+            ),
+            (
+                {**corporate_action_record(), "cash_per_ten_shares": None},
+                {**base_details, "cash_per_ten_shares": "5.000000"},
+                "missing or nonpositive",
+            ),
+            (
+                corporate_action_record(conversion_ratio="1.000000"),
                 {**base_details, "cash_per_ten_shares": "5.000000"},
                 "not pure cash",
             ),
@@ -1470,6 +1552,7 @@ class DailyCaptureTests(unittest.TestCase):
         self.assertIn("unknown_st_status", evidence.tradeability[0]["block_reasons"])
 
     def test_cash_dividend_factor_reference_is_rebuilt_and_tamper_evident(self) -> None:
+        eastmoney_record = corporate_action_record("601866", cash_per_ten="0.150000")
         details = {
             "previous_session": PREVIOUS.isoformat(),
             "registration_date": PREVIOUS.isoformat(),
@@ -1480,6 +1563,8 @@ class DailyCaptureTests(unittest.TestCase):
             "derived_previous_close": "2.4600",
             "action_content": "10派0.15元",
             "vendor_action_sha256": "a" * 64,
+            "eastmoney_inventory_record": eastmoney_record,
+            "eastmoney_inventory_record_sha256": sha256(eastmoney_record),
         }
         lineage = canonical_lineage_evidence({
             "symbol": "601866",
@@ -1496,6 +1581,19 @@ class DailyCaptureTests(unittest.TestCase):
         tampered = {**lineage, "details": {**details, "factor_reference_close": "2.456000"}}
         with self.assertRaisesRegex(ValueError, "does not reconcile"):
             _factor_reference_closes([tampered])
+
+        tampered_eastmoney = {
+            **lineage,
+            "details": {
+                **details,
+                "eastmoney_inventory_record": {
+                    **eastmoney_record,
+                    "cash_per_ten_shares": "0.160000",
+                },
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "Eastmoney evidence hash"):
+            canonical_lineage_evidence(tampered_eastmoney)
 
     def test_missing_exact_predecessor_is_recovered_only_with_gap_evidence(self) -> None:
         prior = date(2026, 7, 23)

@@ -215,6 +215,13 @@ def canonical_lineage_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
         vendor_hash = str(canonical_details.get("vendor_action_sha256", ""))
         if len(vendor_hash) != 64 or any(character not in "0123456789abcdef" for character in vendor_hash):
             raise ValueError("cash-dividend lineage requires a valid vendor action hash")
+        eastmoney_record = canonical_details.get("eastmoney_inventory_record")
+        eastmoney_hash = canonical_details.get("eastmoney_inventory_record_sha256")
+        if eastmoney_record is not None or eastmoney_hash is not None:
+            if not isinstance(eastmoney_record, Mapping) or not isinstance(eastmoney_hash, str):
+                raise ValueError("cash-dividend lineage requires a complete Eastmoney evidence pair")
+            if sha256(dict(eastmoney_record)) != eastmoney_hash:
+                raise ValueError("cash-dividend Eastmoney evidence hash does not reconcile")
     else:
         if source != "tencent_raw_hfq_continuity":
             raise ValueError("gap recovery lineage evidence requires Tencent continuity attribution")
