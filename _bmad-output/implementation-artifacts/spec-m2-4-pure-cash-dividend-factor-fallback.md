@@ -2,8 +2,8 @@
 title: 'M2.4 Verified Pure-Cash Dividend Factor Fallback'
 type: 'bugfix'
 created: '2026-08-28'
-status: 'in-review'
-review_loop_iteration: 0
+status: 'completed'
+review_loop_iteration: 1
 baseline_commit: '52039c8ad0488ea70cb28580ffb799b36f989155'
 context:
   - '{project-root}/AGENTS.md'
@@ -62,6 +62,8 @@ context:
 
 ## Spec Change Log
 
+- 2026-08-28: BMad three-lens review completed. Required repairs replaced string-matched factor absence with an explicit two-series absence contract, prevented a base-history dataset from being reported as a daily replay, verified embedded Eastmoney evidence hashes, and added runner-entry, provider-failure, Eastmoney-boundary, tamper, and tiny-dividend rounding tests. Broader provider, schema, and historical-data changes were rejected as outside this bounded fix.
+
 ## Design Notes
 
 The fallback is a corporate-action marker, not a substitute vendor factor. It carries the accepted predecessor factors and lets the existing exact cash-reference path label the adjusted row `rqalpha_deferred_cash_action`; RQAlpha remains responsible for applying the cash action later. Eastmoney inventory discovery plus Tencent structured details form the two-source admission contract.
@@ -76,9 +78,10 @@ The fallback is a corporate-action marker, not a substitute vendor factor. It ca
 **Manual checks:**
 - Inspect run logs and TiDB counts for 2026-08-07; a green workflow alone is insufficient evidence of acceptance.
 
-**Local implementation evidence (2026-08-28):**
-- 78 daily orchestration, adjustment, catch-up, persistence, and quota tests passed.
+**Final acceptance evidence (2026-08-28):**
+- Commit `d0c2d2f` contains the BMad review repairs. The local acceptance suite passed 81 daily orchestration, adjustment, catch-up, persistence, quota, and structured factor-absence tests.
 - Python compilation and `git diff --check` passed.
 - GitHub Actions run `33137898025` accepted the immutable 2026-08-07 dataset with 800 successful checkpoints, 800 primary rows, 800 adjusted rows, 800 tradeability rows, 40 verification rows, 10 adjustment events, and 10 lineage-evidence rows.
 - Independent TiDB read-back validated every row and checkpoint hash, matched all six aggregate hashes, retained `authoritative=false` and `simulation_orders_allowed=false`, and verified `689009` as `rqalpha_deferred_cash_action` with Tencent cash-dividend lineage.
 - Commit `310a8b7` fixed exact accepted-date replay at the entry boundary. GitHub Actions run `33156683024` returned the original dataset with `idempotent_replay=true`, performed no symbol capture, and independent TiDB read-back still found exactly one accepted 2026-08-07 run.
+- GitHub Actions run `33158362761` passed on hardened commit `d0c2d2f`: all cloud deterministic suites and the fresh quota gate passed, all four shards plus finalization returned the same immutable dataset with `idempotent_replay=true`, and no symbol-capture event occurred. Final independent TiDB read-back found exactly one accepted run, 800 successful checkpoints, zero blocked checkpoints, unchanged manifest SHA-256 `94d7da6b74e0ab22bf0ba8f19a2a15b0e361f3525d7869536bcfae47f4ef89d4`, `authoritative=0`, and `simulation_orders_allowed=0`.
