@@ -25,6 +25,14 @@ on:
         description: "Date both percentages were checked (YYYY-MM-DD, no older than 7 days)"
         required: true
         type: string
+      replay_delisting_evidence_run_id:
+        description: "Optional accepted run id whose frozen official delisting evidence must be reused"
+        required: false
+        type: string
+      replay_delisting_evidence_sha256:
+        description: "Required canonical SHA-256 when replay_delisting_evidence_run_id is supplied"
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
@@ -44,6 +52,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: m2-fundamental-${{ github.event_name }}-${{ inputs.mode || 'tests' }}-${{ inputs.as_of_date || 'current' }}
@@ -105,7 +114,31 @@ jobs:
               stream.write(f"as_of_date={value}\n")
               stream.write("matrix=" + json.dumps({"shard_index": list(range(count)), "shard_count": [count]}, separators=(",", ":")) + "\n")
           PY
+      - name: Validate replay evidence inputs
+        env:
+          REPLAY_RUN_ID: ${{ inputs.replay_delisting_evidence_run_id }}
+          REPLAY_SHA256: ${{ inputs.replay_delisting_evidence_sha256 }}
+        run: |
+          python - <<'PY'
+          import os
+          run_id = os.environ.get("REPLAY_RUN_ID", "").strip()
+          digest = os.environ.get("REPLAY_SHA256", "").strip()
+          if bool(run_id) != bool(digest):
+              raise RuntimeError("replay delisting evidence run id and SHA-256 must be supplied together")
+          if run_id and (not run_id.isdigit() or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest)):
+              raise RuntimeError("invalid replay delisting evidence identity")
+          PY
+      - name: Download pinned official termination-date evidence for replay
+        if: ${{ inputs.replay_delisting_evidence_run_id != '' && inputs.replay_delisting_evidence_sha256 != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: m4-delisting-evidence-${{ inputs.replay_delisting_evidence_run_id }}
+          path: pinned-delisting-evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.replay_delisting_evidence_run_id }}
       - name: Freeze official termination-date evidence once for all shards
+        if: ${{ inputs.replay_delisting_evidence_run_id == '' && inputs.replay_delisting_evidence_sha256 == '' }}
         run: |
           python - <<'PY'
           import json
@@ -116,6 +149,29 @@ jobs:
               "schema_version": "m4-official-delisting-evidence-v1",
               "rows": rows,
           }, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Verify frozen official termination-date evidence
+        env:
+          REPLAY_RUN_ID: ${{ inputs.replay_delisting_evidence_run_id }}
+          REPLAY_SHA256: ${{ inputs.replay_delisting_evidence_sha256 }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from scripts.market_data.manifest import sha256
+          run_id = os.environ.get("REPLAY_RUN_ID", "").strip()
+          source = Path("pinned-delisting-evidence/m4-delisting-evidence.json") if run_id else Path("m4-delisting-evidence.json")
+          payload = json.loads(source.read_text(encoding="utf-8"))
+          if payload.get("schema_version") != "m4-official-delisting-evidence-v1" or not isinstance(payload.get("rows"), list):
+              raise RuntimeError("invalid frozen official delisting evidence")
+          actual = sha256(payload)
+          expected = os.environ.get("REPLAY_SHA256", "").strip()
+          if expected and actual != expected:
+              raise RuntimeError(f"frozen official delisting evidence hash mismatch: expected={expected} actual={actual}")
+          Path("m4-delisting-evidence.json").write_text(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps({"delisting_evidence_sha256": actual, "replay_source_run_id": run_id or None}, sort_keys=True))
           PY
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

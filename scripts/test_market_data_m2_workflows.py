@@ -48,6 +48,16 @@ class M2WorkflowTests(unittest.TestCase):
         self.assertEqual(text.count("TIDB_MARKET_HOST: ${{ secrets.TIDB_HOST }}"), 2)
         self.assertEqual(text.count("TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}"), 2)
 
+    def test_fundamental_replay_requires_pinned_delisting_evidence_identity(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "market-data-fundamental-acceptance.yml").read_text(encoding="utf-8")
+        self.assertIn("replay_delisting_evidence_run_id", text)
+        self.assertIn("replay_delisting_evidence_sha256", text)
+        self.assertIn("run id and SHA-256 must be supplied together", text)
+        self.assertIn("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", text)
+        self.assertIn("run-id: ${{ inputs.replay_delisting_evidence_run_id }}", text)
+        self.assertIn("frozen official delisting evidence hash mismatch", text)
+        self.assertIn("actions: read", text)
+
 
 if __name__ == "__main__":
     unittest.main()
