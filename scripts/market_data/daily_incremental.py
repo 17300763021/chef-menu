@@ -21,7 +21,6 @@ from scripts.market_data.daily_adjustments import PreviousAdjustedState, evaluat
 from scripts.market_data.daily_quality_gates import evaluate_daily_incremental
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
 from scripts.market_data.manifest import sha256
-from scripts.market_data.pit_quality_gates import evaluate_calendars
 from scripts.market_data.quality_gates import GateResult, accepted
 from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
@@ -199,6 +198,56 @@ def _calendar_scope_sha256(calendar: TradingCalendar, target_session: date) -> s
     })
 
 
+def validate_daily_calendar_boundary(
+    primary: TradingCalendar,
+    secondary: TradingCalendar,
+    target_session: date,
+) -> dict[str, Any]:
+    """Require exact dual-source agreement only through the daily target.
+
+    Dates published after the target remain visible as diagnostics. They do not
+    change the target-bounded hashes and cannot block an older sequential day.
+    """
+    primary_dates = set(primary.open_dates)
+    secondary_dates = set(secondary.open_dates)
+    missing_target = [
+        label
+        for label, dates in (("primary", primary_dates), ("secondary", secondary_dates))
+        if target_session not in dates
+    ]
+    if missing_target:
+        raise RuntimeError(
+            f"daily target {target_session.isoformat()} is absent from "
+            f"{','.join(missing_target)} calendar"
+        )
+
+    primary_through = {value for value in primary_dates if value <= target_session}
+    secondary_through = {value for value in secondary_dates if value <= target_session}
+    through_differences = sorted(primary_through ^ secondary_through)
+    if through_differences:
+        dates = ",".join(value.isoformat() for value in through_differences[:20])
+        raise RuntimeError(
+            "daily primary and secondary trading calendars are not aligned "
+            f"through target {target_session.isoformat()}: {dates}"
+        )
+
+    return {
+        "target_session": target_session.isoformat(),
+        "primary_calendar_sha256": _calendar_scope_sha256(primary, target_session),
+        "secondary_calendar_sha256": _calendar_scope_sha256(secondary, target_session),
+        "primary_only_after_target": tuple(
+            value.isoformat()
+            for value in sorted((primary_dates - secondary_dates))
+            if value > target_session
+        ),
+        "secondary_only_after_target": tuple(
+            value.isoformat()
+            for value in sorted((secondary_dates - primary_dates))
+            if value > target_session
+        ),
+    }
+
+
 def _point_in_time_membership(
     target_session: date,
     snapshots: Mapping[date, Mapping[str, Iterable[str]]],
@@ -254,20 +303,15 @@ def build_incremental_plan(
 ) -> DailyIncrementalPlan:
     """Build a stable single-session scope and identify only missing symbols to fetch."""
     local_observed_at = _shanghai_time(observed_at)
-    calendar_gates = evaluate_calendars(primary_calendar, secondary_calendar)
-    if not accepted(calendar_gates):
-        raise RuntimeError("primary and secondary trading calendars are not aligned")
     latest_primary = latest_closed_session(primary_calendar, local_observed_at)
     latest_secondary = latest_closed_session(secondary_calendar, local_observed_at)
-    if latest_primary != latest_secondary:
-        raise RuntimeError(
-            f"latest closed session mismatch: {latest_primary.isoformat()} != {latest_secondary.isoformat()}"
+    primary_target = target_session or min(latest_primary, latest_secondary)
+    if primary_target > latest_primary or primary_target > latest_secondary:
+        raise ValueError(
+            f"target session {primary_target.isoformat()} is beyond a closed calendar horizon: "
+            f"primary={latest_primary.isoformat()} secondary={latest_secondary.isoformat()}"
         )
-    primary_target = target_session or latest_primary
-    if primary_target > latest_primary:
-        raise ValueError(f"target session {primary_target.isoformat()} is not closed and ready")
-    if primary_target not in primary_calendar.open_dates or primary_target not in secondary_calendar.open_dates:
-        raise ValueError(f"target session {primary_target.isoformat()} is not aligned in both calendars")
+    validate_daily_calendar_boundary(primary_calendar, secondary_calendar, primary_target)
     previous = _previous_session(primary_calendar, primary_target)
     effective, membership, universe_hash = _point_in_time_membership(primary_target, snapshots)
     expected_symbols = {symbol for symbol, _ in membership}

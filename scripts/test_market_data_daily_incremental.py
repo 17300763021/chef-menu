@@ -22,6 +22,7 @@ from scripts.market_data.daily_incremental import (
     build_incremental_plan,
     fetch_missing_bars,
     latest_closed_session,
+    validate_daily_calendar_boundary,
     write_outputs,
 )
 from scripts.market_data.daily_incremental_runner import (
@@ -204,6 +205,88 @@ class DailyIncrementalTests(unittest.TestCase):
                 primary_calendar=self.calendar(),
                 secondary_calendar=mismatched,
                 snapshots=self.full_snapshots(),
+            )
+
+    def test_daily_calendar_boundary_ignores_only_post_target_drift(self) -> None:
+        future = date(2026, 7, 28)
+        baseline = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), future, [PREVIOUS, TARGET],
+        )
+        primary_future = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), future, [PREVIOUS, TARGET, future],
+        )
+        secondary_future = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), future, [PREVIOUS, TARGET, future],
+        )
+
+        primary_diagnostic = validate_daily_calendar_boundary(
+            primary_future, baseline, TARGET,
+        )
+        secondary_diagnostic = validate_daily_calendar_boundary(
+            baseline, secondary_future, TARGET,
+        )
+
+        self.assertEqual(primary_diagnostic["primary_only_after_target"], (future.isoformat(),))
+        self.assertEqual(secondary_diagnostic["secondary_only_after_target"], (future.isoformat(),))
+        self.assertEqual(
+            primary_diagnostic["primary_calendar_sha256"],
+            secondary_diagnostic["primary_calendar_sha256"],
+        )
+        self.assertEqual(
+            primary_diagnostic["secondary_calendar_sha256"],
+            secondary_diagnostic["secondary_calendar_sha256"],
+        )
+        observed = datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI)
+        primary_plan = build_incremental_plan(
+            observed_at=observed,
+            primary_calendar=primary_future,
+            secondary_calendar=baseline,
+            snapshots=self.full_snapshots(),
+            target_session=TARGET,
+        )
+        secondary_plan = build_incremental_plan(
+            observed_at=observed,
+            primary_calendar=baseline,
+            secondary_calendar=secondary_future,
+            snapshots=self.full_snapshots(),
+            target_session=TARGET,
+        )
+        self.assertEqual(primary_plan.target_session, TARGET)
+        self.assertEqual(secondary_plan.target_session, TARGET)
+        self.assertEqual(primary_plan.scope_sha256, secondary_plan.scope_sha256)
+
+    def test_daily_calendar_boundary_reports_historical_omission_and_missing_target(self) -> None:
+        historical = date(2026, 7, 23)
+        complete = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), TARGET, [historical, PREVIOUS, TARGET],
+        )
+        omission = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), TARGET, [PREVIOUS, TARGET],
+        )
+        with self.assertRaisesRegex(RuntimeError, historical.isoformat()):
+            validate_daily_calendar_boundary(complete, omission, TARGET)
+
+        missing_target = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), TARGET, [historical, PREVIOUS],
+        )
+        with self.assertRaisesRegex(RuntimeError, rf"{TARGET.isoformat()}.*secondary"):
+            validate_daily_calendar_boundary(complete, missing_target, TARGET)
+
+    def test_explicit_target_must_be_ready_in_both_calendar_horizons(self) -> None:
+        future = date(2026, 7, 28)
+        primary = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), future, [PREVIOUS, TARGET, future],
+        )
+        secondary = TradingCalendar.build(
+            "fixture", date(2026, 7, 1), future, [PREVIOUS, TARGET],
+        )
+        with self.assertRaisesRegex(ValueError, "closed calendar horizon"):
+            build_incremental_plan(
+                observed_at=datetime(2026, 7, 28, 17, 0, tzinfo=SHANGHAI),
+                primary_calendar=primary,
+                secondary_calendar=secondary,
+                snapshots=self.full_snapshots(),
+                target_session=future,
             )
 
     def test_plan_uses_point_in_time_csi800_and_fetches_only_missing_symbols(self) -> None:

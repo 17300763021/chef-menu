@@ -34,6 +34,7 @@ from scripts.market_data.daily_incremental import (
     build_incremental_evidence,
     build_incremental_plan,
     latest_closed_session,
+    validate_daily_calendar_boundary,
     write_outputs,
 )
 from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
@@ -41,7 +42,6 @@ from scripts.market_data.historical_bars import load_calendars
 from scripts.market_data.historical_contracts import AdjustmentEvent, HistoricalBar
 from scripts.market_data.manifest import sha256
 from scripts.market_data.pit_universe import reconstruct
-from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sources.akshare_history_source import (
     AkshareEastmoneyHistorySource,
     AkshareHistorySource,
@@ -794,15 +794,12 @@ def run(
         deadline_seconds=CALENDAR_DEADLINE_SECONDS,
     )
     with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
-        primary_calendar, secondary_calendar, calendar_gates, _sources = load_calendars(observed.date())
+        primary_calendar, secondary_calendar, _calendar_gates, _sources = load_calendars(observed.date())
     _progress(
         "daily_calendars_loaded",
         primary_sessions=len(primary_calendar.open_dates),
         secondary_sessions=len(secondary_calendar.open_dates),
     )
-    if not accepted(calendar_gates):
-        raise RuntimeError("daily primary and secondary calendars are not aligned")
-
     config = TiDBConfig.from_env()
     connection = connect(config)
     try:
@@ -819,7 +816,8 @@ def run(
                 superseded_dataset_id=supersedes_dataset_id,
                 target_session=requested_target,
             )
-        latest_ready = latest_closed_session(primary_calendar, observed)
+        latest_primary_ready = latest_closed_session(primary_calendar, observed)
+        latest_secondary_ready = latest_closed_session(secondary_calendar, observed)
     finally:
         connection.close()
 
@@ -835,14 +833,38 @@ def run(
         _progress_result(replay)
         return replay
 
-    target = _select_target(primary_calendar.open_dates, latest_accepted, latest_ready, requested_target)
+    discovery_calendar = tuple(sorted(
+        set(primary_calendar.open_dates) | set(secondary_calendar.open_dates)
+    ))
+    latest_ready = max(latest_primary_ready, latest_secondary_ready)
+    target = _select_target(discovery_calendar, latest_accepted, latest_ready, requested_target)
     if target is None:
+        boundary = validate_daily_calendar_boundary(
+            primary_calendar, secondary_calendar, latest_accepted,
+        )
         result = {
             "event": "daily_noop", "latest_accepted_session": latest_accepted.isoformat(),
             "latest_ready_session": latest_ready.isoformat(), "simulation_orders_allowed": False,
+            "calendar_diagnostics": boundary,
         }
         _progress(**result)
         return result
+
+    if target > latest_primary_ready or target > latest_secondary_ready:
+        raise RuntimeError(
+            f"daily target {target.isoformat()} is beyond a closed calendar horizon: "
+            f"primary={latest_primary_ready.isoformat()} "
+            f"secondary={latest_secondary_ready.isoformat()}"
+        )
+    calendar_boundary = validate_daily_calendar_boundary(
+        primary_calendar, secondary_calendar, target,
+    )
+    _progress(
+        "daily_calendar_boundary_accepted",
+        latest_primary_ready_session=latest_primary_ready.isoformat(),
+        latest_secondary_ready_session=latest_secondary_ready.isoformat(),
+        **calendar_boundary,
+    )
 
     _progress("daily_prerequisites_started", phase="corporate_action_inventory")
     with prerequisite_deadline(CALENDAR_DEADLINE_SECONDS):
