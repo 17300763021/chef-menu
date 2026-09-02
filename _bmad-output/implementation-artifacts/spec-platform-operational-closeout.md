@@ -48,6 +48,7 @@ context:
 - `.github/workflows/market-data-daily-incremental.yml` -- read-only during code repair; existing bounded catch-up, quota gate, and atomic publication path.
 - `.github/workflows/m4-release-inventory-once.yml` -- owned by the isolated M4 task; remove the nonexistent aggregate column and reconcile failures from stable counts/manifest without changing schema.
 - `scripts/market_data/tidb_fundamental_store.py:16-39` -- read-only deployed-table contract proving `failed_symbol_count` is not a physical column.
+- `supabase/migrations/20260902093000_ensure_cloud_quota_month_rows.sql` -- idempotent current-month quota-row initialization used by both job claims and acceptance probes.
 - `AGENTS.md` -- update only after production-facing evidence, with M2 maintenance outcome, M3 integration truth, M4 status, and remaining limitations.
 
 ## Tasks & Acceptance
@@ -72,6 +73,7 @@ context:
 ## Spec Change Log
 
 - 2026-09-02: Completed the local operational repair. Expected quota denials now return audited `blocked` outcomes with exact reasons and no protected work, unexpected runtime defects still return a failing process status with a report artifact path, and historical live acquisition is manual-dispatch-only while push coverage remains deterministic. Remote M2 publication, isolated M4 repair/acceptance, branch integration, final online closeout, and `AGENTS.md` remain incomplete because this implementation handoff prohibited remote operations and production claims without evidence.
+- 2026-09-02: After explicit confirmation, added an idempotent quota-period migration so month rollover no longer causes `current quota row is missing` failures. Existing thresholds, providers, and fail-closed behavior are unchanged.
 
 ## Design Notes
 
@@ -89,13 +91,13 @@ Expected business-policy blocks and unexpected software failures are separate st
 
 **Local evidence (2026-09-02):**
 
-- `python -m scripts.test_cloud_runtime` -- 19 tests passed, covering allowed scheduling, expected missing/hard-stop quota blocks, recovery retry preservation, strict RPC response validation, zero protected work, CLI failure reports, and unexpected RPC failure propagation.
+- `python -m scripts.test_cloud_runtime` -- 20 tests passed, covering allowed scheduling, expected missing/hard-stop quota blocks, recovery retry preservation, strict RPC response validation, CLI failure reports, and idempotent quota-month initialization contract.
 - `python -m scripts.test_market_data_m2_workflows` -- 5 tests passed; parsed workflow contracts prove push runs deterministic tests only, the guard test is in the push job, and live historical sample acquisition requires explicit dispatch.
 - `python -m scripts.test_historical_quality_gates` -- 5 tests passed, retaining fail-closed source-overlap and historical quality behavior.
 - `python -m scripts.test_market_data_daily_incremental` -- 33 tests passed in an isolated Python 3.11 environment with pinned market-data dependencies plus Windows timezone data.
 - `python -m py_compile scripts/cloud_runtime.py scripts/test_cloud_runtime.py scripts/test_market_data_m2_workflows.py` and `git diff --check` passed.
 
-**Review disposition (2026-09-02):** Three independent review lenses were deduplicated. The implementation patched strict boolean/status validation, avoided claiming recovery work when the scheduled quota gate is blocked, verified terminal RPC responses, preserved artifact upload on runtime failure, and added push-trigger isolation coverage. No new table, migration, source, threshold, or paid capability was introduced.
+**Review disposition (2026-09-02):** Three independent review lenses were deduplicated. The implementation patched strict boolean/status validation, avoided claiming recovery work when the scheduled quota gate is blocked, verified terminal RPC responses, preserved artifact upload on runtime failure, added push-trigger isolation coverage, and then added only the explicitly confirmed idempotent quota-month migration. No new table, source, threshold, or paid capability was introduced.
 
 **Incomplete production evidence:**
 

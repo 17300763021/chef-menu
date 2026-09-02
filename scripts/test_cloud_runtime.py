@@ -189,6 +189,15 @@ class CloudRuntimeTest(unittest.TestCase):
         self.assertNotIn("pg_net", sql)
         self.assertNotIn("vault.create_secret", sql)
 
+    def test_quota_month_migration_is_idempotent_and_used_by_claim_and_probe(self) -> None:
+        migration = ROOT / "supabase" / "migrations" / "20260902093000_ensure_cloud_quota_month_rows.sql"
+        sql = migration.read_text(encoding="utf-8").lower()
+        self.assertIn("create or replace function private.ensure_cloud_quota_period", sql)
+        self.assertIn("on conflict (provider, period_start) do nothing", sql)
+        self.assertGreaterEqual(sql.count("perform private.ensure_cloud_quota_period"), 2)
+        self.assertIn("create or replace function public.claim_cloud_job", sql)
+        self.assertIn("create or replace function public.set_cloud_quota_for_acceptance", sql)
+
     def test_legacy_automatic_schedules_are_disabled(self) -> None:
         for name in ("stock-tasks.yml", "stock-pending.yml"):
             workflow = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
