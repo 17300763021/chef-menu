@@ -11,6 +11,7 @@ from typing import Any, Callable
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
+from scripts.market_data.calendar_contracts import TradingCalendar
 from scripts.market_data.contracts import DailyBar
 from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_daily_adjusted_bars
 from scripts.market_data.daily_incremental import DailyIncrementalPlan
@@ -955,6 +956,40 @@ class TiDBDailyStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot skip"):
             _select_target(sessions, PREVIOUS, date(2026, 7, 28), date(2026, 7, 28))
 
+    def test_runner_union_discovery_rejects_provider_missing_target_before_acquisition(self) -> None:
+        future = date(2026, 7, 28)
+        primary = TradingCalendar.build(
+            "primary", date(2026, 7, 1), future, (PREVIOUS, TARGET, future),
+        )
+        secondary = TradingCalendar.build(
+            "secondary", date(2026, 7, 1), future, (PREVIOUS, future),
+        )
+        connection = FakeConnection()
+        with (
+            patch(
+                "scripts.market_data.daily_incremental_runner.load_calendars",
+                return_value=(primary, secondary, [], {}),
+            ),
+            patch("scripts.market_data.daily_incremental_runner.TiDBConfig.from_env"),
+            patch("scripts.market_data.daily_incremental_runner.connect", return_value=connection),
+            patch(
+                "scripts.market_data.daily_incremental_runner.latest_accepted_lineage",
+                return_value=(PREVIOUS, "accepted-previous"),
+            ),
+            patch(
+                "scripts.market_data.daily_incremental_runner.EastmoneyCorporateActionSource",
+                side_effect=AssertionError("calendar rejection must precede acquisition"),
+            ) as corporate_source,
+        ):
+            with self.assertRaisesRegex(RuntimeError, rf"{TARGET.isoformat()}.*secondary"):
+                run(
+                    observed_at=datetime(2026, 7, 28, 17, 0, tzinfo=SHANGHAI),
+                    base_history_dataset_id="base-history",
+                    output_dir=Path("unused-daily-output"),
+                )
+
+        corporate_source.assert_not_called()
+
     def test_exact_accepted_target_returns_immutable_idempotent_replay(self) -> None:
         result = _accepted_replay_result(
             TARGET,
@@ -995,7 +1030,6 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 "scripts.market_data.daily_incremental_runner.load_calendars",
                 return_value=(calendar, calendar, [], {}),
             ),
-            patch("scripts.market_data.daily_incremental_runner.accepted", return_value=True),
             patch("scripts.market_data.daily_incremental_runner.TiDBConfig.from_env"),
             patch("scripts.market_data.daily_incremental_runner.connect", return_value=connection),
             patch(
