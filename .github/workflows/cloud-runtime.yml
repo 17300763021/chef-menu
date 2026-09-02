@@ -75,11 +75,12 @@ jobs:
           --mode acceptance
           --report-out cloud-runtime/report-acceptance-repeat.json
       - name: Upload non-sensitive M1 report
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cloud-runtime-${{ github.sha }}-${{ steps.mode.outputs.value }}
           path: cloud-runtime/*.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
   framework-smoke:

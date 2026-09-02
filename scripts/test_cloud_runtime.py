@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import unittest
 import json
+import tempfile
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,22 +12,35 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from cloud_runtime import build_claim, complete_claim, current_half_hour_slot, idempotency_key
+from cloud_runtime import (
+    build_claim,
+    complete_claim,
+    current_half_hour_slot,
+    idempotency_key,
+    process_one_recovery,
+    run_heartbeat,
+    run_scheduled,
+)
 
 
 class FakeClient:
-    def __init__(self, claim: dict) -> None:
+    def __init__(self, claim: dict, recovery: dict | None = None) -> None:
         self.claim = claim
+        self.recovery = {"found": False} if recovery is None else recovery
         self.calls: list[tuple[str, dict]] = []
 
     def rpc(self, name: str, payload: dict) -> dict:
         self.calls.append((name, payload))
         if name == "claim_cloud_job":
             return dict(self.claim)
+        if name == "claim_cloud_recovery":
+            return dict(self.recovery)
         if name == "heartbeat_cloud_job":
             return {"status": "running"}
         if name == "finish_cloud_job":
             return {"status": "succeeded", "result_published": False}
+        if name == "complete_cloud_recovery":
+            return {"status": payload["p_status"]}
         raise AssertionError(name)
 
 
@@ -65,6 +80,104 @@ class CloudRuntimeTest(unittest.TestCase):
         self.assertEqual([name for name, _ in client.calls], ["claim_cloud_job"])
         self.assertFalse(result["allowed"])
 
+    def test_scheduled_heartbeat_reports_expected_quota_block_without_work(self) -> None:
+        client = FakeClient(
+            {"allowed": False, "status": "blocked", "run_id": "run-1", "quota_decision": "blocked_missing_quota"}
+        )
+        result = run_heartbeat(client, slot="scheduled-slot")
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["blocked_reason"], "blocked_missing_quota")
+        self.assertFalse(result["protected_work_performed"])
+        self.assertEqual([name for name, _ in client.calls], ["claim_cloud_job"])
+
+    def test_scheduled_allowed_path_heartbeats_and_finishes(self) -> None:
+        client = FakeClient({"allowed": True, "status": "claimed", "run_id": "run-allowed", "quota_decision": "normal"})
+        result = run_scheduled(client)
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertTrue(result["protected_work_performed"])
+        self.assertEqual(result["blocked_reasons"], [])
+        self.assertEqual(
+            [name for name, _ in client.calls],
+            ["claim_cloud_job", "heartbeat_cloud_job", "finish_cloud_job", "claim_cloud_recovery"],
+        )
+
+    def test_scheduled_block_is_top_level_no_work_outcome(self) -> None:
+        client = FakeClient(
+            {"allowed": False, "status": "blocked", "run_id": "run-blocked", "quota_decision": "blocked_100"}
+        )
+        result = run_scheduled(client)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertFalse(result["protected_work_performed"])
+        self.assertEqual(result["blocked_reasons"], ["blocked_100"])
+
+    def test_unexpected_rpc_failure_remains_an_exception(self) -> None:
+        class BrokenClient:
+            def rpc(self, name: str, payload: dict) -> dict:
+                raise RuntimeError("rpc unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "rpc unavailable"):
+            run_heartbeat(BrokenClient(), slot="scheduled-slot")  # type: ignore[arg-type]
+
+    def test_scheduled_quota_block_skips_recovery_without_claiming_it(self) -> None:
+        client = FakeClient(
+            {"allowed": False, "status": "blocked", "run_id": "run-blocked", "quota_decision": "blocked_100"},
+            {
+                "found": True,
+                "recovery_id": "recovery-1",
+                "environment": "shadow",
+                "job_type": "foundation_heartbeat",
+                "reason": "missed heartbeat",
+            },
+        )
+        result = run_scheduled(client)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["heartbeat"]["blocked_reason"], "blocked_100")
+        self.assertFalse(result["protected_work_performed"])
+        self.assertFalse(result["recovery"]["recovery_closed"])
+        self.assertEqual(
+            [name for name, _ in client.calls],
+            ["claim_cloud_job"],
+        )
+
+    def test_successful_recovery_is_completed_and_audited(self) -> None:
+        client = FakeClient(
+            {"allowed": True, "status": "claimed", "run_id": "run-recovery"},
+            {
+                "found": True,
+                "recovery_id": "recovery-1",
+                "environment": "shadow",
+                "job_type": "foundation_heartbeat",
+                "reason": "missed heartbeat",
+            },
+        )
+        result = process_one_recovery(client)
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["recovery_closed"])
+        self.assertEqual(client.calls[-1][0], "complete_cloud_recovery")
+
+    def test_malformed_claim_is_rejected(self) -> None:
+        client = FakeClient({"allowed": "false", "status": "blocked", "quota_decision": "blocked_100"})
+        with self.assertRaisesRegex(RuntimeError, "non-boolean allowed"):
+            run_heartbeat(client, slot="malformed")
+
+    def test_malformed_recovery_is_rejected(self) -> None:
+        client = FakeClient({"allowed": True, "status": "succeeded"}, recovery={"found": "false"})
+        with self.assertRaisesRegex(RuntimeError, "non-boolean found"):
+            process_one_recovery(client)
+
+    def test_cli_writes_failure_report_and_returns_nonzero(self) -> None:
+        import cloud_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "runtime.json"
+            with patch.object(cloud_runtime, "make_client", side_effect=RuntimeError("rpc unavailable")), patch.object(
+                sys, "argv", ["cloud_runtime.py", "--mode", "scheduled", "--report-out", str(report)]
+            ):
+                self.assertEqual(cloud_runtime.main(), 1)
+            body = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(body["outcome"], "failed")
+            self.assertEqual(body["error_message"], "rpc unavailable")
+
     def test_migration_is_private_atomic_and_cost_gated(self) -> None:
         migration = next((ROOT / "supabase" / "migrations").glob("*_add_cloud_runtime_foundation.sql"))
         sql = migration.read_text(encoding="utf-8").lower()
@@ -88,6 +201,7 @@ class CloudRuntimeTest(unittest.TestCase):
         self.assertIn('cron: "17,47 * * * 1-5"', cloud)
         self.assertIn("timeout-minutes: 15", cloud)
         self.assertIn("cancel-in-progress: false", cloud)
+        self.assertIn("- name: Upload non-sensitive M1 report\n        if: always()", cloud)
         for path in workflows:
             for line in path.read_text(encoding="utf-8").splitlines():
                 if "uses: actions/" in line:

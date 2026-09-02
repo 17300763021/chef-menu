@@ -39,6 +39,7 @@ on:
       - scripts/test_tidb_checkpoint_store.py
       - scripts/test_adjustment_engine.py
       - scripts/test_tradeability.py
+      - scripts/test_market_data_m2_workflows.py
       - .python-version
 
 permissions:
@@ -77,9 +78,10 @@ jobs:
           python -m scripts.test_baostock_calendar_source
           python -m scripts.test_eastmoney_market_state_source
           python -m scripts.test_baostock_history_source
+          python -m scripts.test_market_data_m2_workflows
 
   sample:
-    if: github.event_name == 'push' || (inputs.mode == 'sample' && inputs.operation == 'capture')
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'sample' && inputs.operation == 'capture'
     needs: deterministic-tests
     runs-on: ubuntu-latest
     timeout-minutes: 15

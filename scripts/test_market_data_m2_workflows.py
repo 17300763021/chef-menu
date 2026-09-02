@@ -40,6 +40,24 @@ class M2WorkflowTests(unittest.TestCase):
         self.assertIn("--storage-percent", text)
         self.assertIn("max_sessions", text)
 
+    def test_historical_push_runs_deterministic_tests_without_live_acquisition(self) -> None:
+        path = ROOT / ".github" / "workflows" / "market-data-history-acceptance.yml"
+        text = path.read_text(encoding="utf-8")
+        workflow = yaml.safe_load(text)
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertIn("push", triggers)
+        deterministic = workflow["jobs"]["deterministic-tests"]
+        self.assertNotIn("if", deterministic)
+        sample = workflow["jobs"]["sample"]
+        self.assertEqual(
+            sample["if"],
+            "github.event_name == 'workflow_dispatch' && inputs.mode == 'sample' && inputs.operation == 'capture'",
+        )
+        self.assertIn("historical_bars", str(sample))
+        for name, job in workflow["jobs"].items():
+            if name != "sample":
+                self.assertNotIn("--mode sample", str(job), name)
+
     def test_full_fundamentals_use_short_resumable_shards_without_more_parallel_pressure(self) -> None:
         text = (ROOT / ".github" / "workflows" / "market-data-fundamental-acceptance.yml").read_text(encoding="utf-8")
         self.assertIn('else 16', text)

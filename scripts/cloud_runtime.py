@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-RUNTIME_VERSION = "m1-cloud-runtime-v1"
+RUNTIME_VERSION = "m1-cloud-runtime-v2"
 QUOTA_PROVIDERS = ("github_actions_internal", "supabase_internal")
 
 
@@ -131,12 +131,24 @@ def build_claim(
 
 def complete_claim(client: CloudRuntimeClient, payload: dict[str, Any]) -> dict[str, Any]:
     claim = client.rpc("claim_cloud_job", {"p_payload": payload})
-    if not claim.get("allowed"):
+    allowed = claim.get("allowed")
+    if not isinstance(allowed, bool):
+        raise RuntimeError("claim_cloud_job returned a non-boolean allowed field")
+    status = claim.get("status")
+    if status not in {"claimed", "running", "succeeded", "blocked"}:
+        raise RuntimeError(f"claim_cloud_job returned an invalid status: {status!r}")
+    if not allowed:
+        if status != "blocked":
+            raise RuntimeError(f"denied claim has invalid status: {status!r}")
         return claim
-    if claim.get("status") == "succeeded":
+    if status == "succeeded":
         return claim
+    if status not in {"claimed", "running"} or not claim.get("run_id"):
+        raise RuntimeError("allowed claim is missing a runnable run_id")
     run_id = str(claim["run_id"])
-    client.rpc("heartbeat_cloud_job", {"p_run_id": run_id, "p_metadata": {"phase": "active"}})
+    heartbeat = client.rpc("heartbeat_cloud_job", {"p_run_id": run_id, "p_metadata": {"phase": "active"}})
+    if heartbeat.get("status") != "running":
+        raise RuntimeError(f"heartbeat_cloud_job did not return running: {heartbeat}")
     finish = client.rpc(
         "finish_cloud_job",
         {
@@ -147,7 +159,34 @@ def complete_claim(client: CloudRuntimeClient, payload: dict[str, Any]) -> dict[
             "p_metadata": {"phase": "complete"},
         },
     )
+    if finish.get("status") != "succeeded":
+        raise RuntimeError(f"finish_cloud_job did not return succeeded: {finish}")
     return {**claim, "finish": finish}
+
+
+def claim_outcome(claim: dict[str, Any], *, work_performed: bool) -> dict[str, Any]:
+    """Expose policy blocks without turning them into infrastructure failures."""
+    allowed = claim.get("allowed")
+    if not isinstance(allowed, bool):
+        raise RuntimeError("claim result is missing boolean allowed")
+    if allowed:
+        return {
+            **claim,
+            "outcome": "succeeded",
+            "protected_work_performed": work_performed,
+            "blocked_reason": None,
+        }
+    if claim.get("status") != "blocked":
+        raise RuntimeError(f"blocked claim has invalid status: {claim.get('status')!r}")
+    decision = claim.get("quota_decision")
+    if not isinstance(decision, str) or not decision:
+        raise RuntimeError("blocked claim is missing quota_decision")
+    return {
+        **claim,
+        "outcome": "blocked",
+        "protected_work_performed": False,
+        "blocked_reason": decision,
+    }
 
 
 def current_half_hour_slot(now: datetime | None = None) -> str:
@@ -159,15 +198,24 @@ def current_half_hour_slot(now: datetime | None = None) -> str:
 def run_heartbeat(client: CloudRuntimeClient, slot: str | None = None) -> dict[str, Any]:
     payload = build_claim("shadow", "foundation_heartbeat", slot or current_half_hour_slot(), source_commit())
     result = complete_claim(client, payload)
-    if not result.get("allowed"):
-        raise RuntimeError(f"云端心跳被配额闸门阻止：{result.get('quota_decision')}")
-    return result
+    return claim_outcome(
+        result,
+        work_performed=bool(result.get("allowed")) and result.get("status") != "succeeded",
+    )
 
 
 def process_one_recovery(client: CloudRuntimeClient) -> dict[str, Any]:
     recovery = client.rpc("claim_cloud_recovery", {"p_claimed_by": f"github:{source_commit()}"})
-    if not recovery.get("found"):
-        return recovery
+    found = recovery.get("found")
+    if not isinstance(found, bool):
+        raise RuntimeError("claim_cloud_recovery returned a non-boolean found field")
+    if not found:
+        return {
+            **recovery,
+            "outcome": "idle",
+            "protected_work_performed": False,
+            "blocked_reason": None,
+        }
     recovery_id = str(recovery["recovery_id"])
     try:
         if recovery["job_type"] != "foundation_heartbeat":
@@ -181,8 +229,14 @@ def process_one_recovery(client: CloudRuntimeClient) -> dict[str, Any]:
         )
         run = complete_claim(client, payload)
         if not run.get("allowed"):
-            raise RuntimeError(f"恢复任务被配额闸门阻止：{run.get('quota_decision')}")
-        client.rpc(
+            blocked = claim_outcome(run, work_performed=False)
+            return {
+                **recovery,
+                **blocked,
+                "completed": False,
+                "recovery_closed": False,
+            }
+        completion = client.rpc(
             "complete_cloud_recovery",
             {
                 "p_recovery_id": recovery_id,
@@ -191,7 +245,14 @@ def process_one_recovery(client: CloudRuntimeClient) -> dict[str, Any]:
                 "p_error_message": "",
             },
         )
-        return {**recovery, "completed": True, "run_id": run["run_id"]}
+        if completion.get("status") != "completed":
+            raise RuntimeError(f"complete_cloud_recovery did not return completed: {completion}")
+        return {
+            **recovery,
+            **claim_outcome(run, work_performed=run.get("status") != "succeeded"),
+            "completed": True,
+            "recovery_closed": True,
+        }
     except Exception as reason:
         client.rpc(
             "complete_cloud_recovery",
@@ -203,6 +264,36 @@ def process_one_recovery(client: CloudRuntimeClient) -> dict[str, Any]:
             },
         )
         raise
+
+
+def run_scheduled(client: CloudRuntimeClient) -> dict[str, Any]:
+    heartbeat = run_heartbeat(client)
+    if heartbeat.get("outcome") == "blocked":
+        recovery = {
+            "found": False,
+            "outcome": "skipped_quota",
+            "protected_work_performed": False,
+            "blocked_reason": heartbeat.get("blocked_reason"),
+            "recovery_closed": False,
+        }
+    else:
+        recovery = process_one_recovery(client)
+    blocked_reasons = sorted(
+        {
+            str(item["blocked_reason"])
+            for item in (recovery, heartbeat)
+            if item.get("outcome") == "blocked" and item.get("blocked_reason")
+        }
+    )
+    return {
+        "outcome": "blocked" if blocked_reasons else "succeeded",
+        "protected_work_performed": any(
+            bool(item.get("protected_work_performed")) for item in (recovery, heartbeat)
+        ),
+        "blocked_reasons": blocked_reasons,
+        "recovery": recovery,
+        "heartbeat": heartbeat,
+    }
 
 
 def set_all_quotas(client: CloudRuntimeClient, percent: int, hard_stop: bool = False) -> None:
@@ -271,21 +362,31 @@ def main() -> int:
     parser.add_argument("--mode", choices=["scheduled", "heartbeat", "recover", "acceptance"], default="scheduled")
     parser.add_argument("--report-out", type=Path)
     args = parser.parse_args()
-    client = make_client()
-    if args.mode == "heartbeat":
-        result: Any = {"heartbeat": run_heartbeat(client)}
-    elif args.mode == "recover":
-        result = {"recovery": process_one_recovery(client)}
-    elif args.mode == "acceptance":
-        result = run_acceptance(client)
-    else:
-        result = {"recovery": process_one_recovery(client), "heartbeat": run_heartbeat(client)}
+    exit_code = 0
+    try:
+        client = make_client()
+        if args.mode == "heartbeat":
+            result: Any = {"heartbeat": run_heartbeat(client)}
+        elif args.mode == "recover":
+            result = {"recovery": process_one_recovery(client)}
+        elif args.mode == "acceptance":
+            result = run_acceptance(client)
+        else:
+            result = run_scheduled(client)
+    except Exception as error:
+        result = {
+            "runtime_version": RUNTIME_VERSION,
+            "outcome": "failed",
+            "error_class": type(error).__name__,
+            "error_message": str(error),
+        }
+        exit_code = 1
     output = json.dumps(result, ensure_ascii=False, indent=2)
     if args.report_out:
         args.report_out.parent.mkdir(parents=True, exist_ok=True)
         args.report_out.write_text(output + "\n", encoding="utf-8")
     print(output)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
