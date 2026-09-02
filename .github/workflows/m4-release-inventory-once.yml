@@ -51,7 +51,7 @@ jobs:
           ids = {
               "history": "m2-full-2026-07-24-993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged",
               "daily": "m2-daily-2026-07-28-1392a4e46e59cd69fc330a36e81176070f18f27dde759a9376721411a3f7b851",
-              "industry": "m2-industry-2026-08-03-f3accc399f4b9ba3cb50676fd199895e5ec5e890ee0f85a458e441bbbc0f2dd",
+              "industry": "m2-industry-2026-08-03-f3accc399f4b9ba3cb50676fd199895e5ec5e890ee0f85a458e441bbbc0f2dd1",
               "fundamental": "m2-fundamental-2026-07-28-456e3797d55902d24e8896ac4c6676067d53b41e4e9094effbd840b1f1365228",
               "index": "m2-index-2026-07-31-1bd56e506a07d7dd60787681b0e42533d5f0bf1d4c87509b43686f41d48d1e54",
               "flow": "m2-flow-2026-07-31-ce1eac39cb5c04975f334d1e219bba26b86b6437dfee60d9c65213003ef23fa9",
