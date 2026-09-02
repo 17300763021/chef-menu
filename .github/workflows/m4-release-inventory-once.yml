@@ -1,0 +1,144 @@
+name: M4 Release Inventory Once
+
+on:
+  push:
+    branches: [codex/m4-baseline-strategy]
+    paths:
+      - .github/workflows/m4-release-inventory-once.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m4-release-inventory-once
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - run: python -m pip install "PyMySQL==1.1.1"
+      - name: Export exact accepted component identities without database writes
+        env:
+          TIDB_HOST: ${{ secrets.TIDB_RESEARCH_HOST }}
+          TIDB_PORT: ${{ secrets.TIDB_RESEARCH_PORT }}
+          TIDB_USER: ${{ secrets.TIDB_RESEARCH_USER }}
+          TIDB_PASSWORD: ${{ secrets.TIDB_RESEARCH_PASSWORD }}
+          TIDB_DATABASE: ${{ secrets.TIDB_RESEARCH_DATABASE }}
+          TIDB_SSL_MODE: ${{ secrets.TIDB_RESEARCH_SSL_MODE }}
+          TIDB_MARKET_HOST: ${{ secrets.TIDB_HOST }}
+          TIDB_MARKET_PORT: ${{ secrets.TIDB_PORT }}
+          TIDB_MARKET_USER: ${{ secrets.TIDB_USER }}
+          TIDB_MARKET_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
+          TIDB_MARKET_DATABASE: ${{ secrets.TIDB_DATABASE }}
+          TIDB_MARKET_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+
+
+          ids = {
+              "history": "m2-full-2026-07-24-993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged",
+              "daily": "m2-daily-2026-07-28-1392a4e46e59cd69fc330a36e81176070f18f27dde759a9376721411a3f7b851",
+              "industry": "m2-industry-2026-08-03-f3accc399f4b9ba3cb50676fd199895e5ec5e890ee0f85a458e441bbbc0f2dd",
+              "fundamental": "m2-fundamental-2026-07-28-456e3797d55902d24e8896ac4c6676067d53b41e4e9094effbd840b1f1365228",
+              "index": "m2-index-2026-07-31-1bd56e506a07d7dd60787681b0e42533d5f0bf1d4c87509b43686f41d48d1e54",
+              "flow": "m2-flow-2026-07-31-ce1eac39cb5c04975f334d1e219bba26b86b6437dfee60d9c65213003ef23fa9",
+          }
+          queries = {
+              "history": (
+                  "market",
+                  "SELECT dataset_id,business_end,authoritative,simulation_orders_allowed,accepted,global_symbol_count,manifest_sha256 "
+                  "FROM m2_history_runs WHERE dataset_id=%s AND mode='full' AND shard_index IS NULL",
+              ),
+              "daily": (
+                  "market",
+                  "SELECT dataset_id,target_session,base_history_dataset_id,authoritative,simulation_orders_allowed,accepted,"
+                  "expected_symbol_count,primary_row_count,manifest_sha256 FROM m2_daily_runs WHERE dataset_id=%s",
+              ),
+              "industry": (
+                  "market",
+                  "SELECT dataset_id,as_of_date,base_history_dataset_id,authoritative,simulation_orders_allowed,accepted,"
+                  "scope_count,manifest_sha256 FROM m2_industry_runs WHERE dataset_id=%s AND mode='full'",
+              ),
+              "index": (
+                  "market",
+                  "SELECT dataset_id,business_end,authoritative,simulation_orders_allowed,accepted,primary_row_count,manifest_sha256 "
+                  "FROM m2_index_runs WHERE dataset_id=%s",
+              ),
+              "flow": (
+                  "market",
+                  "SELECT dataset_id,business_date,expected_symbol_count,available_symbol_count,data_available,authoritative,"
+                  "simulation_orders_allowed,boundary_accepted,manifest_sha256 FROM m2_flow_runs WHERE dataset_id=%s",
+              ),
+              "fundamental": (
+                  "research",
+                  "SELECT dataset_id,as_of_date,base_history_dataset_id,authoritative,simulation_orders_allowed,accepted,"
+                  "expected_symbol_count,successful_symbol_count,excluded_symbol_count,failed_symbol_count,report_count,fact_count,"
+                  "verification_count,reports_sha256,facts_sha256,quality_sha256,manifest_sha256 "
+                  "FROM m2_fundamental_runs WHERE dataset_id=%s AND mode='full'",
+              ),
+          }
+          columns = {
+              "history": ["dataset_id", "through_date", "authoritative", "simulation_orders_allowed", "accepted", "expected_count", "manifest_sha256"],
+              "daily": ["dataset_id", "through_date", "base_history_dataset_id", "authoritative", "simulation_orders_allowed", "accepted", "expected_count", "available_count", "manifest_sha256"],
+              "industry": ["dataset_id", "through_date", "base_history_dataset_id", "authoritative", "simulation_orders_allowed", "accepted", "expected_count", "manifest_sha256"],
+              "index": ["dataset_id", "through_date", "authoritative", "simulation_orders_allowed", "accepted", "available_count", "manifest_sha256"],
+              "flow": ["dataset_id", "through_date", "expected_count", "available_count", "data_available", "authoritative", "simulation_orders_allowed", "accepted", "manifest_sha256"],
+              "fundamental": ["dataset_id", "through_date", "base_history_dataset_id", "authoritative", "simulation_orders_allowed", "accepted", "expected_count", "successful_count", "excluded_count", "failed_count", "report_count", "fact_count", "verification_count", "reports_sha256", "facts_sha256", "quality_sha256", "manifest_sha256"],
+          }
+          market = connect(TiDBConfig.from_env(prefix="TIDB_MARKET"))
+          research = connect(TiDBConfig.from_env())
+          try:
+              output = {
+                  "schema_version": "m4-release-inventory-v1",
+                  "business_date": "2026-07-28",
+                  "strategy_version": "m4-a-share-adaptive-baseline-v2",
+                  "components": {},
+              }
+              for name, (warehouse, query) in queries.items():
+                  connection = market if warehouse == "market" else research
+                  with connection.cursor() as cursor:
+                      cursor.execute(query, (ids[name],))
+                      rows = cursor.fetchall()
+                  if len(rows) != 1:
+                      raise RuntimeError(f"{name} exact inventory returned {len(rows)} rows")
+                  values = [str(value) if value is not None else None for value in rows[0]]
+                  output["components"][name] = dict(zip(columns[name], values))
+              with research.cursor() as cursor:
+                  cursor.execute(
+                      "SELECT COUNT(*) FROM information_schema.tables "
+                      "WHERE table_schema=DATABASE() AND table_name='m4_research_releases'"
+                  )
+                  output["m4_release_table_exists"] = int(cursor.fetchone()[0]) == 1
+              Path("m4-inventory").mkdir()
+              Path("m4-inventory/inventory.json").write_text(
+                  json.dumps(output, ensure_ascii=False, sort_keys=True, indent=2),
+                  encoding="utf-8",
+              )
+              print(json.dumps({
+                  "event": "m4_release_inventory_exported",
+                  "components": sorted(output["components"]),
+                  "m4_release_table_exists": output["m4_release_table_exists"],
+              }, sort_keys=True))
+          finally:
+              market.close()
+              research.close()
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: m4-release-inventory-${{ github.run_id }}
+          path: m4-inventory/inventory.json
+          retention-days: 7
+          if-no-files-found: error
