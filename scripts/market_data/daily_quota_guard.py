@@ -19,6 +19,7 @@ def evaluate_daily_quota(
     reported_percent: str,
     storage_percent: str,
     checked_at: str,
+    critical_work: bool = False,
     now: datetime,
 ) -> dict[str, object]:
     if now.tzinfo is None or now.utcoffset() is None:
@@ -31,11 +32,13 @@ def evaluate_daily_quota(
         storage = DecimalPercent(storage_percent)
     except ValueError as error:
         raise RuntimeError("numeric TiDB monthly RU and storage percentages are required") from error
-    if percent >= MAX_USAGE_PERCENT:
+    if percent >= 100 or storage >= 100:
+        raise RuntimeError("TiDB free quota reached 100%; affected work is stopped")
+    if percent >= MAX_USAGE_PERCENT and not critical_work:
         raise RuntimeError(
             f"TiDB monthly RU usage {percent:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
         )
-    if storage >= MAX_USAGE_PERCENT:
+    if storage >= MAX_USAGE_PERCENT and not critical_work:
         raise RuntimeError(
             f"TiDB row-storage usage {storage:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
         )
@@ -55,6 +58,7 @@ def evaluate_daily_quota(
         "event_name": event_name,
         "reported_percent": percent,
         "storage_percent": storage,
+        "critical_work": critical_work,
         "checked_at": observed_date.isoformat(),
         "attestation_age_days": age.days,
         "threshold_percent": MAX_USAGE_PERCENT,
@@ -79,6 +83,11 @@ def main() -> int:
     parser.add_argument("--reported-percent", required=True)
     parser.add_argument("--storage-percent", required=True)
     parser.add_argument("--checked-at", required=True)
+    parser.add_argument(
+        "--critical-work",
+        action="store_true",
+        help="allow critical daily work between 80% and 100%; 100% still fails closed",
+    )
     args = parser.parse_args()
     result = evaluate_daily_quota(
         event_name=args.event_name,
@@ -86,6 +95,7 @@ def main() -> int:
         reported_percent=args.reported_percent,
         storage_percent=args.storage_percent,
         checked_at=args.checked_at,
+        critical_work=args.critical_work,
         now=datetime.now(timezone.utc),
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

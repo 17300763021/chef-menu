@@ -34,6 +34,12 @@ class DailyQuotaGuardTests(unittest.TestCase):
                 reported_percent="80", checked_at="2026-07-28", now=NOW,
                 storage_percent="10",
             )
+        result = evaluate_daily_quota(
+            event_name="workflow_dispatch", schedule_enabled="false",
+            reported_percent="93.33", checked_at="2026-07-28", now=NOW,
+            storage_percent="74.8", critical_work=True,
+        )
+        self.assertTrue(result["allowed"])
         with self.assertRaisesRegex(RuntimeError, "days old"):
             evaluate_daily_quota(
                 event_name="workflow_dispatch", schedule_enabled="false",
@@ -64,6 +70,15 @@ class DailyQuotaGuardTests(unittest.TestCase):
                 checked_at="2026-07-28", now=NOW,
             )
 
+    def test_critical_work_still_fails_at_full_quota(self) -> None:
+        for reported_percent, storage_percent in (("100", "10"), ("10", "100")):
+            with self.assertRaisesRegex(RuntimeError, "100%"):
+                evaluate_daily_quota(
+                    event_name="workflow_dispatch", schedule_enabled="false",
+                    reported_percent=reported_percent, storage_percent=storage_percent,
+                    checked_at="2026-07-28", now=NOW, critical_work=True,
+                )
+
     def test_cloud_workflow_is_disabled_by_default_and_uses_compact_retention(self) -> None:
         workflow = (
             Path(__file__).resolve().parents[1]
@@ -85,6 +100,7 @@ class DailyQuotaGuardTests(unittest.TestCase):
         self.assertIn("max_sessions=5", workflow)
         self.assertIn("--reported-percent", workflow)
         self.assertIn("--storage-percent", workflow)
+        self.assertIn("--critical-work", workflow)
         self.assertIn("retention-days: 7", workflow)
         self.assertIn("daily-market-increment/session-*/manifest.json", workflow)
         self.assertNotIn("daily-market-increment/*", workflow)

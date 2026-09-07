@@ -110,7 +110,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
-      - name: Enforce fresh TiDB free-quota attestation below 80 percent
+      - name: Enforce fresh TiDB free-quota attestation for critical daily work
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_ENABLED: ${{ vars.M2_DAILY_ENABLED }}
@@ -127,6 +127,7 @@ jobs:
           --reported-percent "${MANUAL_RU_PERCENT:-$SCHEDULED_RU_PERCENT}"
           --storage-percent "${MANUAL_STORAGE_PERCENT:-$SCHEDULED_STORAGE_PERCENT}"
           --checked-at "${MANUAL_CHECKED_AT:-$SCHEDULED_CHECKED_AT}"
+          --critical-work
 
   ingest:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.M2_DAILY_ENABLED == 'true')
