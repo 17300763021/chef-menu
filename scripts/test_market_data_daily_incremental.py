@@ -334,6 +334,12 @@ class DailyIncrementalTests(unittest.TestCase):
             (("000001", TARGET), ("000002", TARGET), ("600000", TARGET)),
         )
 
+    def test_finalization_reuses_only_explicit_failed_checkpoints_for_exclusion(self) -> None:
+        keys = _reusable_existing_keys(
+            ("000001",), TARGET, (), failed_symbols=("000002",),
+        )
+        self.assertEqual(keys, (("000001", TARGET), ("000002", TARGET)))
+
     def test_weekend_retry_keeps_the_same_business_scope_hash(self) -> None:
         friday_calendar = TradingCalendar.build("fixture", date(2026, 7, 1), TARGET, [PREVIOUS, TARGET])
         sunday_calendar = TradingCalendar.build("fixture", date(2026, 7, 1), date(2026, 8, 2), [PREVIOUS, TARGET])
@@ -491,6 +497,68 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertEqual(manifest["expected_symbol_count"], 800)
         self.assertEqual(manifest["primary_row_count"], 800)
         self.assertEqual(manifest["verification_row_count"], 40)
+
+    def test_explicit_failed_symbols_are_published_as_partial_research_evidence(self) -> None:
+        symbols = tuple(f"{value:06d}" for value in range(1, 101))
+        membership = tuple((symbol, "000905") for symbol in symbols)
+        plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET, previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS, expected_membership=membership,
+            accepted_existing_symbols=(), fetch_symbols=symbols,
+            verification_symbols=symbols[:40], primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64, universe_sha256="c" * 64,
+        )
+        successful = symbols[:-2]
+        primary = [bar("akshare_eastmoney", symbol) for symbol in successful]
+        facts = [fact(symbol, "000905") for symbol in successful]
+        verification = [bar("baostock", symbol) for symbol in plan.verification_symbols]
+        closes = {symbol: Decimal("10") for symbol in successful}
+        states, adjusted = adjustment_inputs(plan, primary, closes)
+        statuses = {symbol: "succeeded" for symbol in successful}
+        statuses.update({symbols[-2]: "failed", symbols[-1]: "failed"})
+        manifest = build_incremental_evidence(
+            plan=plan, primary_bars=primary, tradeability_facts=facts,
+            verification_bars=verification, adjusted_bars=adjusted,
+            adjustment_events=[], previous_adjusted_states=states,
+            accepted_previous_closes=closes, reported_previous_closes=closes,
+            primary_failures={symbols[-2]: "source timeout", symbols[-1]: "source timeout"},
+            checkpoint_statuses=statuses,
+        )[0]
+        self.assertTrue(manifest["accepted"], manifest["gates"])
+        self.assertEqual(manifest["acceptance_status"], "accepted_with_exclusions")
+        self.assertEqual(manifest["excluded_symbols"], list(symbols[-2:]))
+        self.assertFalse(manifest["simulation_orders_allowed"])
+
+    def test_unknown_checkpoint_gap_blocks_even_when_coverage_is_high(self) -> None:
+        symbols = tuple(f"{value:06d}" for value in range(1, 101))
+        membership = tuple((symbol, "000905") for symbol in symbols)
+        plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET, previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS, expected_membership=membership,
+            accepted_existing_symbols=(), fetch_symbols=symbols,
+            verification_symbols=symbols[:40], primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64, universe_sha256="c" * 64,
+        )
+        successful = symbols[:-2]
+        primary = [bar("akshare_eastmoney", symbol) for symbol in successful]
+        facts = [fact(symbol, "000905") for symbol in successful]
+        verification = [bar("baostock", symbol) for symbol in plan.verification_symbols]
+        closes = {symbol: Decimal("10") for symbol in successful}
+        states, adjusted = adjustment_inputs(plan, primary, closes)
+        statuses = {symbol: "succeeded" for symbol in successful}
+        statuses[symbols[-2]] = "failed"
+        manifest = build_incremental_evidence(
+            plan=plan, primary_bars=primary, tradeability_facts=facts,
+            verification_bars=verification, adjusted_bars=adjusted,
+            adjustment_events=[], previous_adjusted_states=states,
+            accepted_previous_closes=closes, reported_previous_closes=closes,
+            checkpoint_statuses=statuses,
+        )[0]
+        self.assertFalse(manifest["accepted"])
+        self.assertEqual(manifest["acceptance_status"], "blocked")
+        self.assertIn(symbols[-1], manifest["checkpoint_unknown_symbols"])
 
     def test_verified_corporate_action_reconciles_previous_close_break(self) -> None:
         plan = small_plan()

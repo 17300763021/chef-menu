@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import date
 
@@ -51,7 +52,7 @@ def _rows():
         "FROM m2_industry_runs": ("industry-full", "2026-08-03", base, 0, 0, digest),
         "FROM m2_fundamental_runs": ("fundamental-full", "2026-08-03", base, 0, 0, digest),
         "FROM m2_index_runs": ("index", "2026-08-03", 0, 0, digest),
-        "FROM m2_daily_runs": ("daily", "2026-08-03", base, 0, 0, digest),
+        "FROM m2_daily_runs": ("daily", "2026-08-03", base, 0, 0, digest, "accepted", "{}"),
         "FROM m2_flow_runs": ("flow", "2026-08-03", 0, 0, 0, digest),
     }
 
@@ -64,6 +65,8 @@ class M2ReleaseGateTests(unittest.TestCase):
         self.assertFalse(manifest["authoritative"])
         self.assertFalse(manifest["simulation_orders_allowed"])
         self.assertFalse(manifest["components"]["flow"]["data_available"])
+        self.assertEqual(manifest["components"]["daily"]["acceptance_status"], "accepted")
+        self.assertEqual(manifest["components"]["daily"]["excluded_symbols"], [])
         self.assertEqual(manifest["market_data_window"], {
             "mode": "last_n_closed_trading_sessions",
             "session_count": RESEARCH_WINDOW_SESSIONS,
@@ -99,6 +102,24 @@ class M2ReleaseGateTests(unittest.TestCase):
         rows["FROM m2_fundamental_runs"] = tuple(row)
         with self.assertRaisesRegex(RuntimeError, "escaped research-only"):
             build_release(_Connection(rows), date(2026, 8, 3))
+
+    def test_discloses_degraded_daily_component(self):
+        rows = _rows()
+        row = list(rows["FROM m2_daily_runs"])
+        row[6] = "accepted_with_exclusions"
+        row[7] = json.dumps({"excluded_symbols": ["689009"]})
+        rows["FROM m2_daily_runs"] = tuple(row)
+        manifest = build_release(_Connection(rows), date(2026, 8, 3))
+        self.assertEqual(
+            manifest["components"]["daily"],
+            {
+                "dataset_id": "daily",
+                "through": "2026-08-03",
+                "manifest_sha256": "a" * 64,
+                "acceptance_status": "accepted_with_exclusions",
+                "excluded_symbols": ["689009"],
+            },
+        )
 
 
 if __name__ == "__main__":

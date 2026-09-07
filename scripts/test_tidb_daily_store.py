@@ -30,6 +30,7 @@ from scripts.market_data.sources.tencent_history_source import TencentHistorySou
 from scripts.market_data.tidb_daily_store import (
     DailyEvidence,
     _canonical_adjusted_bar,
+    _manifest_hashes,
     canonical_lineage_evidence,
     connect,
     default_daily_dataset_id,
@@ -254,7 +255,61 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "m2_daily_run_supersessions",
         ):
             self.assertIn(table, sql)
+        self.assertIn("acceptance_status VARCHAR(32)", sql)
         self.assertEqual(connection.commits, 1)
+
+    def test_partial_aggregate_publishes_and_replays_with_exclusions(self) -> None:
+        expected_symbols = [f"{value:06d}" for value in range(1, 101)]
+        excluded = expected_symbols[-2:]
+        evidence = DailyEvidence(
+            manifest={}, primary_bars=[],
+            tradeability=[{"symbol": symbol} for symbol in expected_symbols[:-2]],
+            verification_bars=[], adjusted_bars=[], adjustments=[],
+        )
+        values = _manifest_hashes(evidence)
+        scope_hash = "f" * 64
+        manifest = {
+            **values,
+            "manifest_version": "m2-daily-incremental-manifest-v7",
+            "schema_version": "m2-daily-incremental-v7",
+            "authoritative": False,
+            "simulation_orders_allowed": False,
+            "accepted": True,
+            "acceptance_status": "accepted_with_exclusions",
+            "target_session": TARGET.isoformat(),
+            "previous_session": PREVIOUS.isoformat(),
+            "snapshot_effective_session": PREVIOUS.isoformat(),
+            "scope_sha256": scope_hash,
+            "expected_symbol_count": len(expected_symbols),
+            "expected_symbols": expected_symbols,
+            "excluded_symbols": excluded,
+            "excluded_symbol_count": len(excluded),
+            "quality_sha256": "e" * 64,
+        }
+        publication = replace(evidence, manifest=manifest)
+        statuses = [(symbol, "failed" if symbol in excluded else "succeeded") for symbol in expected_symbols]
+
+        def router(sql: str, params: Any):
+            if "SELECT symbol, status" in sql:
+                return [(symbol, status, TARGET.isoformat()) for symbol, status in statuses]
+            return []
+
+        result = publish_daily_run(
+            FakeConnection(router), publication,
+            dataset_id=default_daily_dataset_id(TARGET, scope_hash),
+            base_history_dataset_id="base", predecessor_dataset_id="base",
+        )
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["acceptance_status"], "accepted_with_exclusions")
+        self.assertEqual(result["excluded_symbols"], excluded)
+
+    def test_failed_checkpoint_requires_error_for_audit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires an error"):
+            publish_daily_symbol_checkpoint(
+                FakeConnection(), complete_evidence(), dataset_id="daily-scope",
+                symbol="000001", target_session=TARGET, verification_required=False,
+                reported_previous_close=None, status="failed",
+            )
 
     def test_symbol_checkpoint_is_atomic_scope_and_rejects_accepted_mutation(self) -> None:
         evidence = complete_evidence()
@@ -409,7 +464,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
         def fresh_router(sql: str, params: Any):
             if "SELECT symbol, status" in sql:
-                return [("000001", "succeeded")]
+                return [("000001", "succeeded", TARGET.isoformat())]
             return []
 
         connection = FakeConnection(fresh_router)
@@ -424,7 +479,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
         def replay_router(sql: str, params: Any):
             if "SELECT symbol, status" in sql:
-                return [("000001", "succeeded")]
+                return [("000001", "succeeded", TARGET.isoformat())]
             if "run.target_session=%s" in sql:
                 return [(dataset_id, manifest_hash)]
             return []
@@ -477,7 +532,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
         def router(sql: str, params: Any):
             if "SELECT symbol, status" in sql:
-                return [("000001", "succeeded")]
+                return [("000001", "succeeded", TARGET.isoformat())]
             if "run.target_session=%s" in sql:
                 return [("bad-daily-run", "old-manifest-hash")]
             return []
@@ -505,7 +560,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
 
         def replay_router(sql: str, params: Any):
             if "SELECT symbol, status" in sql:
-                return [("000001", "succeeded")]
+                return [("000001", "succeeded", TARGET.isoformat())]
             if "JOIN m2_daily_runs AS run" in sql and "superseded_dataset_id=%s" in sql:
                 return [(dataset_id, manifest_hash)]
             return []
@@ -1015,6 +1070,8 @@ class TiDBDailyStoreTests(unittest.TestCase):
             "dataset_id": "accepted-daily",
             "target_session": TARGET.isoformat(),
             "accepted": True,
+            "acceptance_status": "accepted",
+            "excluded_symbols": [],
             "idempotent_replay": True,
             "authoritative": False,
             "simulation_orders_allowed": False,
@@ -1037,7 +1094,9 @@ class TiDBDailyStoreTests(unittest.TestCase):
             open_dates=(PREVIOUS, TARGET),
             end_date=date(2026, 7, 28),
         )
-        connection = FakeConnection()
+        connection = FakeConnection(
+            lambda sql, params: [("accepted", "{}")] if "acceptance_status" in sql else []
+        )
         with (
             patch(
                 "scripts.market_data.daily_incremental_runner.load_calendars",

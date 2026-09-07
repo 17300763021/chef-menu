@@ -1,8 +1,9 @@
 """Online M2 daily-increment acquisition with TiDB checkpoints.
 
 The runner advances exactly one trading session from the last accepted lineage.
-It never skips a missing session, never publishes a partial aggregate, and every
-stored result remains research-only with simulated-order permission disabled.
+It never skips a missing session, publishes only explicitly checkpointed partial
+aggregates at the approved coverage threshold, and every stored result remains
+research-only with simulated-order permission disabled.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ from scripts.market_data.tidb_daily_store import (
     default_daily_dataset_id,
     ensure_daily_schema,
     latest_accepted_lineage,
+    load_daily_acceptance_status,
     load_base_references,
     load_daily_checkpoint_evidence,
     load_latest_prior_adjusted_states,
@@ -721,6 +723,8 @@ def _accepted_replay_result(
     requested: date | None,
     *,
     base_history_dataset_id: str,
+    acceptance_status: str = "accepted",
+    excluded_symbols: Iterable[str] = (),
 ) -> dict[str, Any] | None:
     """Return the existing immutable result for an exact accepted-date replay."""
     if (
@@ -734,6 +738,8 @@ def _accepted_replay_result(
         "dataset_id": accepted_dataset_id,
         "target_session": latest_accepted.isoformat(),
         "accepted": True,
+        "acceptance_status": acceptance_status,
+        "excluded_symbols": sorted(set(excluded_symbols)),
         "idempotent_replay": True,
         "authoritative": False,
         "simulation_orders_allowed": False,
@@ -744,12 +750,13 @@ def _reusable_existing_keys(
     succeeded_symbols: Iterable[str],
     target_session: date,
     corporate_action_symbols: Iterable[str],
+    failed_symbols: Iterable[str] = (),
 ) -> tuple[tuple[str, date], ...]:
     """Keep action candidates out of checkpoint reuse for the current session."""
     candidates = set(corporate_action_symbols)
     return tuple(
         (symbol, target_session)
-        for symbol in sorted(set(succeeded_symbols) - candidates)
+        for symbol in sorted((set(succeeded_symbols) | set(failed_symbols)) - candidates)
     )
 
 
@@ -823,11 +830,23 @@ def run(
 
     replay = None
     if supersedes_dataset_id is None:
+        replay_status = "accepted"
+        replay_excluded_symbols: list[str] = []
+        if requested_target is not None and requested_target == latest_accepted and predecessor_dataset_id != base_history_dataset_id:
+            replay_connection = connect(config)
+            try:
+                replay_status, replay_excluded_symbols = load_daily_acceptance_status(
+                    replay_connection, predecessor_dataset_id,
+                )
+            finally:
+                replay_connection.close()
         replay = _accepted_replay_result(
             latest_accepted,
             predecessor_dataset_id,
             requested_target,
             base_history_dataset_id=base_history_dataset_id,
+            acceptance_status=replay_status,
+            excluded_symbols=replay_excluded_symbols,
         )
     if replay is not None:
         _progress_result(replay)
@@ -954,6 +973,7 @@ def run(
                     base_plan.corporate_action_symbols,
                     finalize_only=finalize_only,
                 ),
+                failed_symbols=metadata["failed_symbols"] if finalize_only else (),
             ),
             target_session=target,
             corporate_action_inventory=corporate_action_rows,
@@ -982,6 +1002,7 @@ def run(
         all_scope_symbols, plan.fetch_symbols, shard_index, shard_count,
     ))
     if finalize_only and plan.fetch_symbols:
+        unresolved = sorted(set(plan.fetch_symbols) - set(metadata["failed_symbols"]))
         blocked_result = {
             "event": "daily_blocked",
             "dataset_id": dataset_id,
@@ -990,8 +1011,12 @@ def run(
             "authoritative": False,
             "simulation_orders_allowed": False,
             "remaining_symbols": len(plan.fetch_symbols),
-            "blocked_symbols": sorted(plan.fetch_symbols),
-            "reason": "symbol checkpoints incomplete; see TiDB checkpoint error details",
+            "acceptance_status": "blocked",
+            "blocked_symbols": unresolved or sorted(plan.fetch_symbols),
+            "reason": (
+                "unknown or blocked symbol checkpoints remain; explicit failed checkpoints "
+                "may be excluded only after the full scope is checkpointed"
+            ),
         }
         _progress_result(blocked_result)
         return blocked_result
@@ -1185,6 +1210,7 @@ def run(
         factor_reference_closes=factor_references,
         lineage_evidence=lineage_rows,
         primary_failures=primary_failures, verification_failures=verification_failures,
+        checkpoint_statuses=metadata["checkpoint_statuses"],
     )
     status_source_counts: dict[str, int] = {}
     for source in metadata["status_sources"].values():
@@ -1207,6 +1233,7 @@ def run(
         "csi_discovered_notice_ids": sorted(discovered),
         "checkpoint_succeeded_symbol_count": len(metadata["succeeded_symbols"]),
         "checkpoint_blocked_symbol_count": len(metadata["blocked_symbols"]),
+        "checkpoint_failed_symbol_count": len(metadata["failed_symbols"]),
     })
     if supersedes_dataset_id is not None:
         manifest.update({

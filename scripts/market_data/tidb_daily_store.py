@@ -24,7 +24,7 @@ from scripts.market_data.manifest import sha256
 from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect as _connect_once
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v6"
+DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v7"
 DAILY_LINEAGE_SCHEMA_VERSION = "m2-daily-lineage-evidence-v1"
 TRADEABILITY_QUANTUM = Decimal("0.01")
 STORAGE_PRICE_QUANTUM = Decimal("0.0001")
@@ -297,6 +297,21 @@ def default_daily_dataset_id(target_session: date | str, scope_sha256: str) -> s
     return f"m2-daily-{target}-{scope_sha256}"
 
 
+def load_daily_acceptance_status(connection: Any, dataset_id: str) -> tuple[str, list[str]]:
+    """Load the persisted degraded-status disclosure for an accepted daily run."""
+    rows = _query_all(connection, """
+        SELECT acceptance_status, manifest_json
+        FROM m2_daily_runs
+        WHERE dataset_id=%s AND accepted=1
+    """, (dataset_id,))
+    if len(rows) != 1:
+        raise RuntimeError(f"accepted daily dataset status is missing: {dataset_id}")
+    status = str(rows[0][0])
+    manifest = json.loads(str(rows[0][1]))
+    excluded = sorted({normalize_symbol(symbol) for symbol in manifest.get("excluded_symbols", [])})
+    return status, excluded
+
+
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS m2_daily_runs (
@@ -312,6 +327,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       authoritative TINYINT NOT NULL,
       simulation_orders_allowed TINYINT NOT NULL,
       accepted TINYINT NOT NULL,
+      acceptance_status VARCHAR(32) NOT NULL DEFAULT 'accepted',
       expected_symbol_count INT NOT NULL,
       primary_row_count INT NOT NULL,
       adjusted_row_count INT NOT NULL,
@@ -554,6 +570,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       DEFAULT '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'
       AFTER adjustments_sha256
     """,
+    """
+    ALTER TABLE m2_daily_runs
+      ADD COLUMN IF NOT EXISTS acceptance_status VARCHAR(32) NOT NULL DEFAULT 'accepted'
+      AFTER accepted
+    """,
 )
 
 
@@ -693,7 +714,7 @@ RUN_INSERT = """
 INSERT INTO m2_daily_runs (
   dataset_id, schema_version, manifest_version, target_session, previous_session,
   snapshot_effective_session, base_history_dataset_id, predecessor_dataset_id,
-  scope_sha256, authoritative, simulation_orders_allowed, accepted,
+  scope_sha256, authoritative, simulation_orders_allowed, accepted, acceptance_status,
   expected_symbol_count, primary_row_count, adjusted_row_count,
   tradeability_row_count, verification_row_count, adjustment_event_count, lineage_evidence_count,
   primary_sha256, adjusted_sha256, tradeability_sha256, verification_sha256,
@@ -781,6 +802,8 @@ def publish_daily_symbol_checkpoint(
     """Atomically replace one mutable checkpoint while its run is unaccepted."""
     if status not in {"succeeded", "blocked", "failed"}:
         raise ValueError(f"unsupported daily checkpoint status: {status}")
+    if status in {"blocked", "failed"} and error is None:
+        raise ValueError(f"{status} daily checkpoint requires an error for the audit trail")
     if evidence.manifest.get("authoritative") is not False or evidence.manifest.get("simulation_orders_allowed") is not False:
         raise RuntimeError("daily checkpoints must be explicitly non-authoritative and simulation-only")
     observed_symbols = _symbols(evidence)
@@ -878,12 +901,19 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
                primary_sha256, adjusted_sha256, tradeability_sha256,
                verification_sha256, adjustments_sha256, lineage_evidence_sha256
         FROM m2_daily_symbol_checkpoints
-        WHERE dataset_id=%s AND status IN ('succeeded', 'blocked') ORDER BY symbol
+        WHERE dataset_id=%s ORDER BY symbol
     """, (dataset_id,))
-    retained = {str(row[0]) for row in checkpoints}
+    retained = {
+        str(row[0]) for row in checkpoints
+        if str(row[1]) in {"succeeded", "blocked"}
+    }
     metadata = {
         "succeeded_symbols": sorted(str(row[0]) for row in checkpoints if str(row[1]) == "succeeded"),
         "blocked_symbols": sorted(str(row[0]) for row in checkpoints if str(row[1]) == "blocked"),
+        "failed_symbols": sorted(str(row[0]) for row in checkpoints if str(row[1]) == "failed"),
+        "checkpoint_statuses": {
+            str(row[0]): str(row[1]) for row in checkpoints
+        },
         "verification_required_symbols": sorted(str(row[0]) for row in checkpoints if bool(row[2])),
         "reported_previous_closes": {
             str(row[0]): Decimal(str(row[3])) for row in checkpoints if row[3] is not None
@@ -1655,6 +1685,9 @@ def publish_daily_run(
     manifest = evidence.manifest
     if manifest.get("accepted") is not True:
         raise RuntimeError("refusing to publish an unaccepted daily aggregate")
+    acceptance_status = str(manifest.get("acceptance_status", "accepted"))
+    if acceptance_status not in {"accepted", "accepted_with_exclusions"}:
+        raise RuntimeError(f"unsupported daily acceptance status: {acceptance_status}")
     if manifest.get("authoritative") is not False or manifest.get("simulation_orders_allowed") is not False:
         raise RuntimeError("daily aggregate must remain non-authoritative and simulation-only")
     expected = _manifest_hashes(evidence)
@@ -1669,16 +1702,69 @@ def publish_daily_run(
     if dataset_id != default_daily_dataset_id(target, scope_hash):
         raise RuntimeError("daily dataset id does not match target session and scope hash")
     expected_symbols = int(manifest["expected_symbol_count"])
+    if expected_symbols <= 0:
+        raise RuntimeError("daily aggregate expected symbol count must be positive")
+    declared_scope = manifest.get("expected_symbols")
+    if declared_scope is None:
+        if manifest.get("acceptance_status", "accepted") == "accepted":
+            declared_scope = sorted({str(row["symbol"]) for row in evidence.tradeability})
+        else:
+            raise RuntimeError("partial daily aggregate must declare its expected symbol scope")
+    expected_scope = {normalize_symbol(symbol) for symbol in declared_scope}
+    if len(expected_scope) != len(declared_scope) or len(expected_scope) != expected_symbols:
+        raise RuntimeError("daily aggregate expected symbol scope does not reconcile")
+    excluded_symbols = sorted({normalize_symbol(symbol) for symbol in manifest.get("excluded_symbols", [])})
+    if len(excluded_symbols) != len(manifest.get("excluded_symbols", [])):
+        raise RuntimeError("daily aggregate contains duplicate excluded symbols")
+    if int(manifest.get("excluded_symbol_count", len(excluded_symbols))) != len(excluded_symbols):
+        raise RuntimeError("daily aggregate excluded-symbol count does not reconcile")
+    if not set(excluded_symbols) <= expected_scope:
+        raise RuntimeError("daily aggregate excluded symbols are malformed")
+    if acceptance_status == "accepted_with_exclusions" and not excluded_symbols:
+        raise RuntimeError("degraded daily aggregate requires explicit excluded symbols")
+    if acceptance_status == "accepted" and excluded_symbols:
+        raise RuntimeError("accepted daily aggregate cannot hide excluded symbols")
     facts = {str(row["symbol"]) for row in evidence.tradeability}
-    if len(facts) != expected_symbols:
-        raise RuntimeError(f"daily aggregate requires {expected_symbols} complete tradeability facts, got {len(facts)}")
+    if not facts <= expected_scope:
+        raise RuntimeError("daily aggregate tradeability evidence is outside the expected scope")
+    minimum_facts = (expected_symbols * 9800 + 9999) // 10000
+    if len(facts) < minimum_facts:
+        raise RuntimeError(
+            f"daily aggregate tradeability coverage is below 98%: "
+            f"facts={len(facts)} minimum={minimum_facts} expected={expected_symbols}"
+        )
+    if facts | set(excluded_symbols) != expected_scope:
+        raise RuntimeError(
+            f"daily aggregate coverage inventory does not reconcile: "
+            f"facts={len(facts)} excluded={len(excluded_symbols)} expected={expected_symbols}"
+        )
     checkpoints = _query_all(connection, """
-        SELECT symbol, status FROM m2_daily_symbol_checkpoints
+        SELECT symbol, status, target_session FROM m2_daily_symbol_checkpoints
         WHERE dataset_id=%s ORDER BY symbol
     """, (dataset_id,))
-    completed = {str(row[0]) for row in checkpoints if str(row[1]) in {"succeeded", "blocked"}}
-    if completed != facts:
-        raise RuntimeError("daily aggregate checkpoint inventory does not match tradeability evidence")
+    checkpoint_statuses = {str(row[0]): str(row[1]) for row in checkpoints}
+    wrong_date = [
+        str(row[0]) for row in checkpoints
+        if len(row) < 3 or str(row[2]) != target
+    ]
+    if wrong_date:
+        raise RuntimeError(f"daily aggregate checkpoint target session mismatch: {sorted(wrong_date)}")
+    expected_checkpoint_symbols = set(facts) | set(excluded_symbols)
+    if set(checkpoint_statuses) != expected_checkpoint_symbols:
+        raise RuntimeError("daily aggregate checkpoint inventory has an unknown or missing symbol")
+    succeeded = {
+        symbol for symbol, status in checkpoint_statuses.items() if status == "succeeded"
+    }
+    failed = {
+        symbol for symbol, status in checkpoint_statuses.items() if status == "failed"
+    }
+    blocked = {
+        symbol for symbol, status in checkpoint_statuses.items() if status == "blocked"
+    }
+    if blocked:
+        raise RuntimeError(f"daily aggregate cannot publish blocked checkpoints: {sorted(blocked)}")
+    if succeeded != facts or failed != set(excluded_symbols):
+        raise RuntimeError("daily aggregate checkpoint statuses do not match evidence or exclusions")
 
     manifest_hash = sha256(manifest)
     if supersedes_dataset_id is not None:
@@ -1699,6 +1785,8 @@ def publish_daily_run(
                 return {
                     "dataset_id": dataset_id,
                     "accepted": True,
+                    "acceptance_status": acceptance_status,
+                    "excluded_symbols": excluded_symbols,
                     "idempotent_replay": True,
                     "superseded_dataset_id": supersedes_dataset_id,
                 }
@@ -1716,7 +1804,13 @@ def publish_daily_run(
             if len(existing) != 1 or str(existing[0][0]) != supersedes_dataset_id:
                 raise RuntimeError("daily correction does not name the active accepted result")
         elif len(existing) == 1 and str(existing[0][0]) == dataset_id and str(existing[0][1]) == manifest_hash:
-            return {"dataset_id": dataset_id, "accepted": True, "idempotent_replay": True}
+            return {
+                "dataset_id": dataset_id,
+                "accepted": True,
+                "acceptance_status": acceptance_status,
+                "excluded_symbols": excluded_symbols,
+                "idempotent_replay": True,
+            }
         else:
             raise RuntimeError(f"a different accepted daily result already exists for {target}")
     elif supersedes_dataset_id is not None:
@@ -1726,7 +1820,7 @@ def publish_daily_run(
         dataset_id, DAILY_STORE_SCHEMA_VERSION, manifest["manifest_version"], target,
         manifest["previous_session"], manifest["snapshot_effective_session"],
         base_history_dataset_id, predecessor_dataset_id, scope_hash, 0, 0, 1,
-        expected_symbols, expected["primary_row_count"], expected["adjusted_row_count"],
+        acceptance_status, expected_symbols, expected["primary_row_count"], expected["adjusted_row_count"],
         expected["tradeability_row_count"], expected["verification_row_count"],
         expected["adjustment_event_count"], expected["lineage_evidence_count"],
         expected["primary_sha256"],
@@ -1760,7 +1854,13 @@ def publish_daily_run(
     except Exception:
         connection.rollback()
         raise
-    result = {"dataset_id": dataset_id, "accepted": True, "idempotent_replay": False}
+    result = {
+        "dataset_id": dataset_id,
+        "accepted": True,
+        "acceptance_status": acceptance_status,
+        "excluded_symbols": excluded_symbols,
+        "idempotent_replay": False,
+    }
     if supersedes_dataset_id is not None:
         result["superseded_dataset_id"] = supersedes_dataset_id
     return result
@@ -1769,7 +1869,7 @@ def publish_daily_run(
 __all__ = [
     "DAILY_STORE_SCHEMA_VERSION", "DailyEvidence", "TiDBConfig", "connect",
     "daily_correction_context", "default_daily_dataset_id", "ensure_daily_schema", "latest_accepted_lineage",
-    "load_base_references", "load_daily_checkpoint_evidence", "load_daily_evidence",
+    "load_base_references", "load_daily_acceptance_status", "load_daily_checkpoint_evidence", "load_daily_evidence",
     "load_latest_prior_adjusted_states", "load_previous_adjusted_states",
     "recovered_previous_states_from_lineage", "publish_daily_run", "publish_daily_symbol_checkpoint",
 ]

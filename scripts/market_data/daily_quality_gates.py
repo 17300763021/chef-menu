@@ -164,9 +164,9 @@ def evaluate_daily_incremental(
         GateResult("daily_tradeability_scope", not fact_scope_errors, len(fact_scope_errors), "= 0 target-session universe violations", details=_limited(fact_scope_errors)),
         GateResult(
             "daily_tradeability_coverage",
-            fact_coverage == 10000,
+            fact_coverage >= 9800,
             f"{fact_coverage / 100:.2f}%",
-            "= 100.00%",
+            ">= 98.00%",
             details=_limited(missing_facts),
         ),
         GateResult("daily_tradeability_index_alignment", not index_mismatches, len(index_mismatches), "= 0", details=_limited(index_mismatches)),

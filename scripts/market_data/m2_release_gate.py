@@ -58,7 +58,8 @@ def build_release(connection: Any, business_date: date) -> dict[str, Any]:
         index = _one(cursor, """SELECT dataset_id,business_end,authoritative,simulation_orders_allowed,manifest_sha256
             FROM m2_index_runs WHERE accepted=1 ORDER BY business_end DESC LIMIT 1""")
         daily = _one(cursor, """SELECT daily.dataset_id,daily.target_session,daily.base_history_dataset_id,
-                   daily.authoritative,daily.simulation_orders_allowed,daily.manifest_sha256
+                   daily.authoritative,daily.simulation_orders_allowed,daily.manifest_sha256,
+                   daily.acceptance_status,daily.manifest_json
             FROM m2_daily_runs AS daily
             LEFT JOIN m2_daily_run_supersessions AS supersession
               ON supersession.superseded_dataset_id=daily.dataset_id
@@ -67,12 +68,24 @@ def build_release(connection: Any, business_date: date) -> dict[str, Any]:
         flow = _one(cursor, """SELECT dataset_id,business_date,data_available,authoritative,simulation_orders_allowed,manifest_sha256
             FROM m2_flow_runs WHERE boundary_accepted=1 AND business_date=%s
             ORDER BY published_at DESC LIMIT 1""", (business_date,))
+    daily_manifest = json.loads(str(daily[7]))
+    daily_acceptance_status = str(daily[6])
+    if daily_acceptance_status not in {"accepted", "accepted_with_exclusions"}:
+        raise RuntimeError(f"daily component has unsupported acceptance status: {daily_acceptance_status}")
+    daily_excluded_symbols = sorted({str(symbol) for symbol in daily_manifest.get("excluded_symbols", [])})
+    if daily_acceptance_status == "accepted_with_exclusions" and not daily_excluded_symbols:
+        raise RuntimeError("degraded daily component does not disclose excluded symbols")
     component_rows = {
         "history": {"dataset_id": str(history[0]), "through": str(history[1]), "manifest_sha256": str(history[4])},
         "industry": {"dataset_id": str(industry[0]), "through": str(industry[1]), "manifest_sha256": str(industry[5])},
         "fundamental": {"dataset_id": str(fundamental[0]), "through": str(fundamental[1]), "manifest_sha256": str(fundamental[5])},
         "index": {"dataset_id": str(index[0]), "through": str(index[1]), "manifest_sha256": str(index[4])},
-        "daily": {"dataset_id": str(daily[0]), "through": str(daily[1]), "manifest_sha256": str(daily[5])},
+        "daily": {
+            "dataset_id": str(daily[0]), "through": str(daily[1]),
+            "manifest_sha256": str(daily[5]),
+            "acceptance_status": daily_acceptance_status,
+            "excluded_symbols": daily_excluded_symbols,
+        },
         "flow": {"dataset_id": str(flow[0]), "through": str(flow[1]), "data_available": bool(flow[2]), "manifest_sha256": str(flow[5])},
     }
     unsafe = []

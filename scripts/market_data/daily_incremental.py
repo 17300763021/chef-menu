@@ -26,8 +26,8 @@ from scripts.market_data.tradeability_contracts import TradeabilityFact
 from scripts.market_data.universe_contracts import INDEX_SIZES
 
 
-DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v6"
-DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v6"
+DAILY_INCREMENTAL_SCHEMA_VERSION = "m2-daily-incremental-v7"
+DAILY_INCREMENTAL_MANIFEST_VERSION = "m2-daily-incremental-manifest-v7"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_READY_TIME = time(16, 30)
 DEFAULT_VERIFICATION_SYMBOLS = 40
@@ -407,6 +407,7 @@ def build_incremental_evidence(
     lineage_evidence: Iterable[Mapping[str, Any]] = (),
     primary_failures: Mapping[str, str] | None = None,
     verification_failures: Mapping[str, str] | None = None,
+    checkpoint_statuses: Mapping[str, str] | None = None,
 ) -> tuple[
     dict[str, Any], list[DailyBar], list[TradeabilityFact], list[DailyBar],
     list[HistoricalBar], list[AdjustmentEvent],
@@ -465,11 +466,78 @@ def build_incremental_evidence(
             + [f"missing_cash_lineage:{symbol}" for symbol in missing_candidate_lineage]
         ),
     ))
+    expected_symbols = set(plan.membership)
+    if checkpoint_statuses is None:
+        failure_map_symbols = (
+            (set(primary_failures or {}) | set(verification_failures or {}))
+            & expected_symbols
+        )
+        missing_failure_checkpoints = sorted(failure_map_symbols - {row.symbol for row in fact_rows})
+        explicit_failed_symbols: list[str] = []
+        unknown_checkpoint_symbols = missing_failure_checkpoints
+        blocked_checkpoint_symbols: list[str] = []
+        invalid_checkpoint_symbols: list[str] = []
+        if missing_failure_checkpoints:
+            gates.append(GateResult(
+                "daily_checkpoint_inventory",
+                False,
+                f"missing explicit checkpoint status for {len(missing_failure_checkpoints)} failure symbols",
+                "all excluded symbols require a persisted failed checkpoint",
+                details=tuple(f"unknown:{symbol}" for symbol in missing_failure_checkpoints[:20]),
+            ))
+    else:
+        statuses = {str(symbol): str(status) for symbol, status in checkpoint_statuses.items()}
+        explicit_failed_symbols = sorted(
+            symbol for symbol, status in statuses.items()
+            if symbol in expected_symbols and status == "failed"
+        )
+        unknown_checkpoint_symbols = sorted(expected_symbols - set(statuses))
+        blocked_checkpoint_symbols = sorted(
+            symbol for symbol, status in statuses.items()
+            if symbol in expected_symbols and status == "blocked"
+        )
+        invalid_checkpoint_symbols = sorted(
+            symbol for symbol, status in statuses.items()
+            if symbol not in expected_symbols or status not in {"succeeded", "blocked", "failed"}
+        )
+        gates.extend([
+            GateResult(
+                "daily_checkpoint_inventory",
+                not unknown_checkpoint_symbols and not invalid_checkpoint_symbols,
+                f"known={len(expected_symbols) - len(unknown_checkpoint_symbols)}/{len(expected_symbols)}",
+                "100.00% explicit succeeded, blocked, or failed checkpoints",
+                details=tuple(
+                    [f"unknown:{symbol}" for symbol in unknown_checkpoint_symbols]
+                    + [f"invalid:{symbol}" for symbol in invalid_checkpoint_symbols]
+                )[:20],
+            ),
+            GateResult(
+                "daily_checkpoint_blocked_symbols",
+                not blocked_checkpoint_symbols,
+                len(blocked_checkpoint_symbols),
+                "= 0 unresolved blocked checkpoints",
+                details=tuple(blocked_checkpoint_symbols[:20]),
+            ),
+        ])
+    if explicit_failed_symbols:
+        gates.append(GateResult(
+            "daily_checkpoint_failed_symbols_explicit",
+            True,
+            len(explicit_failed_symbols),
+            "checkpointed failures may be excluded only with >=98% coverage",
+            critical=False,
+            details=tuple(explicit_failed_symbols[:20]),
+        ))
     canonical_primary = canonical_rows(primary_rows)
     canonical_facts = [row.canonical() for row in fact_rows]
     canonical_verification = canonical_rows(verification_rows)
     canonical_adjusted = [row.canonical() for row in adjusted_rows]
     canonical_events = [row.canonical() for row in event_rows]
+    manifest_accepted = accepted(gates)
+    acceptance_status = (
+        "accepted_with_exclusions" if manifest_accepted and explicit_failed_symbols
+        else "accepted" if manifest_accepted else "blocked"
+    )
     manifest = {
         "manifest_version": DAILY_INCREMENTAL_MANIFEST_VERSION,
         "schema_version": DAILY_INCREMENTAL_SCHEMA_VERSION,
@@ -492,6 +560,7 @@ def build_incremental_evidence(
         "corporate_action_inventory_sha256": plan.corporate_action_inventory_sha256,
         "corporate_action_candidate_count": len(plan.corporate_action_symbols),
         "corporate_action_symbols": list(plan.corporate_action_symbols),
+        "expected_symbols": sorted(expected_symbols),
         "expected_membership_sha256": sha256([
             {"symbol": symbol, "index_code": index_code}
             for symbol, index_code in plan.expected_membership
@@ -502,6 +571,11 @@ def build_incremental_evidence(
         "adjusted_row_count": len(adjusted_rows),
         "adjustment_event_count": len(event_rows),
         "lineage_evidence_count": len(lineage_rows),
+        "excluded_symbols": explicit_failed_symbols,
+        "excluded_symbol_count": len(explicit_failed_symbols),
+        "checkpoint_unknown_symbols": unknown_checkpoint_symbols,
+        "checkpoint_blocked_symbols": blocked_checkpoint_symbols,
+        "checkpoint_invalid_symbols": invalid_checkpoint_symbols,
         "primary_failures": dict(sorted((primary_failures or {}).items())),
         "verification_failures": dict(sorted((verification_failures or {}).items())),
         "primary_sha256": sha256(canonical_primary),
@@ -511,7 +585,8 @@ def build_incremental_evidence(
         "adjustments_sha256": sha256(canonical_events),
         "lineage_evidence_sha256": sha256(lineage_rows),
         "quality_sha256": sha256([gate.canonical() for gate in gates]),
-        "accepted": accepted(gates),
+        "accepted": manifest_accepted,
+        "acceptance_status": acceptance_status,
         "gates": [gate.canonical() for gate in gates],
     }
     return manifest, primary_rows, fact_rows, verification_rows, adjusted_rows, event_rows
