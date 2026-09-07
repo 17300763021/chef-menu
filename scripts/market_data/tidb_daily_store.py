@@ -363,6 +363,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS m2_daily_symbol_failures (
+      dataset_id VARCHAR(160) NOT NULL,
+      symbol CHAR(6) NOT NULL,
+      target_session DATE NOT NULL,
+      stage VARCHAR(64) NOT NULL,
+      status VARCHAR(32) NOT NULL,
+      error_class VARCHAR(128) NOT NULL,
+      error_message TEXT NOT NULL,
+      recorded_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+      PRIMARY KEY (dataset_id, symbol, stage),
+      KEY idx_m2_daily_failures_target (target_session, status),
+      KEY idx_m2_daily_failures_symbol (symbol, target_session)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS m2_daily_primary_bars (
       dataset_id VARCHAR(160) NOT NULL,
       symbol CHAR(6) NOT NULL,
@@ -662,6 +678,17 @@ ON DUPLICATE KEY UPDATE
 """
 
 
+FAILURE_UPSERT = """
+INSERT INTO m2_daily_symbol_failures (
+  dataset_id, symbol, target_session, stage, status, error_class, error_message
+) VALUES (%s, %s, %s, %s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  target_session=VALUES(target_session), status=VALUES(status),
+  error_class=VALUES(error_class), error_message=VALUES(error_message),
+  recorded_at=CURRENT_TIMESTAMP(6)
+"""
+
+
 RUN_INSERT = """
 INSERT INTO m2_daily_runs (
   dataset_id, schema_version, manifest_version, target_session, previous_session,
@@ -826,6 +853,13 @@ def publish_daily_symbol_checkpoint(
         error_class, error_text,
     )
     counts["symbol_checkpoints"] = _upsert_many(connection, CHECKPOINT_UPSERT, [checkpoint])
+    if status in {"blocked", "failed"} and error_text:
+        counts_failure = _upsert_many(connection, FAILURE_UPSERT, [(
+            dataset_id, symbol, target_session.isoformat(), "daily_symbol_capture",
+            status, error_class or "RuntimeError", error_text,
+        )])
+        if counts_failure != 1:
+            raise RuntimeError("daily symbol failure record was not persisted")
     connection.commit()
     return counts
 

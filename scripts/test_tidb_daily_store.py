@@ -247,6 +247,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
         sql = "\n".join(statement for statement, _params in connection.executed)
         for table in (
             "m2_daily_runs", "m2_daily_symbol_checkpoints", "m2_daily_primary_bars",
+            "m2_daily_symbol_failures",
             "m2_daily_adjusted_bars", "m2_daily_tradeability_facts",
             "m2_daily_verification_bars", "m2_daily_adjustment_events",
             "m2_daily_lineage_evidence",
@@ -326,6 +327,18 @@ class TiDBDailyStoreTests(unittest.TestCase):
             if "m2_daily_symbol_checkpoints" in sql
         )
         self.assertEqual(checkpoint_batch[0][4:9], (1, 0, 1, 1, 0))
+        failure_sql, failure_batch = next(
+            (sql, rows) for sql, rows in connection.executed_many
+            if "m2_daily_symbol_failures" in sql
+        )
+        self.assertIn("ON DUPLICATE KEY UPDATE", failure_sql)
+        self.assertEqual(
+            failure_batch[0],
+            (
+                "daily-scope", "000001", TARGET.isoformat(), "daily_symbol_capture",
+                "blocked", "RuntimeError", "missing adjustment factor",
+            ),
+        )
 
     def test_lineage_evidence_is_canonical_persisted_and_rehydrates_predecessor(self) -> None:
         evidence = complete_evidence()
