@@ -530,6 +530,45 @@ class DailyIncrementalTests(unittest.TestCase):
         self.assertEqual(manifest["excluded_symbols"], list(symbols[-2:]))
         self.assertFalse(manifest["simulation_orders_allowed"])
 
+    def test_verification_source_failure_is_an_explicit_partial_exclusion(self) -> None:
+        symbols = tuple(f"{value:06d}" for value in range(1, 101))
+        membership = tuple((symbol, "000905") for symbol in symbols)
+        plan = DailyIncrementalPlan(
+            observed_at=datetime(2026, 7, 27, 17, 0, tzinfo=SHANGHAI),
+            target_session=TARGET, previous_session=PREVIOUS,
+            snapshot_effective_session=PREVIOUS, expected_membership=membership,
+            accepted_existing_symbols=(), fetch_symbols=symbols,
+            verification_symbols=symbols[:40], primary_calendar_sha256="a" * 64,
+            secondary_calendar_sha256="b" * 64, universe_sha256="c" * 64,
+        )
+        failed_symbol = symbols[0]
+        primary = [bar("akshare_eastmoney", symbol) for symbol in symbols]
+        facts = [fact(symbol, "000905") for symbol in symbols]
+        verification = [
+            bar("baostock", symbol)
+            for symbol in plan.verification_symbols
+            if symbol != failed_symbol
+        ]
+        closes = {symbol: Decimal("10") for symbol in symbols}
+        states, adjusted = adjustment_inputs(plan, primary, closes)
+        statuses = {symbol: "succeeded" for symbol in symbols}
+        statuses[failed_symbol] = "failed"
+        manifest = build_incremental_evidence(
+            plan=plan, primary_bars=primary, tradeability_facts=facts,
+            verification_bars=verification, adjusted_bars=adjusted,
+            adjustment_events=[], previous_adjusted_states=states,
+            accepted_previous_closes=closes, reported_previous_closes=closes,
+            verification_failures={failed_symbol: "verification source offline after retries"},
+            checkpoint_statuses=statuses,
+        )[0]
+        self.assertTrue(manifest["accepted"], manifest["gates"])
+        self.assertEqual(manifest["acceptance_status"], "accepted_with_exclusions")
+        self.assertEqual(manifest["excluded_symbols"], [failed_symbol])
+        self.assertEqual(manifest["verification_failures"], {
+            failed_symbol: "verification source offline after retries",
+        })
+        self.assertFalse(manifest["simulation_orders_allowed"])
+
     def test_unknown_checkpoint_gap_blocks_even_when_coverage_is_high(self) -> None:
         symbols = tuple(f"{value:06d}" for value in range(1, 101))
         membership = tuple((symbol, "000905") for symbol in symbols)

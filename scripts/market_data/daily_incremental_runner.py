@@ -47,6 +47,8 @@ from scripts.market_data.sources.akshare_history_source import (
     AkshareEastmoneyHistorySource,
     AkshareHistorySource,
     SinaFactorsUnavailableError,
+    VerificationSourceIntegrityError,
+    VerificationSourceUnavailableError,
 )
 from scripts.market_data.sources.baostock_history_source import BaostockHistorySource
 from scripts.market_data.sources.csi_index_source import CsiIndexSource
@@ -81,6 +83,16 @@ DEFAULT_BASE_HISTORY_DATASET_ID = (
     "m2-full-2026-07-24-"
     "993df9aab3cbd021a495535c9326eaa79f26f4bbfbe74b28215256e778e517f7-merged"
 )
+
+
+class DailyVerificationIntegrityError(RuntimeError):
+    """A verification response was present but failed structural/data checks."""
+
+
+class DailyVerificationUnavailableError(RuntimeError):
+    """All bounded independent verification requests were exhausted."""
+
+
 SYMBOL_DEADLINE_SECONDS = 90
 CALENDAR_DEADLINE_SECONDS = 180
 
@@ -657,46 +669,123 @@ def capture_symbol(
         listing_age_sessions=age, primary=_tradeability_row(primary), secondary=secondary,
     )
     if verification_required:
+        verification_integrity_error = False
         try:
             values = verification_source.fetch_raw(
                 symbol, target, target, exclude_sources={str(primary_source_name or primary.source)},
             )
-            verification = _one_target_row(values, symbol, target, "verification source")
-        except Exception as error:
+            try:
+                verification = _one_target_row(values, symbol, target, "verification source")
+            except Exception as row_error:
+                raise DailyVerificationIntegrityError(
+                    f"verification source response is structurally invalid for {symbol}: {row_error}"
+                ) from row_error
+        except VerificationSourceIntegrityError as error:
+            verification_integrity_error = True
+            recoverable_error = DailyVerificationIntegrityError(str(error))
+        except VerificationSourceUnavailableError as error:
+            recoverable_error = DailyVerificationUnavailableError(str(error))
+        except DailyVerificationIntegrityError as error:
+            verification_integrity_error = True
             recoverable_error = error
-            if verification_fallback_source is not None and primary.source != "baostock":
+        except (ValueError, KeyError, TypeError, AttributeError, AssertionError) as error:
+            verification_integrity_error = True
+            recoverable_error = DailyVerificationIntegrityError(
+                f"verification source response is structurally invalid for {symbol}: {error}"
+            )
+        except (ConnectionError, TimeoutError, OSError) as error:
+            recoverable_error = DailyVerificationUnavailableError(str(error))
+        except RuntimeError as error:
+            verification_integrity_error = True
+            recoverable_error = DailyVerificationIntegrityError(
+                f"verification source returned an unclassified error for {symbol}: {error}"
+            )
+        except Exception as error:
+            verification_integrity_error = True
+            recoverable_error = DailyVerificationIntegrityError(
+                f"verification source response is structurally invalid for {symbol}: "
+                f"{type(error).__name__}: {error}"
+            )
+        if verification is None and verification_fallback_source is not None and primary.source != "baostock":
+            try:
+                fallback_status = verification_fallback_source.fetch_status(
+                    symbol, target, target,
+                )
+                fallback_bars = verification_fallback_source.bars_from_status(
+                    symbol, fallback_status,
+                )
                 try:
-                    fallback_status = verification_fallback_source.fetch_status(
-                        symbol, target, target,
-                    )
-                    fallback_bars = verification_fallback_source.bars_from_status(
-                        symbol, fallback_status,
-                    )
                     verification = _one_target_row(
                         fallback_bars.values(), symbol, target, "BaoStock verification source",
                     )
-                    consistency_errors = cross_source_consistency_errors(primary, verification)
-                    if consistency_errors:
-                        raise RuntimeError(
-                            f"BaoStock verification disagrees for {symbol}: "
-                            f"{','.join(consistency_errors)}"
-                        )
+                except Exception as row_error:
+                    raise DailyVerificationIntegrityError(
+                        f"BaoStock verification response is structurally invalid for {symbol}: {row_error}"
+                    ) from row_error
+                consistency_errors = cross_source_consistency_errors(primary, verification)
+                if consistency_errors:
+                    raise DailyVerificationIntegrityError(
+                        f"BaoStock verification disagrees for {symbol}: "
+                        f"{','.join(consistency_errors)}"
+                    )
+                if not verification_integrity_error:
                     recoverable_error = None
-                except Exception as fallback_error:
-                    verification = None
-                    recoverable_error = RuntimeError(
-                        f"{error}; baostock_verification: "
+            except DailyVerificationIntegrityError as fallback_error:
+                verification = None
+                verification_integrity_error = True
+                recoverable_error = RuntimeError(
+                    f"{recoverable_error}; baostock_verification: "
+                    f"{type(fallback_error).__name__}: {fallback_error}"
+                )
+            except (ValueError, KeyError, TypeError, AttributeError, AssertionError) as fallback_error:
+                verification = None
+                verification_integrity_error = True
+                recoverable_error = DailyVerificationIntegrityError(
+                    f"{recoverable_error}; baostock_verification: "
+                    f"{type(fallback_error).__name__}: {fallback_error}"
+                )
+            except (ConnectionError, TimeoutError, OSError) as fallback_error:
+                verification = None
+                recoverable_error = DailyVerificationUnavailableError(
+                    f"{recoverable_error}; baostock_verification: "
+                    f"{type(fallback_error).__name__}: {fallback_error}"
+                )
+            except RuntimeError as fallback_error:
+                verification = None
+                fallback_text = str(fallback_error).lower()
+                if "baostock" in fallback_text and "failed" in fallback_text:
+                    recoverable_error = DailyVerificationUnavailableError(
+                        f"{recoverable_error}; baostock_verification: "
                         f"{type(fallback_error).__name__}: {fallback_error}"
                     )
+                else:
+                    verification_integrity_error = True
+                    recoverable_error = DailyVerificationIntegrityError(
+                        f"{recoverable_error}; baostock_verification: "
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
+            except Exception as fallback_error:
+                verification = None
+                verification_integrity_error = True
+                recoverable_error = DailyVerificationIntegrityError(
+                    f"{recoverable_error}; baostock_verification: "
+                    f"{type(fallback_error).__name__}: {fallback_error}"
+                )
 
     evidence = _checkpoint_evidence(
         primary=primary, fact=fact, verification=verification, adjusted=adjusted, events=events,
         status_source=status_source, previous_close_source=previous_close_source,
         lineage_evidence=lineage_evidence,
     )
-    if verification_required and verification is None:
+    if verification_required and verification_integrity_error:
         assert recoverable_error is not None
         return evidence, reported, "blocked", recoverable_error
+    if verification_required and verification is None:
+        assert recoverable_error is not None
+        # An exhausted independent verification source is an explicit,
+        # symbol-scoped exclusion. A response that exists but disagrees
+        # structurally with the primary source remains blocked.
+        return evidence, reported, "failed", recoverable_error
     return evidence, reported, "succeeded", None
 
 
@@ -1152,7 +1241,7 @@ def run(
                         ),
                         dataset_id=dataset_id, symbol=symbol, target_session=target,
                         verification_required=symbol in set(plan.verification_symbols),
-                        reported_previous_close=None, status="failed", error=final_error or "unknown failure",
+                        reported_previous_close=None, status="blocked", error=final_error or "unknown failure",
                     )
                 finally:
                     failed_connection.close()

@@ -86,6 +86,7 @@ jobs:
       - name: Run deterministic M2 daily and prerequisite tests
         run: |
           python -m scripts.test_market_data_daily_incremental
+          python -m scripts.test_market_data_daily_catchup
           python -m scripts.test_market_data_daily_quota
           python -m scripts.test_historical_market_data
           python -m scripts.test_tidb_daily_store

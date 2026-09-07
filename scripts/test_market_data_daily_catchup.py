@@ -71,6 +71,29 @@ class DailyCatchupTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 2)
         self.assertEqual(summary["results"][0]["acceptance_status"], "accepted_with_exclusions")
 
+    def test_verification_outage_exclusion_advances_catchup(self) -> None:
+        responses = [
+            {
+                "accepted": True,
+                "acceptance_status": "accepted_with_exclusions",
+                "dataset_id": "verification-outage-day",
+                "excluded_symbols": ["000001"],
+                "verification_failures": {"000001": "verification source offline after retries"},
+                "simulation_orders_allowed": False,
+            },
+            {"event": "daily_noop"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "scripts.market_data.daily_catchup_runner.run", side_effect=responses,
+        ) as mocked:
+            summary = catch_up(
+                max_sessions=5, base_history_dataset_id="base", output_dir=Path(tmp),
+                symbol_attempts=2,
+            )
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(summary["results"][0]["excluded_symbols"], ["000001"])
+        self.assertEqual(summary["event"], "daily_catchup_completed")
+
     def test_stable_shards_do_not_change_when_other_checkpoints_finish(self) -> None:
         membership = [(f"{value:06d}", "000300" if value < 6 else "000905") for value in range(12)]
         scope = list(daily_membership_symbols(membership))

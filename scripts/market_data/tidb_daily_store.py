@@ -905,7 +905,7 @@ def load_daily_checkpoint_evidence(connection: Any, dataset_id: str) -> tuple[Da
     """, (dataset_id,))
     retained = {
         str(row[0]) for row in checkpoints
-        if str(row[1]) in {"succeeded", "blocked"}
+        if str(row[1]) in {"succeeded", "blocked", "failed"}
     }
     metadata = {
         "succeeded_symbols": sorted(str(row[0]) for row in checkpoints if str(row[1]) == "succeeded"),
@@ -1765,6 +1765,27 @@ def publish_daily_run(
         raise RuntimeError(f"daily aggregate cannot publish blocked checkpoints: {sorted(blocked)}")
     if succeeded != facts or failed != set(excluded_symbols):
         raise RuntimeError("daily aggregate checkpoint statuses do not match evidence or exclusions")
+    if failed:
+        failure_rows = _query_all(connection, """
+            SELECT symbol, status, error_message
+            FROM m2_daily_symbol_failures
+            WHERE dataset_id=%s AND stage='daily_symbol_capture'
+        """, (dataset_id,))
+        failure_audit = {
+            str(row[0]): (str(row[1]), str(row[2]).strip())
+            for row in failure_rows
+            if len(row) >= 3
+        }
+        missing_audit = sorted(
+            symbol for symbol in failed
+            if not failure_audit.get(symbol)
+            or failure_audit[symbol][0] != "failed"
+            or not failure_audit[symbol][1]
+        )
+        if missing_audit:
+            raise RuntimeError(
+                f"daily aggregate failed checkpoints lack matching failure audit: {missing_audit}"
+            )
 
     manifest_hash = sha256(manifest)
     if supersedes_dataset_id is not None:

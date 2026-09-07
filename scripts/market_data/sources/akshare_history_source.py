@@ -34,6 +34,14 @@ class SinaFactorsUnavailableError(RuntimeError):
     """Both Sina QFQ and HFQ factor series are confirmed unavailable."""
 
 
+class VerificationSourceUnavailableError(RuntimeError):
+    """All verification-source requests were exhausted without a usable row."""
+
+
+class VerificationSourceIntegrityError(RuntimeError):
+    """A verification provider returned data that violated the bar contract."""
+
+
 def _confirmed_sina_factor_absence(error: Exception) -> bool:
     """Recognize only AKShare's explicit factor-unavailable signal."""
     return isinstance(error, ValueError) and str(error).strip().lower() in {
@@ -120,7 +128,20 @@ class AkshareHistorySource:
                 ).fetch_raw(code, start, end)
             except Exception as error:
                 failures.append(f"tencent_archive: {type(error).__name__}: {error}")
-        raise RuntimeError(f"verification sources failed for {code}: {'; '.join(failures) or 'all sources excluded'}")
+        failure_text = "; ".join(failures) or "all sources excluded"
+        if any(
+            marker in failure_text.lower()
+            for marker in (
+                "valueerror", "keyerror", "typeerror", "attributeerror", "assertionerror",
+                "malformed", "invalid",
+            )
+        ):
+            raise VerificationSourceIntegrityError(
+                f"verification sources returned invalid data for {code}: {failure_text}"
+            )
+        raise VerificationSourceUnavailableError(
+            f"verification sources failed for {code}: {failure_text}"
+        )
 
 
 class AkshareEastmoneyHistorySource:

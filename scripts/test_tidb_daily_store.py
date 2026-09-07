@@ -290,6 +290,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         statuses = [(symbol, "failed" if symbol in excluded else "succeeded") for symbol in expected_symbols]
 
         def router(sql: str, params: Any):
+            if "FROM m2_daily_symbol_failures" in sql:
+                return [
+                    (symbol, "failed", "verification source offline after retries")
+                    for symbol in excluded
+                ]
             if "SELECT symbol, status" in sql:
                 return [(symbol, status, TARGET.isoformat()) for symbol, status in statuses]
             return []
@@ -1183,6 +1188,11 @@ class FakeVerification:
         return [raw_bar(symbol, source="akshare_sina")]
 
 
+class FakeMalformedVerification(FakeVerification):
+    def fetch_raw(self, symbol: str, start: date, end: date, *, exclude_sources=None):
+        return [None]
+
+
 class FakeSecondary:
     def __init__(self, *, preclose: str = "10", status: str = "1") -> None:
         self.preclose = preclose
@@ -1209,6 +1219,11 @@ class FakeBaoStockVerification(FakeSecondary):
                 is_st=bar.is_st,
             )
         return {TARGET: bar}
+
+
+class FakeMalformedBaoStockVerification(FakeBaoStockVerification):
+    def bars_from_status(self, symbol: str, rows):
+        raise ValueError("malformed BaoStock verification row")
 
 
 class DailyCaptureTests(unittest.TestCase):
@@ -1745,7 +1760,7 @@ class DailyCaptureTests(unittest.TestCase):
         self.assertEqual(evidence.lineage_evidence[0]["kind"], "gap_no_adjustment_recovery")
         self.assertEqual(evidence.adjusted_bars[0]["hfq_factor"], "2")
 
-    def test_capture_blocks_missing_predecessor_or_verification_without_guessing(self) -> None:
+    def test_capture_blocks_missing_predecessor_but_excludes_verification_outage(self) -> None:
         common = {
             "plan": plan(), "symbol": "000001", "primary_source": FakePrimary(),
             "secondary_source": FakeSecondary(), "ipo_dates": {"000001": date(1991, 4, 3)},
@@ -1764,10 +1779,74 @@ class DailyCaptureTests(unittest.TestCase):
             **common, verification_source=FakeVerification(fail=True),
             previous_states={"000001": previous_state()},
         )
-        self.assertEqual(status, "blocked")
+        self.assertEqual(status, "failed")
         self.assertIn("verification offline", str(error))
         self.assertEqual(len(unverified.primary_bars), 1)
         self.assertEqual(unverified.verification_bars, [])
+
+    def test_failed_verification_checkpoint_preserves_failure_audit_without_verification_row(self) -> None:
+        evidence = complete_evidence()
+        evidence.verification_bars.clear()
+        connection = FakeConnection()
+        counts = publish_daily_symbol_checkpoint(
+            connection, evidence, dataset_id="daily-scope", symbol="000001",
+            target_session=TARGET, verification_required=True,
+            reported_previous_close=Decimal("10"), status="failed",
+            error=RuntimeError("verification source offline after retries"),
+        )
+        self.assertEqual(counts["verification_bars"], 0)
+        checkpoint_batch = next(
+            rows for sql, rows in connection.executed_many
+            if "m2_daily_symbol_checkpoints" in sql
+        )
+        self.assertEqual(checkpoint_batch[0][3], "failed")
+        failure_sql, failure_batch = next(
+            (sql, rows) for sql, rows in connection.executed_many
+            if "m2_daily_symbol_failures" in sql
+        )
+        self.assertIn("ON DUPLICATE KEY UPDATE", failure_sql)
+        self.assertEqual(
+            failure_batch[0],
+            (
+                "daily-scope", "000001", TARGET.isoformat(), "daily_symbol_capture",
+                "failed", "RuntimeError", "verification source offline after retries",
+            ),
+        )
+
+    def test_malformed_verification_response_remains_blocked(self) -> None:
+        evidence, _reported, status, error = capture_symbol(
+            plan=plan(), symbol="000001", primary_source=FakePrimary(),
+            verification_source=FakeMalformedVerification(), secondary_source=None,
+            fallback_suspended_symbols=frozenset(), fallback_status_available=True,
+            previous_states={"000001": previous_state()},
+            ipo_dates={"000001": date(1991, 4, 3)}, calendar_dates=(PREVIOUS, TARGET),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("structurally invalid", str(error))
+        self.assertEqual(evidence.verification_bars, [])
+
+    def test_malformed_fallback_or_primary_response_cannot_become_exclusion(self) -> None:
+        common = {
+            "plan": plan(), "symbol": "000001", "primary_source": FakePrimary(),
+            "secondary_source": FakeSecondary(),
+            "fallback_suspended_symbols": frozenset(), "fallback_status_available": True,
+            "previous_states": {"000001": previous_state()},
+            "ipo_dates": {"000001": date(1991, 4, 3)},
+            "calendar_dates": (PREVIOUS, TARGET),
+        }
+        _evidence, _reported, status, error = capture_symbol(
+            **common, verification_source=FakeVerification(fail=True),
+            verification_fallback_source=FakeMalformedBaoStockVerification(),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("malformed BaoStock", str(error))
+
+        _evidence, _reported, status, error = capture_symbol(
+            **common, verification_source=FakeMalformedVerification(),
+            verification_fallback_source=FakeBaoStockVerification(),
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("structurally invalid", str(error))
 
     def test_confirmed_suspension_is_complete_and_never_fabricates_a_bar(self) -> None:
         evidence, _reported, status, error = capture_symbol(
