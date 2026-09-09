@@ -636,11 +636,25 @@ class MySQLCheckpointStoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(connection.executed), 6)
         self.assertEqual(connection.commits, 1)
         self.assertTrue(all(
-            "CREATE TABLE IF NOT EXISTS" in sql or "ALTER TABLE" in sql
+            "CREATE TABLE IF NOT EXISTS" in sql
+            or "information_schema.COLUMNS" in sql
+            or "ALTER TABLE" in sql
             for sql, _ in connection.executed
         ))
-        self.assertTrue(any("ADD COLUMN IF NOT EXISTS verification_source" in sql for sql, _ in connection.executed))
+        self.assertTrue(any("ADD COLUMN verification_source" in sql for sql, _ in connection.executed))
         self.assertTrue(any("m2_history_run_shards" in sql for sql, _ in connection.executed))
+
+    def test_schema_migration_skips_existing_verification_source_column(self) -> None:
+        class ExistingColumnConnection(FakeConnection):
+            def query_result(self, sql: str):
+                if "information_schema.COLUMNS" in sql:
+                    return [(1,)]
+                return []
+
+        connection = ExistingColumnConnection()
+        ensure_schema(connection)
+        self.assertEqual(connection.commits, 1)
+        self.assertFalse(any("ADD COLUMN verification_source" in sql for sql, _ in connection.executed))
 
     def test_manifest_only_publish_maps_shards_without_duplicate_market_rows(self) -> None:
         evidence = merged_manifest_evidence()

@@ -362,10 +362,6 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
-    ALTER TABLE m2_history_verification_checks
-      ADD COLUMN IF NOT EXISTS verification_source VARCHAR(96) NULL AFTER verification_close
-    """,
-    """
     CREATE TABLE IF NOT EXISTS m2_adjustment_events (
       dataset_id VARCHAR(160) NOT NULL,
       symbol CHAR(6) NOT NULL,
@@ -422,11 +418,29 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
 )
 
+SCHEMA_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "m2_history_verification_checks",
+        "verification_source",
+        """ALTER TABLE m2_history_verification_checks
+        ADD COLUMN verification_source VARCHAR(96) NULL AFTER verification_close""",
+    ),
+)
+
 
 def ensure_schema(connection: Any) -> None:
     with connection.cursor() as cursor:
         for statement in SCHEMA_STATEMENTS:
             cursor.execute(statement)
+        for table_name, column_name, statement in SCHEMA_COLUMN_MIGRATIONS:
+            cursor.execute(
+                """SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s""",
+                (table_name, column_name),
+            )
+            row = cursor.fetchone()
+            if not row or int(row[0]) == 0:
+                cursor.execute(statement)
     connection.commit()
 
 
