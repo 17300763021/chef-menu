@@ -21,15 +21,15 @@ from scripts.market_data.quality_gates import accepted
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
 from scripts.market_data.sources.cninfo_announcement_source import CninfoAnnouncementSource
 from scripts.market_data.sources.eastmoney_fundamental_source import EastmoneyFundamentalSource
-from scripts.market_data.tidb_fundamental_store import (
-    TiDBConfig,
+from scripts.market_data.mysql_fundamental_store import (
+    MySQLConfig,
     connect,
     ensure_fundamental_schema,
     load_dataset,
     publish_run,
     publish_symbol_checkpoint,
 )
-from scripts.market_data.tidb_industry_store import load_base_scope
+from scripts.market_data.mysql_industry_store import load_base_scope
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -87,7 +87,7 @@ def capture(
     shard_count: int,
     attempts: int,
 ) -> dict[str, Any]:
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     connection = connect(config)
     try:
         ensure_fundamental_schema(connection)
@@ -209,7 +209,7 @@ def _fact_from_db(row: Mapping[str, Any]) -> FundamentalFact:
 
 
 def finalize(*, mode: str, as_of_date: date, base_id: str, output_dir: Path) -> dict[str, Any]:
-    connection = connect(TiDBConfig.from_env())
+    connection = connect(MySQLConfig.from_env())
     try:
         ensure_fundamental_schema(connection)
         scope = _scope(connection, base_id, mode)

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect
 
 
 RELEASE_SCHEMA_VERSION = "m2-data-release-v1"
@@ -166,7 +166,7 @@ def main() -> int:
     parser.add_argument("--business-date", type=date.fromisoformat, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("m2-release"))
     args = parser.parse_args()
-    connection = connect(TiDBConfig.from_env())
+    connection = connect(MySQLConfig.from_env())
     try:
         manifest = build_release(connection, args.business_date)
         result = publish_release(connection, manifest)

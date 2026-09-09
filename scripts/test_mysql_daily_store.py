@@ -27,7 +27,7 @@ from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sources.akshare_history_source import SinaFactorsUnavailableError
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
-from scripts.market_data.tidb_daily_store import (
+from scripts.market_data.mysql_daily_store import (
     DailyEvidence,
     _canonical_adjusted_bar,
     _manifest_hashes,
@@ -174,39 +174,39 @@ def complete_evidence() -> DailyEvidence:
     )
 
 
-class TiDBDailyStoreTests(unittest.TestCase):
-    def test_transient_tidb_connect_error_retries_and_recovers(self) -> None:
+class MySQLDailyStoreTests(unittest.TestCase):
+    def test_transient_mysql_connect_error_retries_and_recovers(self) -> None:
         connection = object()
         with patch(
-            "scripts.market_data.tidb_daily_store._connect_once",
+            "scripts.market_data.mysql_daily_store._connect_once",
             side_effect=[TimeoutError("TLS read timed out"), connection],
-        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+        ) as connect_once, patch("scripts.market_data.mysql_daily_store.time.sleep") as sleep:
             self.assertIs(connect(object()), connection)
 
         self.assertEqual(connect_once.call_count, 2)
         sleep.assert_called_once_with(1)
 
-    def test_transient_tidb_connect_errors_exhaust_three_bounded_attempts(self) -> None:
+    def test_transient_mysql_connect_errors_exhaust_three_bounded_attempts(self) -> None:
         errors = [
             ConnectionResetError("connection reset"),
             RuntimeError(2003, "cannot connect"),
             RuntimeError(2013, "lost connection"),
         ]
         with patch(
-            "scripts.market_data.tidb_daily_store._connect_once",
+            "scripts.market_data.mysql_daily_store._connect_once",
             side_effect=errors,
-        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+        ) as connect_once, patch("scripts.market_data.mysql_daily_store.time.sleep") as sleep:
             with self.assertRaisesRegex(RuntimeError, "lost connection"):
                 connect(object())
 
         self.assertEqual(connect_once.call_count, 3)
         self.assertEqual(sleep.call_args_list, [call(1), call(2)])
 
-    def test_permanent_tidb_connect_error_fails_without_retry(self) -> None:
+    def test_permanent_mysql_connect_error_fails_without_retry(self) -> None:
         with patch(
-            "scripts.market_data.tidb_daily_store._connect_once",
+            "scripts.market_data.mysql_daily_store._connect_once",
             side_effect=RuntimeError(1045, "access denied"),
-        ) as connect_once, patch("scripts.market_data.tidb_daily_store.time.sleep") as sleep:
+        ) as connect_once, patch("scripts.market_data.mysql_daily_store.time.sleep") as sleep:
             with self.assertRaisesRegex(RuntimeError, "access denied"):
                 connect(object())
 
@@ -343,7 +343,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 reported_previous_close=Decimal("10"), status="succeeded",
             )
 
-    def test_adjusted_checkpoint_hash_uses_tidb_decimal_precision(self) -> None:
+    def test_adjusted_checkpoint_hash_uses_mysql_decimal_precision(self) -> None:
         evidence = complete_evidence()
         evidence.adjusted_bars[0]["previous_close"] = "9.5"
         connection = FakeConnection()
@@ -783,11 +783,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         connection = FakeConnection()
         with (
             patch(
-                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                "scripts.market_data.mysql_daily_store.load_daily_checkpoint_evidence",
                 side_effect=load,
             ),
             patch(
-                "scripts.market_data.tidb_daily_store._query_all",
+                "scripts.market_data.mysql_daily_store._query_all",
                 return_value=[("corrupt",), ("new-eastmoney",), ("old-sina",)],
             ),
         ):
@@ -833,11 +833,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         rejected_connection = FakeConnection()
         with (
             patch(
-                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                "scripts.market_data.mysql_daily_store.load_daily_checkpoint_evidence",
                 side_effect=load,
             ),
             patch(
-                "scripts.market_data.tidb_daily_store._query_all",
+                "scripts.market_data.mysql_daily_store._query_all",
                 return_value=[("new-eastmoney",)],
             ),
         ):
@@ -863,11 +863,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         rejected_verification_connection = FakeConnection()
         with (
             patch(
-                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                "scripts.market_data.mysql_daily_store.load_daily_checkpoint_evidence",
                 side_effect=load_bad_verification,
             ),
             patch(
-                "scripts.market_data.tidb_daily_store._query_all",
+                "scripts.market_data.mysql_daily_store._query_all",
                 return_value=[("bad-verification",)],
             ),
         ):
@@ -919,11 +919,11 @@ class TiDBDailyStoreTests(unittest.TestCase):
         connection = FakeConnection()
         with (
             patch(
-                "scripts.market_data.tidb_daily_store.load_daily_checkpoint_evidence",
+                "scripts.market_data.mysql_daily_store.load_daily_checkpoint_evidence",
                 side_effect=lambda _connection, dataset_id: (empty, empty_metadata)
                 if dataset_id == "stable" else (mixed, mixed_metadata),
             ),
-            patch("scripts.market_data.tidb_daily_store._query_all", return_value=[("mixed",)]),
+            patch("scripts.market_data.mysql_daily_store._query_all", return_value=[("mixed",)]),
         ):
             result = recover_compatible_daily_checkpoints(
                 connection, dataset_id="stable", target_session=TARGET,
@@ -1043,7 +1043,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 "scripts.market_data.daily_incremental_runner.load_calendars",
                 return_value=(primary, secondary, [], {}),
             ),
-            patch("scripts.market_data.daily_incremental_runner.TiDBConfig.from_env"),
+            patch("scripts.market_data.daily_incremental_runner.MySQLConfig.from_env"),
             patch("scripts.market_data.daily_incremental_runner.connect", return_value=connection),
             patch(
                 "scripts.market_data.daily_incremental_runner.latest_accepted_lineage",
@@ -1107,7 +1107,7 @@ class TiDBDailyStoreTests(unittest.TestCase):
                 "scripts.market_data.daily_incremental_runner.load_calendars",
                 return_value=(calendar, calendar, [], {}),
             ),
-            patch("scripts.market_data.daily_incremental_runner.TiDBConfig.from_env"),
+            patch("scripts.market_data.daily_incremental_runner.MySQLConfig.from_env"),
             patch("scripts.market_data.daily_incremental_runner.connect", return_value=connection),
             patch(
                 "scripts.market_data.daily_incremental_runner.latest_accepted_lineage",

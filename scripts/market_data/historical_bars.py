@@ -487,7 +487,7 @@ def run(
             valid_resumed.add(symbol)
     ignored_resumed = sorted((claimed_resumed & symbol_set) - valid_resumed)
     if claimed_resumed:
-        _progress("tidb_resume_validated", resumed=len(valid_resumed), ignored=len(ignored_resumed), ignored_symbols=ignored_resumed)
+        _progress("mysql_resume_validated", resumed=len(valid_resumed), ignored=len(ignored_resumed), ignored_symbols=ignored_resumed)
 
     bars = [row for row in resumed_bars if row.symbol in valid_resumed]
     facts = [row for row in resumed_facts if row.symbol in valid_resumed]
@@ -582,10 +582,10 @@ def run(
                         symbol_reference, symbol_checks,
                         primary_sources_by_symbol.get(symbol), None,
                     )
-                    _progress("tidb_verification_checkpoint_refreshed", symbol=symbol, checks=len(symbol_checks))
+                    _progress("mysql_verification_checkpoint_refreshed", symbol=symbol, checks=len(symbol_checks))
                 except Exception as error:
                     checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
-                    _progress("tidb_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
+                    _progress("mysql_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
 
     acquisition_symbols = [symbol for symbol in symbols if symbol not in valid_resumed]
     history_delay = history_stagger_seconds(mode, shard_index)
@@ -696,10 +696,10 @@ def run(
                     reference if last_error is None else None, symbol_checks,
                     primary_source_name if last_error is None else None, error_message,
                 )
-                _progress("tidb_symbol_checkpointed", symbol=symbol, status="failed" if error_message else "succeeded")
+                _progress("mysql_symbol_checkpointed", symbol=symbol, status="failed" if error_message else "succeeded")
             except Exception as error:
                 checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
-                _progress("tidb_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
+                _progress("mysql_symbol_checkpoint_failed", symbol=symbol, error=checkpoint_failures[symbol])
 
         elapsed = max(time.monotonic() - started_at, 0.001)
         completed = len(valid_resumed) + position
@@ -791,7 +791,7 @@ def run(
         ))
     if checkpoint_callback is not None:
         gates.append(GateResult(
-            "tidb_symbol_checkpoint_writes", not checkpoint_failures, len(checkpoint_failures), "= 0",
+            "mysql_symbol_checkpoint_writes", not checkpoint_failures, len(checkpoint_failures), "= 0",
             details=tuple(f"{symbol}: {message}" for symbol, message in sorted(checkpoint_failures.items())),
         ))
     canonical_bars = [row.canonical() for row in sorted(bars, key=lambda value: value.key)]
@@ -962,10 +962,10 @@ def checkpoint_expectations(plan: dict[str, Any]) -> dict[int, dict[str, tuple[i
 
 
 def enrich_repair_plan(plan: dict[str, Any]) -> dict[str, Any]:
-    """Attach a TiDB-derived repair matrix without changing the frozen checkpoint scope."""
+    """Attach a MySQL-derived repair matrix without changing the frozen checkpoint scope."""
 
-    from scripts.market_data.tidb_checkpoint_store import (
-        TiDBConfig,
+    from scripts.market_data.mysql_checkpoint_store import (
+        MySQLConfig,
         build_checkpoint_repair_plan,
         connect,
         ensure_schema,
@@ -973,7 +973,7 @@ def enrich_repair_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
     expectations = checkpoint_expectations(plan)
     dataset_ids = {index: shard_checkpoint_dataset_id(plan, index) for index in expectations}
-    connection = connect(TiDBConfig.from_env())
+    connection = connect(MySQLConfig.from_env())
     try:
         ensure_schema(connection)
         repair = build_checkpoint_repair_plan(
@@ -1043,9 +1043,9 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("historical-market-acceptance"))
     parser.add_argument("--symbol-attempts", type=int, default=1)
     parser.add_argument(
-        "--tidb-checkpoint-dataset-id",
-        default=os.environ.get("TIDB_CHECKPOINT_DATASET_ID", ""),
-        help="Stable TiDB dataset id; blank disables resumable per-symbol checkpoints",
+        "--mysql-checkpoint-dataset-id",
+        default=os.environ.get("MYSQL_CHECKPOINT_DATASET_ID", ""),
+        help="Stable MySQL dataset id; blank disables resumable per-symbol checkpoints",
     )
     args = parser.parse_args()
     if args.plan_output:
@@ -1106,37 +1106,37 @@ def main() -> int:
             }
             if args.shard_index not in repair_indices:
                 raise ValueError(f"shard {args.shard_index} is not present in the frozen repair matrix")
-    checkpoint_dataset_id = args.tidb_checkpoint_dataset_id.strip()
+    checkpoint_dataset_id = args.mysql_checkpoint_dataset_id.strip()
     if checkpoint_dataset_id and args.plan_input:
         expected_dataset_id = shard_checkpoint_dataset_id(plan, args.shard_index)
         if checkpoint_dataset_id != expected_dataset_id:
             raise ValueError(
-                f"TiDB checkpoint dataset id does not match frozen plan: "
+                f"MySQL checkpoint dataset id does not match frozen plan: "
                 f"expected {expected_dataset_id}, got {checkpoint_dataset_id}"
             )
     if args.acquisition_policy in {"repair", "finalize"} and not checkpoint_dataset_id:
-        raise ValueError(f"{args.acquisition_policy} policy requires a stable TiDB checkpoint dataset id")
+        raise ValueError(f"{args.acquisition_policy} policy requires a stable MySQL checkpoint dataset id")
     resume_evidence = None
     checkpoint_writer: Callable[..., None] | None = None
     if checkpoint_dataset_id:
-        from scripts.market_data.tidb_checkpoint_store import (
+        from scripts.market_data.mysql_checkpoint_store import (
             HistoricalEvidence,
-            TiDBConfig,
+            MySQLConfig,
             connect,
             ensure_schema,
             load_resumable_evidence,
             publish_symbol_checkpoint,
         )
 
-        tidb_config = TiDBConfig.from_env()
-        resume_connection = connect(tidb_config)
+        mysql_config = MySQLConfig.from_env()
+        resume_connection = connect(mysql_config)
         try:
             ensure_schema(resume_connection)
             resume_evidence = load_resumable_evidence(resume_connection, checkpoint_dataset_id)
         finally:
             resume_connection.close()
         _progress(
-            "tidb_checkpoint_scope_ready", dataset_id=checkpoint_dataset_id,
+            "mysql_checkpoint_scope_ready", dataset_id=checkpoint_dataset_id,
             resumable_symbols=len(resume_evidence.manifest.get("resumed_symbols", [])),
         )
 
@@ -1181,7 +1181,7 @@ def main() -> int:
             for attempt in range(1, 4):
                 checkpoint_connection = None
                 try:
-                    checkpoint_connection = connect(tidb_config)
+                    checkpoint_connection = connect(mysql_config)
                     publish_symbol_checkpoint(
                         checkpoint_connection, checkpoint_evidence, dataset_id=checkpoint_dataset_id,
                     )
@@ -1191,7 +1191,7 @@ def main() -> int:
                     if checkpoint_connection is not None:
                         checkpoint_connection.rollback()
                     _progress(
-                        "tidb_symbol_checkpoint_retry", symbol=symbol, attempt=attempt,
+                        "mysql_symbol_checkpoint_retry", symbol=symbol, attempt=attempt,
                         remaining_attempts=3 - attempt, error=f"{type(error).__name__}: {error}"[:300],
                     )
                     if attempt < 3:

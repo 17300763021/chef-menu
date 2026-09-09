@@ -22,12 +22,59 @@ class M2WorkflowTests(unittest.TestCase):
             self.assertIn("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1", text)
             self.assertIn('FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"', text)
 
+    def test_all_persistence_workflows_use_only_mysql_adapter_and_secret_contract(self) -> None:
+        names = (
+            "market-data-daily-incremental.yml",
+            "market-data-flow-admission.yml",
+            "market-data-fundamental-acceptance.yml",
+            "market-data-history-acceptance.yml",
+            "market-data-index-acceptance.yml",
+            "market-data-industry-acceptance.yml",
+            "market-data-m2-release-acceptance.yml",
+        )
+        for name in names:
+            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            yaml.safe_load(text)
+            self.assertNotIn("TIDB_", text, name)
+            self.assertNotIn("tidb_", text, name)
+            self.assertNotIn("TiDB", text, name)
+            if "MYSQL_HOST:" in text:
+                for key in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE", "SSL_MODE"):
+                    self.assertIn(f"MYSQL_{key}: ${{{{ secrets.MYSQL_{key} }}}}", text, name)
+
     def test_all_publications_remain_research_only(self) -> None:
-        for name in ("tidb_fundamental_store.py", "tidb_index_store.py", "tidb_flow_store.py", "m2_release_gate.py"):
+        for name in ("mysql_fundamental_store.py", "mysql_index_store.py", "mysql_flow_store.py", "m2_release_gate.py"):
             text = (ROOT / "scripts" / "market_data" / name).read_text(encoding="utf-8")
             self.assertIn("simulation_orders_allowed", text)
             self.assertNotIn("stock_trade_history", text)
             self.assertNotIn("paper_trade", text)
+
+    def test_all_market_data_writers_fail_closed_on_mysql_capacity(self) -> None:
+        names = (
+            "market-data-daily-incremental.yml",
+            "market-data-flow-admission.yml",
+            "market-data-fundamental-acceptance.yml",
+            "market-data-history-acceptance.yml",
+            "market-data-index-acceptance.yml",
+            "market-data-industry-acceptance.yml",
+            "market-data-m2-release-acceptance.yml",
+        )
+        for name in names:
+            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            self.assertIn("mysql_storage_capacity_percent:", text, name)
+            self.assertIn("mysql_capacity_checked_at:", text, name)
+            self.assertIn("--storage-percent", text, name)
+            self.assertIn("--checked-at", text, name)
+
+    def test_each_specialized_mysql_store_test_runs_in_its_workflow(self) -> None:
+        expected = {
+            "market-data-flow-admission.yml": "python -m scripts.test_mysql_flow_store",
+            "market-data-fundamental-acceptance.yml": "python -m scripts.test_mysql_fundamental_store",
+            "market-data-index-acceptance.yml": "python -m scripts.test_mysql_index_store",
+        }
+        for name, command in expected.items():
+            text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            self.assertIn(command, text, name)
 
     def test_daily_cloud_catchup_is_bounded_sharded_and_quota_gated(self) -> None:
         text = (ROOT / ".github" / "workflows" / "market-data-daily-incremental.yml").read_text(encoding="utf-8")

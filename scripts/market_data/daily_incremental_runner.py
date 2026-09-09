@@ -1,4 +1,4 @@
-"""Online M2 daily-increment acquisition with TiDB checkpoints.
+"""Online M2 daily-increment acquisition with MySQL checkpoints.
 
 The runner advances exactly one trading session from the last accepted lineage.
 It never skips a missing session, publishes only explicitly checkpointed partial
@@ -55,9 +55,9 @@ from scripts.market_data.sources.csi_index_source import CsiIndexSource
 from scripts.market_data.sources.eastmoney_corporate_action_source import EastmoneyCorporateActionSource
 from scripts.market_data.sources.eastmoney_market_state_source import EastmoneySuspensionSource
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource
-from scripts.market_data.tidb_daily_store import (
+from scripts.market_data.mysql_daily_store import (
     DailyEvidence,
-    TiDBConfig,
+    MySQLConfig,
     canonical_lineage_evidence,
     connect,
     daily_correction_context,
@@ -896,7 +896,7 @@ def run(
         primary_sessions=len(primary_calendar.open_dates),
         secondary_sessions=len(secondary_calendar.open_dates),
     )
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     connection = connect(config)
     try:
         if initialize_schema:

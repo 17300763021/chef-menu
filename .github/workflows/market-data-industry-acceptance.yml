@@ -17,16 +17,12 @@ on:
         description: "Optional prior industry run id whose frozen plan should be resumed"
         required: false
         type: string
-      tidb_ru_percent:
-        description: "Current TiDB monthly Request Units percentage"
+      mysql_storage_capacity_percent:
+        description: "Manually attested MySQL storage-capacity percentage (0-100)"
         required: true
         type: string
-      tidb_storage_percent:
-        description: "Current TiDB row-storage percentage"
-        required: true
-        type: string
-      tidb_quota_checked_at:
-        description: "Date both TiDB percentages were checked (YYYY-MM-DD, no older than 7 days)"
+      mysql_capacity_checked_at:
+        description: "Date MySQL storage capacity was checked (YYYY-MM-DD, no older than 7 days)"
         required: true
         type: string
   push:
@@ -34,13 +30,13 @@ on:
     paths:
       - .github/workflows/market-data-industry-acceptance.yml
       - scripts/market_data/industry_*.py
-      - scripts/market_data/tidb_industry_store.py
+      - scripts/market_data/mysql_industry_store.py
       - scripts/market_data/sources/sws_industry_source.py
       - scripts/market_data/sources/cninfo_industry_source.py
       - scripts/market_data/sources/exchange_delisting_source.py
       - scripts/test_market_data_industry.py
       - scripts/test_market_data_industry_quota.py
-      - scripts/test_tidb_industry_store.py
+      - scripts/test_mysql_industry_store.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
   pull_request:
@@ -48,13 +44,13 @@ on:
     paths:
       - .github/workflows/market-data-industry-acceptance.yml
       - scripts/market_data/industry_*.py
-      - scripts/market_data/tidb_industry_store.py
+      - scripts/market_data/mysql_industry_store.py
       - scripts/market_data/sources/sws_industry_source.py
       - scripts/market_data/sources/cninfo_industry_source.py
       - scripts/market_data/sources/exchange_delisting_source.py
       - scripts/test_market_data_industry.py
       - scripts/test_market_data_industry_quota.py
-      - scripts/test_tidb_industry_store.py
+      - scripts/test_mysql_industry_store.py
       - scripts/market_data/requirements.lock.txt
       - .python-version
 
@@ -85,12 +81,12 @@ jobs:
         run: |
           python -m scripts.test_market_data_industry
           python -m scripts.test_market_data_industry_quota
-          python -m scripts.test_tidb_industry_store
+          python -m scripts.test_mysql_industry_store
           python -m scripts.test_market_data_daily_incremental
-          python -m scripts.test_tidb_daily_store
+          python -m scripts.test_mysql_daily_store
           python -m scripts.test_historical_market_data
           python -m scripts.test_historical_quality_gates
-          python -m scripts.test_tidb_checkpoint_store
+          python -m scripts.test_mysql_checkpoint_store
           python -m scripts.test_point_in_time_universe
 
   quota-gate:
@@ -103,12 +99,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
-      - name: Enforce fresh TiDB RU and storage attestations below 80 percent
+      - name: Enforce fresh MySQL storage-capacity attestation below 80 percent
         run: >-
           python -m scripts.market_data.industry_quota_guard
-          --ru-percent "${{ inputs.tidb_ru_percent }}"
-          --storage-percent "${{ inputs.tidb_storage_percent }}"
-          --checked-at "${{ inputs.tidb_quota_checked_at }}"
+          --storage-percent "${{ inputs.mysql_storage_capacity_percent }}"
+          --checked-at "${{ inputs.mysql_capacity_checked_at }}"
 
   plan:
     if: github.event_name == 'workflow_dispatch'
@@ -146,12 +141,12 @@ jobs:
         if: inputs.resume_run_id == ''
         env:
           INPUT_OBSERVED_ON: ${{ inputs.observed_on }}
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_SSL_MODE: ${{ secrets.MYSQL_SSL_MODE }}
         run: |
           args=(--operation plan --mode "${{ inputs.mode }}" --output-dir industry-plan)
           if [[ -n "$INPUT_OBSERVED_ON" ]]; then
@@ -212,12 +207,12 @@ jobs:
           path: industry-plan
       - name: Capture or resume missing CNINFO primary industry histories
         env:
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_SSL_MODE: ${{ secrets.MYSQL_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.industry_runner
           --operation shard
@@ -243,12 +238,12 @@ jobs:
           path: industry-plan
       - name: Reconcile per-symbol hashes and atomically publish one accepted manifest
         env:
-          TIDB_HOST: ${{ secrets.TIDB_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_SSL_MODE }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_SSL_MODE: ${{ secrets.MYSQL_SSL_MODE }}
         run: >-
           python -u -m scripts.market_data.industry_runner
           --operation finalize

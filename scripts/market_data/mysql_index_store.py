@@ -1,4 +1,4 @@
-"""Atomic TiDB publication for compact CSI benchmark histories."""
+"""Atomic MySQL publication for compact CSI benchmark histories."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from scripts.market_data.index_bars import IndexBar
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect
 
 
 SCHEMA_STATEMENTS = (
@@ -109,4 +109,4 @@ def publish_index_run(
         raise
 
 
-__all__ = ["TiDBConfig", "connect", "ensure_index_schema", "publish_index_run"]
+__all__ = ["MySQLConfig", "connect", "ensure_index_schema", "publish_index_run"]

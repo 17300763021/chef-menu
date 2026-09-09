@@ -9,20 +9,16 @@ on:
         description: "Optional next trading session; blank advances exactly one missing session"
         required: false
         type: string
-      tidb_ru_percent:
-        description: "Current TiDB monthly Request Units percentage from Usage this month"
-        required: true
-        type: string
-      tidb_ru_checked_at:
-        description: "Date the TiDB percentage was checked (YYYY-MM-DD, no older than 7 days)"
-        required: true
-        type: string
       supersedes_dataset_id:
         description: "Optional active daily dataset to replace immutably; requires target_session and max_sessions=1"
         required: false
         type: string
-      tidb_storage_percent:
-        description: "Current TiDB row-storage percentage from Usage this month"
+      mysql_storage_capacity_percent:
+        description: "Manually attested MySQL storage-capacity percentage (0-100)"
+        required: true
+        type: string
+      mysql_capacity_checked_at:
+        description: "Date the MySQL storage capacity was checked (YYYY-MM-DD, no older than 7 days)"
         required: true
         type: string
       max_sessions:
@@ -36,7 +32,7 @@ on:
     paths:
       - .github/workflows/market-data-daily-incremental.yml
       - scripts/market_data/daily_*.py
-      - scripts/market_data/tidb_daily_store.py
+      - scripts/market_data/mysql_daily_store.py
       - scripts/market_data/sources/akshare_history_source.py
       - scripts/market_data/sources/eastmoney_market_state_source.py
       - scripts/market_data/sources/eastmoney_corporate_action_source.py
@@ -44,7 +40,7 @@ on:
       - scripts/test_market_data_daily_incremental.py
       - scripts/test_market_data_daily_quota.py
       - scripts/test_historical_market_data.py
-      - scripts/test_tidb_daily_store.py
+      - scripts/test_mysql_daily_store.py
       - scripts/test_eastmoney_market_state_source.py
       - scripts/test_eastmoney_corporate_action_source.py
       - scripts/market_data/requirements.lock.txt
@@ -89,7 +85,7 @@ jobs:
           python -m scripts.test_market_data_daily_catchup
           python -m scripts.test_market_data_daily_quota
           python -m scripts.test_historical_market_data
-          python -m scripts.test_tidb_daily_store
+          python -m scripts.test_mysql_daily_store
           python -m scripts.test_market_data_contracts
           python -m scripts.test_market_data_quality
           python -m scripts.test_market_calendar
@@ -111,22 +107,19 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
-      - name: Enforce fresh TiDB free-quota attestation for critical daily work
+      - name: Enforce fresh MySQL storage-capacity attestation for critical daily work
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_ENABLED: ${{ vars.M2_DAILY_ENABLED }}
-          MANUAL_RU_PERCENT: ${{ inputs.tidb_ru_percent }}
-          MANUAL_CHECKED_AT: ${{ inputs.tidb_ru_checked_at }}
-          SCHEDULED_RU_PERCENT: ${{ vars.TIDB_RU_PERCENT }}
-          SCHEDULED_CHECKED_AT: ${{ vars.TIDB_RU_CHECKED_AT }}
-          MANUAL_STORAGE_PERCENT: ${{ inputs.tidb_storage_percent }}
-          SCHEDULED_STORAGE_PERCENT: ${{ vars.TIDB_STORAGE_PERCENT }}
+          MANUAL_STORAGE_CAPACITY_PERCENT: ${{ inputs.mysql_storage_capacity_percent }}
+          MANUAL_CHECKED_AT: ${{ inputs.mysql_capacity_checked_at }}
+          SCHEDULED_STORAGE_CAPACITY_PERCENT: ${{ vars.MYSQL_STORAGE_CAPACITY_PERCENT }}
+          SCHEDULED_CHECKED_AT: ${{ vars.MYSQL_CAPACITY_CHECKED_AT }}
         run: >-
           python -m scripts.market_data.daily_quota_guard
           --event-name "$EVENT_NAME"
           --schedule-enabled "${SCHEDULE_ENABLED:-false}"
-          --reported-percent "${MANUAL_RU_PERCENT:-$SCHEDULED_RU_PERCENT}"
-          --storage-percent "${MANUAL_STORAGE_PERCENT:-$SCHEDULED_STORAGE_PERCENT}"
+          --storage-percent "${MANUAL_STORAGE_CAPACITY_PERCENT:-$SCHEDULED_STORAGE_CAPACITY_PERCENT}"
           --checked-at "${MANUAL_CHECKED_AT:-$SCHEDULED_CHECKED_AT}"
           --critical-work
 
@@ -150,12 +143,12 @@ jobs:
           INPUT_MAX_SESSIONS: ${{ inputs.max_sessions }}
           INPUT_SUPERSEDES_DATASET_ID: ${{ inputs.supersedes_dataset_id }}
           M2_BASE_HISTORY_DATASET_ID: ${{ vars.M2_BASE_HISTORY_DATASET_ID }}
-          TIDB_HOST: ${{ secrets.TIDB_MARKET_HOST }}
-          TIDB_PORT: ${{ secrets.TIDB_MARKET_PORT }}
-          TIDB_USER: ${{ secrets.TIDB_MARKET_USER }}
-          TIDB_PASSWORD: ${{ secrets.TIDB_MARKET_PASSWORD }}
-          TIDB_DATABASE: ${{ secrets.TIDB_MARKET_DATABASE }}
-          TIDB_SSL_MODE: ${{ secrets.TIDB_MARKET_SSL_MODE }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          MYSQL_SSL_MODE: ${{ secrets.MYSQL_SSL_MODE }}
         run: |
           max_sessions="${INPUT_MAX_SESSIONS:-}"
           if [[ -z "$max_sessions" ]]; then

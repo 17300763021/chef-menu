@@ -1,4 +1,4 @@
-"""TiDB audit storage for verified or explicitly unavailable capital-flow evidence."""
+"""MySQL audit storage for verified or explicitly unavailable capital-flow evidence."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect
 from scripts.market_data.verified_flow import VerifiedFlowFact
 
 
@@ -122,4 +122,4 @@ def publish_flow_run(
         raise
 
 
-__all__ = ["TiDBConfig", "connect", "ensure_flow_schema", "publish_flow_run"]
+__all__ = ["MySQLConfig", "connect", "ensure_flow_schema", "publish_flow_run"]

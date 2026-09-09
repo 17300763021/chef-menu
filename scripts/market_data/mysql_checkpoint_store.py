@@ -1,4 +1,4 @@
-"""TiDB checkpoint storage for non-authoritative M2.3 market data.
+"""MySQL checkpoint storage for non-authoritative M2.3 market data.
 
 This module is deliberately storage-only.  It does not fetch market data,
 evaluate strategy signals, create simulated orders, or mark M2.3 as completed.
@@ -20,8 +20,9 @@ from typing import Any, Iterable, Mapping
 from scripts.market_data.manifest import sha256
 
 
-TIDB_SCHEMA_VERSION = "m2-tidb-market-checkpoint-v4"
+MYSQL_SCHEMA_VERSION = "m2-mysql-market-checkpoint-v4"
 DEFAULT_ENV_FILE = Path(".env.local")
+TLS_SSL_MODES = frozenset({"REQUIRED"})
 
 
 def _read_json(path: Path) -> Any:
@@ -78,7 +79,7 @@ def load_dotenv(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
 
 
 @dataclass(frozen=True, slots=True)
-class TiDBConfig:
+class MySQLConfig:
     host: str
     port: int
     user: str
@@ -92,22 +93,36 @@ class TiDBConfig:
         env: Mapping[str, str] | None = None,
         *,
         env_file: Path = DEFAULT_ENV_FILE,
-    ) -> "TiDBConfig":
+    ) -> "MySQLConfig":
         file_values = load_dotenv(env_file)
         source = {**file_values, **dict(os.environ if env is None else env)}
-        missing = [
-            key for key in ("TIDB_HOST", "TIDB_PORT", "TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE")
-            if not source.get(key)
-        ]
+        required_keys = (
+            "MYSQL_HOST",
+            "MYSQL_PORT",
+            "MYSQL_USER",
+            "MYSQL_PASSWORD",
+            "MYSQL_DATABASE",
+            "MYSQL_SSL_MODE",
+        )
+        missing = [key for key in required_keys if not source.get(key)]
         if missing:
-            raise RuntimeError(f"missing TiDB configuration keys: {', '.join(missing)}")
+            raise RuntimeError(f"missing MySQL configuration keys: {', '.join(missing)}")
+        try:
+            port = int(source["MYSQL_PORT"])
+        except ValueError as error:
+            raise RuntimeError("MYSQL_PORT must be an integer") from error
+        ssl_mode = source["MYSQL_SSL_MODE"].strip().upper()
+        if ssl_mode not in TLS_SSL_MODES:
+            raise RuntimeError(
+                "MYSQL_SSL_MODE must require TLS and currently supports only REQUIRED"
+            )
         return cls(
-            host=source["TIDB_HOST"],
-            port=int(source["TIDB_PORT"]),
-            user=source["TIDB_USER"],
-            password=source["TIDB_PASSWORD"],
-            database=source["TIDB_DATABASE"],
-            ssl_mode=source.get("TIDB_SSL_MODE", "REQUIRED"),
+            host=source["MYSQL_HOST"],
+            port=port,
+            user=source["MYSQL_USER"],
+            password=source["MYSQL_PASSWORD"],
+            database=source["MYSQL_DATABASE"],
+            ssl_mode=ssl_mode,
         )
 
     def safe_summary(self) -> dict[str, Any]:
@@ -147,7 +162,7 @@ def load_historical_evidence(input_dir: Path) -> HistoricalEvidence:
 
 
 def load_historical_manifest(input_dir: Path) -> HistoricalEvidence:
-    """Load only a merged manifest when TiDB will reference physical shards.
+    """Load only a merged manifest when MySQL will reference physical shards.
 
     Full-universe merged evidence can contain millions of rows.  Manifest-only
     publication intentionally avoids loading or duplicating those rows after the
@@ -176,12 +191,17 @@ def default_dataset_id(manifest: Mapping[str, Any]) -> str:
     return f"m2-{mode}-{business_end}-{scope}-{fingerprint}"
 
 
-def connect(config: TiDBConfig):
+def connect(config: MySQLConfig):
+    ssl_mode = config.ssl_mode.strip().upper()
+    if ssl_mode not in TLS_SSL_MODES:
+        raise RuntimeError(
+            "MYSQL_SSL_MODE must require TLS and currently supports only REQUIRED"
+        )
     try:
         import pymysql
     except ImportError as error:
-        raise RuntimeError("PyMySQL is required for TiDB storage; install scripts/market_data/requirements.lock.txt") from error
-    ssl = {"ssl": {"check_hostname": False}} if config.ssl_mode.upper() in {"REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"} else {}
+        raise RuntimeError("PyMySQL is required for MySQL storage; install scripts/market_data/requirements.lock.txt") from error
+    ssl = {"ssl": {"check_hostname": False}}
     return pymysql.connect(
         host=config.host,
         port=config.port,
@@ -419,6 +439,18 @@ def _upsert_many(connection: Any, sql: str, rows: Iterable[tuple[Any, ...]]) -> 
     return len(values)
 
 
+def _existing_history_run(connection: Any, dataset_id: str) -> tuple[str, bool] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT manifest_sha256, accepted FROM m2_history_runs WHERE dataset_id=%s",
+            (dataset_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return str(row[0]), bool(row[1])
+
+
 RUN_UPSERT = """
 INSERT INTO m2_history_runs (
   dataset_id, schema_version, manifest_version, mode, business_end, history_start,
@@ -594,7 +626,7 @@ def _run_row(
         verification_count = len(evidence.verification_checks)
     return (
         dataset_id,
-        TIDB_SCHEMA_VERSION,
+        MYSQL_SCHEMA_VERSION,
         _optional_text(manifest.get("manifest_version")),
         _optional_text(manifest.get("mode")) or "unknown",
         _optional_text(manifest.get("business_end")),
@@ -640,7 +672,7 @@ def _required_sha256(value: Mapping[str, Any], key: str, scope: str) -> str:
 
 
 def merged_shard_rows(dataset_id: str, manifest: Mapping[str, Any]) -> list[tuple[Any, ...]]:
-    """Validate and map an accepted logical merge to its physical TiDB shards."""
+    """Validate and map an accepted logical merge to its physical MySQL shards."""
     if not str(manifest.get("manifest_version", "")).startswith("m2-historical-market-merged-manifest-"):
         raise RuntimeError("manifest-only publication requires a merged M2.3 manifest")
     if manifest.get("shard_index") is not None:
@@ -782,7 +814,7 @@ def validate_physical_shards(
     stored_by_id = {str(row[0]): row for row in stored_rows}
     if len(stored_by_id) != len(dataset_ids):
         missing = sorted(set(dataset_ids) - set(stored_by_id))
-        raise RuntimeError(f"physical TiDB shard runs are missing: {', '.join(missing)}")
+        raise RuntimeError(f"physical MySQL shard runs are missing: {', '.join(missing)}")
 
     for dataset_id in dataset_ids:
         shard = shard_manifests[dataset_id]
@@ -836,7 +868,7 @@ def validate_physical_shards(
             str(stored[22]).lower(),
         )
         if actual != expected:
-            raise RuntimeError(f"physical TiDB shard run does not match merged evidence: {dataset_id}")
+            raise RuntimeError(f"physical MySQL shard run does not match merged evidence: {dataset_id}")
 
 
 def _bar_rows(dataset_id: str, bars: Iterable[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
@@ -952,7 +984,7 @@ def symbol_checkpoint_rows(dataset_id: str, evidence: HistoricalEvidence) -> lis
         rows.append((
             dataset_id,
             symbol,
-            TIDB_SCHEMA_VERSION,
+            MYSQL_SCHEMA_VERSION,
             str(manifest.get("mode", "unknown")),
             _optional_int(manifest.get("shard_index")),
             _optional_int(manifest.get("shard_count")),
@@ -1001,6 +1033,32 @@ def publish_historical_evidence(
         raise RuntimeError("manifest-only publication cannot allow an unaccepted checkpoint")
     if checkpoint_manifest_only and allow_unaccepted_checkpoint:
         raise RuntimeError("checkpoint manifest-only publication cannot allow unaccepted evidence")
+    proposed_manifest_sha256 = sha256(manifest)
+    existing_run = _existing_history_run(connection, resolved_dataset_id)
+    if existing_run and existing_run[1]:
+        connection.rollback()
+        if existing_run[0] != proposed_manifest_sha256:
+            raise RuntimeError("accepted historical dataset id already has different immutable content")
+        return {
+            "dataset_id": resolved_dataset_id,
+            "schema_version": MYSQL_SCHEMA_VERSION,
+            "accepted": True,
+            "mode": manifest.get("mode"),
+            "business_end": manifest.get("business_end"),
+            "storage_mode": "accepted_immutable_replay",
+            "counts": {
+                "runs": 0,
+                "shard_mappings": 0,
+                "bars": 0,
+                "tradeability": 0,
+                "adjustments": 0,
+                "references": 0,
+                "verification_checks": 0,
+                "symbol_checkpoints": 0,
+            },
+            "simulation_orders_allowed": False,
+            "idempotent_replay": True,
+        }
     shard_rows = merged_shard_rows(resolved_dataset_id, manifest) if manifest_only else []
     if manifest_only:
         validate_physical_shards(connection, manifest, shard_rows)
@@ -1024,13 +1082,14 @@ def publish_historical_evidence(
     connection.commit()
     return {
         "dataset_id": resolved_dataset_id,
-        "schema_version": TIDB_SCHEMA_VERSION,
+        "schema_version": MYSQL_SCHEMA_VERSION,
         "accepted": bool(manifest.get("accepted")),
         "mode": manifest.get("mode"),
         "business_end": manifest.get("business_end"),
         "storage_mode": "manifest_only_shards" if manifest_only else "checkpoint_manifest_only" if checkpoint_manifest_only else "physical_rows",
         "counts": counts,
         "simulation_orders_allowed": False,
+        "idempotent_replay": False,
     }
 
 
@@ -1056,6 +1115,15 @@ def publish_symbol_checkpoint(
         raise ValueError(f"symbol checkpoint requires exactly one symbol, got {len(checkpoints)}")
     checkpoint = checkpoints[0]
     symbol = str(checkpoint[1])
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT accepted FROM m2_history_runs WHERE dataset_id=%s",
+            (dataset_id,),
+        )
+        existing_run = cursor.fetchone()
+    if existing_run and bool(existing_run[0]):
+        connection.rollback()
+        raise RuntimeError("accepted historical dataset is immutable; symbol checkpoint rejected")
     if str(checkpoint[8]) == "succeeded":
         # A successful repair replaces the exact symbol snapshot atomically so
         # obsolete adjustment or verification rows cannot survive an upsert.

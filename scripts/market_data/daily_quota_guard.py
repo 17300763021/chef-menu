@@ -16,7 +16,6 @@ def evaluate_daily_quota(
     *,
     event_name: str,
     schedule_enabled: str,
-    reported_percent: str,
     storage_percent: str,
     checked_at: str,
     critical_work: bool = False,
@@ -28,36 +27,30 @@ def evaluate_daily_quota(
     if scheduled and schedule_enabled.strip().lower() != "true":
         raise RuntimeError("scheduled M2 daily ingestion is disabled")
     try:
-        percent = DecimalPercent(reported_percent)
         storage = DecimalPercent(storage_percent)
     except ValueError as error:
-        raise RuntimeError("numeric TiDB monthly RU and storage percentages are required") from error
-    if percent >= 100 or storage >= 100:
-        raise RuntimeError("TiDB free quota reached 100%; affected work is stopped")
-    if percent >= MAX_USAGE_PERCENT and not critical_work:
-        raise RuntimeError(
-            f"TiDB monthly RU usage {percent:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
-        )
+        raise RuntimeError("a numeric MySQL storage-capacity percentage is required") from error
+    if storage >= 100:
+        raise RuntimeError("MySQL storage capacity reached 100%; affected work is stopped")
     if storage >= MAX_USAGE_PERCENT and not critical_work:
         raise RuntimeError(
-            f"TiDB row-storage usage {storage:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
+            f"MySQL storage capacity {storage:g}% reached the {MAX_USAGE_PERCENT}% nonessential-work stop"
         )
     try:
         observed_date = date.fromisoformat(checked_at)
     except ValueError as error:
-        raise RuntimeError("TiDB RU checked-at date must use YYYY-MM-DD") from error
+        raise RuntimeError("MySQL storage-capacity checked-at date must use YYYY-MM-DD") from error
     age = now.astimezone(timezone.utc).date() - observed_date
     if age < timedelta(0):
-        raise RuntimeError("TiDB RU attestation date cannot be in the future")
+        raise RuntimeError("MySQL storage-capacity attestation date cannot be in the future")
     if age > timedelta(days=MAX_ATTESTATION_AGE_DAYS):
         raise RuntimeError(
-            f"TiDB RU attestation is {age.days} days old; maximum is {MAX_ATTESTATION_AGE_DAYS}"
+            f"MySQL storage-capacity attestation is {age.days} days old; maximum is {MAX_ATTESTATION_AGE_DAYS}"
         )
     return {
         "allowed": True,
         "event_name": event_name,
-        "reported_percent": percent,
-        "storage_percent": storage,
+        "storage_capacity_percent": storage,
         "critical_work": critical_work,
         "checked_at": observed_date.isoformat(),
         "attestation_age_days": age.days,
@@ -77,10 +70,9 @@ def DecimalPercent(value: str) -> float:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="M2 daily TiDB cost guard")
+    parser = argparse.ArgumentParser(description="M2 daily MySQL storage-capacity guard")
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--schedule-enabled", default="false")
-    parser.add_argument("--reported-percent", required=True)
     parser.add_argument("--storage-percent", required=True)
     parser.add_argument("--checked-at", required=True)
     parser.add_argument(
@@ -92,7 +84,6 @@ def main() -> int:
     result = evaluate_daily_quota(
         event_name=args.event_name,
         schedule_enabled=args.schedule_enabled,
-        reported_percent=args.reported_percent,
         storage_percent=args.storage_percent,
         checked_at=args.checked_at,
         critical_work=args.critical_work,

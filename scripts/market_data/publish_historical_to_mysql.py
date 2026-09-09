@@ -1,4 +1,4 @@
-"""Publish M2.3 historical-market evidence into TiDB checkpoint tables."""
+"""Publish M2.3 historical-market evidence into MySQL checkpoint tables."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-from scripts.market_data.tidb_checkpoint_store import (
-    TiDBConfig,
+from scripts.market_data.mysql_checkpoint_store import (
+    MySQLConfig,
     connect,
     default_dataset_id,
     ensure_schema,
@@ -20,7 +20,7 @@ from scripts.market_data.tidb_checkpoint_store import (
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Publish non-authoritative M2.3 historical evidence to TiDB")
+    parser = argparse.ArgumentParser(description="Publish non-authoritative M2.3 historical evidence to MySQL")
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--dataset-id")
     parser.add_argument("--init-schema", action="store_true")
@@ -46,7 +46,7 @@ def main() -> int:
     if not (args.input_dir / "manifest.json").exists():
         if args.missing_input_ok:
             print(json.dumps({
-                "event": "tidb_publish_skipped",
+                "event": "mysql_publish_skipped",
                 "reason": "missing_manifest",
                 "input_dir": str(args.input_dir),
             }, ensure_ascii=False, sort_keys=True), flush=True)
@@ -55,7 +55,7 @@ def main() -> int:
 
     evidence = load_historical_manifest(args.input_dir) if args.manifest_only else load_historical_evidence(args.input_dir)
     dataset_id = args.dataset_id or default_dataset_id(evidence.manifest)
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     result = None
     last_error: Exception | None = None
     for attempt in range(1, args.publish_attempts + 1):
@@ -78,7 +78,7 @@ def main() -> int:
             if connection is not None:
                 connection.rollback()
             print(json.dumps({
-                "event": "tidb_publish_retry",
+                "event": "mysql_publish_retry",
                 "attempt": attempt,
                 "remaining_attempts": args.publish_attempts - attempt,
                 "error_type": type(error).__name__,
@@ -95,7 +95,7 @@ def main() -> int:
         raise last_error
 
     print(json.dumps({
-        "event": "tidb_publish_completed",
+        "event": "mysql_publish_completed",
         "host": config.host,
         "database": config.database,
         **result,

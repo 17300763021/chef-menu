@@ -12,7 +12,7 @@ from scripts.market_data.index_bars import INDEX_CODES, INDEX_SCHEMA_VERSION, In
 from scripts.market_data.index_quality_gates import evaluate_index_bars
 from scripts.market_data.manifest import sha256
 from scripts.market_data.quality_gates import accepted
-from scripts.market_data.tidb_index_store import TiDBConfig, connect, ensure_index_schema, publish_index_run
+from scripts.market_data.mysql_index_store import MySQLConfig, connect, ensure_index_schema, publish_index_run
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -73,7 +73,7 @@ def run(*, business_end: date, output_dir: Path) -> dict:
     }
     if not manifest["accepted"]:
         raise RuntimeError(f"index critical quality gate failed: {[g.name for g in gates if g.critical and not g.passed]}")
-    connection = connect(TiDBConfig.from_env())
+    connection = connect(MySQLConfig.from_env())
     try:
         ensure_index_schema(connection)
         result = publish_index_run(connection, manifest=manifest, primary=primary, verification=verification)

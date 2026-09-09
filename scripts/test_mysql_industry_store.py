@@ -20,7 +20,7 @@ from scripts.market_data.industry_contracts import (
     IndustryVerification,
     SwsAssignmentRecord,
 )
-from scripts.market_data.tidb_industry_store import (
+from scripts.market_data.mysql_industry_store import (
     SCHEMA_STATEMENTS,
     load_accepted_industry_nodes,
     load_base_scope,
@@ -162,7 +162,7 @@ def checkpoint_fixture(source, intervals, verifications):
     return result
 
 
-class TiDBIndustryStoreTest(unittest.TestCase):
+class MySQLIndustryStoreTest(unittest.TestCase):
     def test_schema_persists_normalized_official_source_assignments(self) -> None:
         schema = "\n".join(SCHEMA_STATEMENTS)
 

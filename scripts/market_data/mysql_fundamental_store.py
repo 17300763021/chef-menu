@@ -1,4 +1,4 @@
-"""Idempotent TiDB storage for M2 point-in-time fundamental evidence."""
+"""Idempotent MySQL storage for M2 point-in-time fundamental evidence."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport, FundamentalVerification
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect
 
 
 SCHEMA_STATEMENTS = (
@@ -247,4 +247,4 @@ def publish_run(connection: Any, manifest: Mapping[str, Any]) -> dict[str, Any]:
         raise
 
 
-__all__ = ["TiDBConfig", "connect", "ensure_fundamental_schema", "publish_symbol_checkpoint", "load_dataset", "publish_run"]
+__all__ = ["MySQLConfig", "connect", "ensure_fundamental_schema", "publish_symbol_checkpoint", "load_dataset", "publish_run"]

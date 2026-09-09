@@ -42,8 +42,8 @@ from scripts.market_data.sources.cninfo_industry_source import (
 )
 from scripts.market_data.sources.exchange_delisting_source import ExchangeDelistingSource
 from scripts.market_data.sources.csi_index_source import load_identifier_continuities
-from scripts.market_data.tidb_industry_store import (
-    TiDBConfig,
+from scripts.market_data.mysql_industry_store import (
+    MySQLConfig,
     completed_symbols,
     connect,
     ensure_industry_schema,
@@ -152,7 +152,7 @@ def build_plan(
 ) -> dict[str, Any]:
     if mode not in MODE_COUNTS:
         raise ValueError(f"unsupported industry acceptance mode: {mode}")
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     connection = connect(config)
     try:
         full_scope = load_base_scope(connection, base_history_dataset_id)
@@ -175,7 +175,7 @@ def build_plan(
         catalog_capture_mode = "live_cninfo"
     else:
         nodes, catalog_evidence_dataset_id = accepted_catalog
-        catalog_capture_mode = "accepted_same_date_tidb_reuse"
+        catalog_capture_mode = "accepted_same_date_mysql_reuse"
     nodes = sorted(nodes, key=lambda row: (row.level, row.node_code))
     scope_symbols = {item.symbol for item in scope}
     delistings = [
@@ -312,7 +312,7 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
     shard_count = int(plan["shard_count"])
     shard_scope = _shard_scope(scope, shard_index, shard_count)
     dataset_id = str(plan["dataset_id"])
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     connection = connect(config)
     try:
         ensure_industry_schema(connection)
@@ -455,7 +455,7 @@ def run_shard(*, input_dir: Path, shard_index: int, attempts: int = 3) -> dict[s
 
 def finalize(*, input_dir: Path, output_dir: Path) -> dict[str, Any]:
     plan, scope, nodes, delistings = load_plan(input_dir)
-    config = TiDBConfig.from_env()
+    config = MySQLConfig.from_env()
     connection = connect(config)
     try:
         source_rows = load_industry_source_assignments(connection, plan["dataset_id"])

@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from scripts.market_data.fundamental_contracts import FundamentalFact, FundamentalReport
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_fundamental_store import publish_symbol_checkpoint
+from scripts.market_data.mysql_fundamental_store import publish_symbol_checkpoint
 
 
 class Cursor:

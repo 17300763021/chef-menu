@@ -1,4 +1,4 @@
-"""TiDB checkpoints and atomic publication for M2 daily market increments.
+"""MySQL checkpoints and atomic publication for M2 daily market increments.
 
 Partial symbol rows are resumable research checkpoints.  They become visible to
 future consumers only after one accepted aggregate run is published.  All data
@@ -21,36 +21,36 @@ from scripts.market_data.daily_adjustments import PreviousAdjustedState, build_d
 from scripts.market_data.daily_quality_gates import cross_source_consistency_errors
 from scripts.market_data.historical_contracts import AdjustmentEvent
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect as _connect_once
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect as _connect_once
 
 
-DAILY_STORE_SCHEMA_VERSION = "m2-tidb-daily-checkpoint-v7"
+DAILY_STORE_SCHEMA_VERSION = "m2-mysql-daily-checkpoint-v7"
 DAILY_LINEAGE_SCHEMA_VERSION = "m2-daily-lineage-evidence-v1"
 TRADEABILITY_QUANTUM = Decimal("0.01")
 STORAGE_PRICE_QUANTUM = Decimal("0.0001")
 STORAGE_AMOUNT_QUANTUM = Decimal("0.01")
 STORAGE_RATIO_QUANTUM = Decimal("0.000001")
-TIDB_CONNECT_ATTEMPTS = 3
-TIDB_TRANSIENT_ERROR_CODES = frozenset({2003, 2006, 2013})
+MYSQL_CONNECT_ATTEMPTS = 3
+MYSQL_TRANSIENT_ERROR_CODES = frozenset({2003, 2006, 2013})
 
 
 def _is_transient_connect_error(error: Exception) -> bool:
     if isinstance(error, (TimeoutError, ConnectionError)):
         return True
     error_code = error.args[0] if error.args else None
-    return isinstance(error_code, int) and error_code in TIDB_TRANSIENT_ERROR_CODES
+    return isinstance(error_code, int) and error_code in MYSQL_TRANSIENT_ERROR_CODES
 
 
-def connect(config: TiDBConfig):
-    """Open a TiDB connection with bounded retries for transient network faults."""
-    for attempt in range(1, TIDB_CONNECT_ATTEMPTS + 1):
+def connect(config: MySQLConfig):
+    """Open a MySQL connection with bounded retries for transient network faults."""
+    for attempt in range(1, MYSQL_CONNECT_ATTEMPTS + 1):
         try:
             return _connect_once(config)
         except Exception as error:
-            if not _is_transient_connect_error(error) or attempt == TIDB_CONNECT_ATTEMPTS:
+            if not _is_transient_connect_error(error) or attempt == MYSQL_CONNECT_ATTEMPTS:
                 raise
             time.sleep(2 ** (attempt - 1))
-    raise AssertionError("unreachable TiDB connection retry state")
+    raise AssertionError("unreachable MySQL connection retry state")
 
 
 def _compact(value: Any) -> str:
@@ -90,7 +90,7 @@ def _storage_decimal(
     *,
     allow_none: bool = False,
 ) -> str | None:
-    """Canonicalize a number exactly as TiDB DECIMAL stores it."""
+    """Canonicalize a number exactly as MySQL DECIMAL stores it."""
     if value is None:
         if allow_none:
             return None
@@ -101,7 +101,7 @@ def _storage_decimal(
     except (InvalidOperation, ValueError) as error:
         raise ValueError(f"invalid {field}: {value!r}") from error
     if not parsed.is_finite() or parsed != normalized:
-        raise ValueError(f"{field} exceeds TiDB storage precision: {value!r}")
+        raise ValueError(f"{field} exceeds MySQL storage precision: {value!r}")
     return format(normalized, "f")
 
 
@@ -1888,7 +1888,7 @@ def publish_daily_run(
 
 
 __all__ = [
-    "DAILY_STORE_SCHEMA_VERSION", "DailyEvidence", "TiDBConfig", "connect",
+    "DAILY_STORE_SCHEMA_VERSION", "DailyEvidence", "MySQLConfig", "connect",
     "daily_correction_context", "default_daily_dataset_id", "ensure_daily_schema", "latest_accepted_lineage",
     "load_base_references", "load_daily_acceptance_status", "load_daily_checkpoint_evidence", "load_daily_evidence",
     "load_latest_prior_adjusted_states", "load_previous_adjusted_states",

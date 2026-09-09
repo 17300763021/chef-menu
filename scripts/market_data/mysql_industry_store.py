@@ -1,4 +1,4 @@
-"""Resumable TiDB checkpoints and atomic visibility for M2.5 industry evidence."""
+"""Resumable MySQL checkpoints and atomic visibility for M2.5 industry evidence."""
 
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ from scripts.market_data.industry_contracts import (
     SwsAssignmentRecord,
 )
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import TiDBConfig, connect
+from scripts.market_data.mysql_checkpoint_store import MySQLConfig, connect
 
 
-INDUSTRY_STORE_SCHEMA_VERSION = "m2-tidb-industry-checkpoint-v4"
+INDUSTRY_STORE_SCHEMA_VERSION = "m2-mysql-industry-checkpoint-v4"
 
 
 def _compact(value: Any) -> str:
@@ -685,7 +685,7 @@ def publish_industry_run(
 
 
 __all__ = [
-    "INDUSTRY_STORE_SCHEMA_VERSION", "TiDBConfig", "completed_symbols", "connect",
+    "INDUSTRY_STORE_SCHEMA_VERSION", "MySQLConfig", "completed_symbols", "connect",
     "ensure_industry_schema", "load_accepted_industry_nodes", "load_base_scope", "load_industry_intervals",
     "load_industry_exclusions", "load_industry_source_assignments",
     "load_industry_verifications", "publish_industry_run", "publish_symbol_checkpoint",

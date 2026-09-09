@@ -34,7 +34,7 @@ from scripts.market_data.sources.frozen_archive_history_source import (
     validate_archive_document,
 )
 from scripts.market_data.sources.tencent_history_source import TencentHistorySource, TencentIndexCalendarSource
-from scripts.market_data.tidb_checkpoint_store import HistoricalEvidence
+from scripts.market_data.mysql_checkpoint_store import HistoricalEvidence
 from scripts.market_data.universe_contracts import CurrentUniverse
 
 
@@ -412,10 +412,10 @@ class HistoricalMarketDataTests(unittest.TestCase):
 
         with (
             patch("scripts.market_data.historical_bars.checkpoint_expectations", return_value={0: {"000001": (1, False, "2026-07-24", "2026-07-24")}}),
-            patch("scripts.market_data.tidb_checkpoint_store.TiDBConfig.from_env", return_value=object()),
-            patch("scripts.market_data.tidb_checkpoint_store.connect", return_value=Connection()),
-            patch("scripts.market_data.tidb_checkpoint_store.ensure_schema"),
-            patch("scripts.market_data.tidb_checkpoint_store.build_checkpoint_repair_plan", return_value=repair),
+            patch("scripts.market_data.mysql_checkpoint_store.MySQLConfig.from_env", return_value=object()),
+            patch("scripts.market_data.mysql_checkpoint_store.connect", return_value=Connection()),
+            patch("scripts.market_data.mysql_checkpoint_store.ensure_schema"),
+            patch("scripts.market_data.mysql_checkpoint_store.build_checkpoint_repair_plan", return_value=repair),
         ):
             first = enrich_repair_plan(base)
             second = enrich_repair_plan(first)

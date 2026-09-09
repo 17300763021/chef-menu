@@ -12,7 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from scripts.market_data.daily_incremental_runner import DEFAULT_BASE_HISTORY_DATASET_ID, SHANGHAI, run
-from scripts.market_data.tidb_daily_store import TiDBConfig, connect, ensure_daily_schema
+from scripts.market_data.mysql_daily_store import MySQLConfig, connect, ensure_daily_schema
 
 
 def _run_capture_shard(
@@ -77,7 +77,7 @@ def catch_up(
     ):
         raise ValueError("a daily correction requires one explicit target and one shard")
     if parallel_shards > 1:
-        connection = connect(TiDBConfig.from_env())
+        connection = connect(MySQLConfig.from_env())
         try:
             ensure_daily_schema(connection)
         finally:

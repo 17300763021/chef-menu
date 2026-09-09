@@ -9,7 +9,7 @@ from pathlib import Path
 
 from scripts.market_data.manifest import sha256
 from scripts.market_data.sample_capture import SAMPLE_SYMBOLS
-from scripts.market_data.tidb_flow_store import TiDBConfig, connect, ensure_flow_schema, publish_flow_run
+from scripts.market_data.mysql_flow_store import MySQLConfig, connect, ensure_flow_schema, publish_flow_run
 from scripts.market_data.verified_flow import FLOW_SCHEMA_VERSION, ExactDateFlowSource
 
 
@@ -64,7 +64,7 @@ def run(*, business_date: date, output_dir: Path) -> dict:
             })
     manifest = build_manifest(business_date=business_date, facts=facts, checkpoints=checkpoints)
     data_available = bool(manifest["data_available"])
-    connection = connect(TiDBConfig.from_env())
+    connection = connect(MySQLConfig.from_env())
     try:
         ensure_flow_schema(connection)
         result = publish_flow_run(connection, manifest=manifest, facts=facts, checkpoints=checkpoints)

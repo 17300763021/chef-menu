@@ -10,9 +10,9 @@ from pathlib import Path
 
 from scripts.market_data.historical_bars import _write_gzip
 from scripts.market_data.manifest import sha256
-from scripts.market_data.tidb_checkpoint_store import (
+from scripts.market_data.mysql_checkpoint_store import (
     HistoricalEvidence,
-    TiDBConfig,
+    MySQLConfig,
     build_checkpoint_repair_plan,
     connect,
     default_dataset_id,
@@ -46,18 +46,26 @@ class FakeCursor:
     def fetchall(self):
         return self.connection.query_result(self.connection.executed[-1][0])
 
+    def fetchone(self):
+        rows = self.connection.query_result(self.connection.executed[-1][0])
+        return rows[0] if rows else None
+
 
 class FakeConnection:
     def __init__(self) -> None:
         self.executed = []
         self.executed_many = []
         self.commits = 0
+        self.rollbacks = 0
 
     def cursor(self) -> FakeCursor:
         return FakeCursor(self)
 
     def commit(self) -> None:
         self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
 
     def query_result(self, sql: str):
         return []
@@ -70,6 +78,8 @@ class PhysicalShardConnection(FakeConnection):
         self.omit_dataset_id = omit_dataset_id
 
     def query_result(self, sql: str):
+        if "SELECT manifest_sha256, accepted" in sql or "SELECT accepted FROM m2_history_runs" in sql:
+            return []
         if "FROM m2_history_runs" not in sql:
             return []
         rows = []
@@ -241,7 +251,7 @@ def merged_manifest_evidence() -> HistoricalEvidence:
     )
 
 
-class TiDBCheckpointStoreTests(unittest.TestCase):
+class MySQLCheckpointStoreTests(unittest.TestCase):
     def test_repair_plan_selects_only_missing_failed_or_incomplete_checkpoints(self) -> None:
         class RepairConnection(FakeConnection):
             def query_result(self, sql: str):
@@ -285,7 +295,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         })
 
     def test_config_safe_summary_does_not_expose_password(self) -> None:
-        config = TiDBConfig(
+        config = MySQLConfig(
             host="gateway.example.com",
             port=4000,
             user="user.root",
@@ -294,6 +304,45 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         )
         self.assertEqual(config.safe_summary()["password"], "***")
         self.assertNotIn("secret-password", json.dumps(config.safe_summary()))
+
+    def test_mysql_environment_contract_requires_all_six_tls_values(self) -> None:
+        values = {
+            "MYSQL_HOST": "mysql.example.test",
+            "MYSQL_PORT": "13306",
+            "MYSQL_USER": "market_app",
+            "MYSQL_PASSWORD": "not-printed",
+            "MYSQL_DATABASE": "chef_menu_market",
+            "MYSQL_SSL_MODE": "required",
+        }
+        config = MySQLConfig.from_env(values, env_file=Path("does-not-exist"))
+        self.assertEqual(config.port, 13306)
+        self.assertEqual(config.ssl_mode, "REQUIRED")
+
+        for missing_key in values:
+            incomplete = dict(values)
+            incomplete.pop(missing_key)
+            with self.assertRaisesRegex(RuntimeError, missing_key):
+                MySQLConfig.from_env(incomplete, env_file=Path("does-not-exist"))
+
+        insecure = dict(values, MYSQL_SSL_MODE="DISABLED")
+        with self.assertRaisesRegex(RuntimeError, "must require TLS"):
+            MySQLConfig.from_env(insecure, env_file=Path("does-not-exist"))
+
+        unsupported_verification = dict(values, MYSQL_SSL_MODE="VERIFY_IDENTITY")
+        with self.assertRaisesRegex(RuntimeError, "only REQUIRED"):
+            MySQLConfig.from_env(unsupported_verification, env_file=Path("does-not-exist"))
+
+    def test_tidb_environment_keys_cannot_select_the_mysql_adapter(self) -> None:
+        legacy = {
+            "TIDB_HOST": "legacy.example.test",
+            "TIDB_PORT": "4000",
+            "TIDB_USER": "root",
+            "TIDB_PASSWORD": "not-printed",
+            "TIDB_DATABASE": "chef_menu_market",
+            "TIDB_SSL_MODE": "REQUIRED",
+        }
+        with self.assertRaisesRegex(RuntimeError, "MYSQL_HOST"):
+            MySQLConfig.from_env(legacy, env_file=Path("does-not-exist"))
 
     def test_repair_plan_rejects_nonpositive_adjusted_inventory(self) -> None:
         class InvalidAdjustedConnection(FakeConnection):
@@ -376,7 +425,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(result["resumable_symbol_count"], 1)
         self.assertEqual(result["repair_symbol_count"], 0)
 
-    def test_connect_uses_tls_for_tidb_required_ssl(self) -> None:
+    def test_connect_uses_tls_for_mysql_required_ssl(self) -> None:
         captured = {}
 
         def fake_connect(**kwargs):
@@ -386,7 +435,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         previous = sys.modules.get("pymysql")
         sys.modules["pymysql"] = types.SimpleNamespace(connect=fake_connect)
         try:
-            connect(TiDBConfig(
+            connect(MySQLConfig(
                 host="gateway.example.com",
                 port=4000,
                 user="user.root",
@@ -401,6 +450,17 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
                 sys.modules["pymysql"] = previous
         self.assertEqual(captured["ssl"], {"check_hostname": False})
         self.assertNotIn("secret-password", json.dumps({key: value for key, value in captured.items() if key != "password"}))
+
+    def test_connect_rejects_an_insecure_tls_mode_before_opening_a_connection(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "must require TLS"):
+            connect(MySQLConfig(
+                host="mysql.example.test",
+                port=13306,
+                user="market_app",
+                password="not-printed",
+                database="chef_menu_market",
+                ssl_mode="DISABLED",
+            ))
 
     def test_default_dataset_id_is_deterministic_and_scoped(self) -> None:
         evidence = sample_evidence()
@@ -432,6 +492,60 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         self.assertEqual(result["counts"]["symbol_checkpoints"], 2)
         self.assertEqual(connection.commits, 1)
 
+    def test_accepted_history_run_is_an_immutable_idempotent_replay(self) -> None:
+        evidence = sample_evidence(accepted=True)
+
+        class AcceptedConnection(FakeConnection):
+            def __init__(self, manifest_hash):
+                super().__init__()
+                self.manifest_hash = manifest_hash
+
+            def query_result(self, sql: str):
+                if "SELECT manifest_sha256, accepted" in sql:
+                    return [(self.manifest_hash, 1)]
+                return []
+
+        same = AcceptedConnection(sha256(evidence.manifest))
+        result = publish_historical_evidence(same, evidence, dataset_id="accepted-dataset")
+        self.assertTrue(result["idempotent_replay"])
+        self.assertEqual(result["storage_mode"], "accepted_immutable_replay")
+        self.assertEqual(result["counts"]["runs"], 0)
+        self.assertEqual(same.commits, 0)
+        self.assertEqual(same.rollbacks, 1)
+        self.assertFalse(any("INSERT INTO" in sql for sql, _ in same.executed))
+
+        changed = AcceptedConnection("0" * 64)
+        with self.assertRaisesRegex(RuntimeError, "different immutable content"):
+            publish_historical_evidence(changed, evidence, dataset_id="accepted-dataset")
+        self.assertEqual(changed.commits, 0)
+        self.assertEqual(changed.rollbacks, 1)
+        self.assertFalse(any("INSERT INTO" in sql for sql, _ in changed.executed))
+
+    def test_symbol_checkpoint_cannot_modify_an_accepted_history_run(self) -> None:
+        evidence = sample_evidence(accepted=True)
+        one_symbol = HistoricalEvidence(
+            manifest={**evidence.manifest, "primary_failures": {}},
+            bars=evidence.bars,
+            tradeability=evidence.tradeability[:1],
+            adjustments=evidence.adjustments,
+            references=evidence.references,
+            verification_checks=evidence.verification_checks,
+        )
+
+        class AcceptedConnection(FakeConnection):
+            def query_result(self, sql: str):
+                if "SELECT accepted FROM m2_history_runs" in sql:
+                    return [(1,)]
+                return []
+
+        connection = AcceptedConnection()
+        with self.assertRaisesRegex(RuntimeError, "symbol checkpoint rejected"):
+            publish_symbol_checkpoint(connection, one_symbol, dataset_id="accepted-dataset")
+        self.assertEqual(connection.commits, 0)
+        self.assertEqual(connection.rollbacks, 1)
+        self.assertFalse(any(sql.lstrip().startswith("DELETE FROM") for sql, _ in connection.executed))
+        self.assertEqual(connection.executed_many, [])
+
     def test_symbol_checkpoint_does_not_publish_incomplete_run_row(self) -> None:
         connection = FakeConnection()
         evidence = sample_evidence(accepted=False)
@@ -450,7 +564,10 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
         counts = publish_symbol_checkpoint(connection, one_symbol, dataset_id="stable-dataset")
         self.assertEqual(counts["symbol_checkpoints"], 1)
         self.assertEqual(connection.commits, 1)
-        self.assertFalse(any("m2_history_runs" in sql for sql, _params in connection.executed))
+        self.assertFalse(any(
+            "INSERT INTO m2_history_runs" in sql
+            for sql, _params in connection.executed
+        ))
         deletes = [params for sql, params in connection.executed if sql.lstrip().startswith("DELETE FROM")]
         self.assertEqual(deletes, [("stable-dataset", "000001")] * 5)
         verification_rows = next(
@@ -566,7 +683,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
                 manifest_only=True,
             )
         self.assertEqual(connection.commits, 2)
-        self.assertEqual(len(connection.executed), 4)
+        self.assertEqual(len(connection.executed), 6)
         self.assertEqual(len(connection.executed_many), 2)
         self.assertTrue(all(len(rows) == 2 for _sql, rows in connection.executed_many))
 
@@ -675,7 +792,7 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
     def test_manifest_only_publish_requires_committed_matching_physical_shards(self) -> None:
         evidence = merged_manifest_evidence()
         missing = PhysicalShardConnection(evidence, omit_dataset_id="physical-shard-1")
-        with self.assertRaisesRegex(RuntimeError, "physical TiDB shard runs are missing"):
+        with self.assertRaisesRegex(RuntimeError, "physical MySQL shard runs are missing"):
             publish_historical_evidence(
                 missing,
                 evidence,
@@ -723,16 +840,16 @@ class TiDBCheckpointStoreTests(unittest.TestCase):
 
     def test_workflow_uses_fail_closed_manifest_only_merged_publication(self) -> None:
         workflow = Path(".github/workflows/market-data-history-acceptance.yml").read_text(encoding="utf-8")
-        merged_step = workflow.split("- name: Publish merged accepted evidence to TiDB", 1)[1]
+        merged_step = workflow.split("- name: Publish merged accepted evidence to MySQL", 1)[1]
         merged_step, merged_upload = merged_step.split("- name: Upload merged non-authoritative evidence", 1)
-        self.assertIn("if: success() && inputs.publish_tidb", merged_step)
+        self.assertIn("if: success() && inputs.publish_mysql", merged_step)
         self.assertIn("--manifest-only", merged_step)
         self.assertNotIn("--allow-unaccepted-checkpoint", merged_step)
         self.assertIn("path: historical-market-acceptance/manifest.json", merged_upload)
         self.assertNotIn("path: historical-market-acceptance/*", merged_upload)
 
         self.assertIn("options: [capture, resume]", workflow)
-        self.assertIn("Build TiDB repair matrix from frozen plan", workflow)
+        self.assertIn("Build MySQL repair matrix from frozen plan", workflow)
         self.assertIn("--acquisition-policy repair", workflow)
         self.assertIn("--acquisition-policy finalize", workflow)
         self.assertIn("--checkpoint-manifest-only", workflow)
