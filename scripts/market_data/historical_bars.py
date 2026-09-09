@@ -711,6 +711,86 @@ def run(
             estimated_remaining_seconds=round(elapsed / position * (len(acquisition_symbols) - position), 1),
         )
 
+    # Verification is intentionally fetched before the slower primary bundle.
+    # If the primary later falls back to that same provider, refresh only those
+    # overlapping symbols while explicitly excluding the final primary source.
+    overlapping_verification_symbols = sorted({
+        symbol
+        for symbol in verification_targets
+        if primary_sources_by_symbol.get(symbol) in {
+            check[4] for check in close_checks if check[0] == symbol
+        }
+    })
+    if overlapping_verification_symbols:
+        _progress(
+            "verification_independence_refresh_started",
+            symbols=len(overlapping_verification_symbols),
+        )
+        independent_rows, independent_failures = fetch_primary(
+            overlapping_verification_symbols,
+            ranges,
+            1,
+            excluded_sources_by_symbol={
+                symbol: {primary_sources_by_symbol[symbol]}
+                for symbol in overlapping_verification_symbols
+            },
+        )
+        independent_map = {
+            row.key: row
+            for rows in independent_rows.values()
+            for row in rows
+            if row.key in expected
+        }
+        overlapping_set = set(overlapping_verification_symbols)
+        close_checks = [row for row in close_checks if row[0] not in overlapping_set]
+        for symbol in overlapping_verification_symbols:
+            if symbol in independent_failures:
+                verification_failures[symbol] = independent_failures[symbol]
+                continue
+            verification_failures.pop(symbol, None)
+            symbol_bars = [row for row in bars if row.symbol == symbol]
+            symbol_checks = []
+            for row in symbol_bars:
+                verification = independent_map.get(row.key)
+                if verification is not None:
+                    symbol_checks.append((
+                        symbol,
+                        row.business_date,
+                        row.close,
+                        verification.close,
+                        verification.source,
+                    ))
+            close_checks.extend(symbol_checks)
+            if checkpoint_callback is not None:
+                try:
+                    checkpoint_callback(
+                        symbol,
+                        symbol_bars,
+                        [row for row in facts if row.symbol == symbol],
+                        [row for row in adjustments if row.symbol == symbol],
+                        next((row for row in references if row.symbol == symbol), None),
+                        symbol_checks,
+                        primary_sources_by_symbol.get(symbol),
+                        None,
+                    )
+                    _progress(
+                        "mysql_verification_checkpoint_refreshed",
+                        symbol=symbol,
+                        checks=len(symbol_checks),
+                    )
+                except Exception as error:
+                    checkpoint_failures[symbol] = f"{type(error).__name__}: {error}"
+                    _progress(
+                        "mysql_symbol_checkpoint_failed",
+                        symbol=symbol,
+                        error=checkpoint_failures[symbol],
+                    )
+        _progress(
+            "verification_independence_refresh_completed",
+            succeeded=len(independent_rows),
+            failed=len(independent_failures),
+        )
+
     verification_expected = sum(1 for row in bars if row.symbol in set(verification_targets))
 
     historical_gates = evaluate_historical(

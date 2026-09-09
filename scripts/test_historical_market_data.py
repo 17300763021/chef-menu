@@ -679,6 +679,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", FakePrimarySource),
             patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows()}, {})),
             patch("scripts.market_data.sources.baostock_history_source.BaostockHistorySource.__enter__", side_effect=AssertionError("BaoStock history must not be opened")),
@@ -700,6 +701,69 @@ class HistoricalMarketDataTests(unittest.TestCase):
         self.assertEqual(len(adjustments), 1)
         self.assertEqual(len(references), 1)
         self.assertEqual(len(close_checks), 3)
+
+        class SinaPrimarySource(FakePrimarySource):
+            def fetch_bundle(self, symbol: str, start: date, end: date):
+                bundle = list(super().fetch_bundle(symbol, start, end))
+                raw = {
+                    day: DailyBar(
+                        source="akshare_sina", symbol=row.symbol, exchange=row.exchange,
+                        business_date=row.business_date, open=row.open, high=row.high,
+                        low=row.low, close=row.close, previous_close=row.previous_close,
+                        volume_shares=row.volume_shares, amount_cny=row.amount_cny,
+                        turnover_percent=row.turnover_percent, trade_status=row.trade_status,
+                        is_st=row.is_st,
+                    )
+                    for day, row in bundle[0].items()
+                }
+                bundle[0] = raw
+                bundle[6] = "akshare_sina"
+                return tuple(bundle)
+
+        tencent_verification = [
+            DailyBar(
+                source="tencent_archive", symbol=row.symbol, exchange=row.exchange,
+                business_date=row.business_date, open=row.open, high=row.high,
+                low=row.low, close=row.close, previous_close=row.previous_close,
+                volume_shares=row.volume_shares, amount_cny=row.amount_cny,
+                turnover_percent=row.turnover_percent, trade_status=row.trade_status,
+                is_st=row.is_st,
+            )
+            for row in verification_rows()
+        ]
+        with (
+            patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
+            patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
+            patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", SinaPrimarySource),
+            patch(
+                "scripts.market_data.historical_bars.fetch_primary",
+                side_effect=[
+                    ({"600519": verification_rows()}, {}),
+                    ({"600519": tencent_verification}, {}),
+                ],
+            ) as fetch_mock,
+        ):
+            refreshed_manifest, *_rest, refreshed_checks = run(
+                date(2026, 7, 22),
+                mode="sample",
+                current_universe=current,
+                primary_calendar=calendar,
+                secondary_calendar=calendar,
+            )
+
+        independence_gate = next(
+            gate for gate in refreshed_manifest["gates"]
+            if gate["name"] == "verification_source_independence"
+        )
+        self.assertTrue(independence_gate["passed"])
+        self.assertEqual(refreshed_manifest["primary_sources_by_symbol"], {"600519": "akshare_sina"})
+        self.assertEqual(refreshed_manifest["verification_sources_by_symbol"], {"600519": ["tencent_archive"]})
+        self.assertEqual({row[4] for row in refreshed_checks}, {"tencent_archive"})
+        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(fetch_mock.call_args_list[1].kwargs["excluded_sources_by_symbol"], {
+            "600519": {"akshare_sina"},
+        })
 
         resume_evidence = HistoricalEvidence(
             manifest={"resumed_symbols": ["600519"]},
@@ -724,6 +788,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", ResumeMustNotFetchPrimary),
             patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("complete verification checkpoint must be reused")),
         ):
@@ -743,6 +808,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", side_effect=AssertionError("finalize must not instantiate a public source")),
             patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("finalize must not fetch verification data")),
         ):
@@ -767,6 +833,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", side_effect=AssertionError("finalize must not instantiate a public source")),
             patch("scripts.market_data.historical_bars.fetch_primary", side_effect=AssertionError("finalize must fail before public verification")),
         ):
@@ -785,6 +852,7 @@ class HistoricalMarketDataTests(unittest.TestCase):
         with (
             patch("scripts.market_data.historical_bars.CsiIndexSource", FakeCsiSource),
             patch("scripts.market_data.historical_bars.evaluate_universe", return_value=[]),
+            patch("scripts.market_data.historical_bars.version", return_value="fixture"),
             patch("scripts.market_data.historical_bars.AkshareEastmoneyHistorySource", ResumeMustNotFetchPrimary),
             patch("scripts.market_data.historical_bars.fetch_primary", return_value=({"600519": verification_rows_for_refresh}, {})),
         ):
